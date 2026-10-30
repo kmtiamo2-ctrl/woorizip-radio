@@ -866,10 +866,19 @@ def run_ui(start_minimized):
     entry.bind("<Return>", lambda e: send_text(entry.get()))
     tk.Button(entry_row, text="보내기", font=(F, 10), command=lambda: send_text(entry.get())).pack(side="left", padx=(6, 0))
 
+    # 메시지 목록: 입력칸 아래, 높이 고정 + 스크롤 (목록이 늘어나도 입력칸을 밀지 않음)
     clips_box = tk.Frame(root, bg=CARD)
-    tk.Label(clips_box, text="받은 메시지", font=(F, 10), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(8, 2))
-    clips_list = tk.Frame(clips_box, bg=CARD)
-    clips_list.pack(fill="x", padx=6, pady=(0, 8))
+    tk.Label(clips_box, text="메시지 (최근 것이 위)", font=(F, 10), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(8, 2))
+    clips_canvas = tk.Canvas(clips_box, bg=CARD, highlightthickness=0, height=170)
+    clips_scroll = tk.Scrollbar(clips_box, orient="vertical", command=clips_canvas.yview)
+    clips_canvas.configure(yscrollcommand=clips_scroll.set)
+    clips_scroll.pack(side="right", fill="y", pady=(0, 8))
+    clips_canvas.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 8))
+    clips_list = tk.Frame(clips_canvas, bg=CARD)
+    clips_win = clips_canvas.create_window((0, 0), window=clips_list, anchor="nw")
+    clips_list.bind("<Configure>", lambda e: clips_canvas.configure(scrollregion=clips_canvas.bbox("all")))
+    clips_canvas.bind("<Configure>", lambda e: clips_canvas.itemconfigure(clips_win, width=e.width))
+    clips_canvas.bind("<MouseWheel>", lambda e: clips_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
 
     opts = tk.Frame(root, bg=CARD)
     opts.pack(fill="x", padx=20, pady=6, side="bottom")
@@ -1254,17 +1263,18 @@ def run_ui(start_minimized):
                 talk.config(text="누르고 말하기\n(%s)" % who, bg=BLUE)
             notice.config(text=radio.notice)
 
-            csig = tuple((c["id"], c["ts"], radio.playing is c) for c in radio.clips[:8])
+            csig = tuple((c["id"], c["ts"], radio.playing is c) for c in radio.clips[:20])
             if csig != cache["clips"]:
                 cache["clips"] = csig
                 for c in clips_list.winfo_children():
                     c.destroy()
                 if radio.clips:
                     if not clips_box.winfo_ismapped():
-                        clips_box.pack(fill="x", padx=20, pady=6, after=notice)
-                    for c in radio.clips[:8]:
+                        clips_box.pack(fill="x", padx=20, pady=6, after=text_box)
+                    for c in radio.clips[:20]:
                         row = tk.Frame(clips_list, bg=CARD)
                         row.pack(fill="x", pady=2)
+                        row.bind("<MouseWheel>", lambda e: clips_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
                         playing = radio.playing is c
                         when_ = time.strftime("%m/%d %H:%M", time.localtime(c["ts"]))
                         if c.get("kind") == "text":

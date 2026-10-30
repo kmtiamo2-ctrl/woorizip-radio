@@ -116,6 +116,31 @@ class MainActivity : AppCompatActivity() {
         setContentView(buildUi())
         if (!prefs.isConfigured) settingsBox.visibility = View.VISIBLE
         else if (prefs.standby && !RadioService.running) ensurePermissionsThenStart()
+        showCrashReportIfAny()
+    }
+
+    /** 지난번에 앱이 멈췄으면 원인을 보여 줌 (스크린샷으로 보내 주면 고칠 수 있음) */
+    private fun showCrashReportIfAny() {
+        val report = WoorizipApp.takeCrashReport(this) ?: return
+        val tv = TextView(this).apply {
+            text = report.take(2500)
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+        }
+        val scroll = NestedScrollView(this).apply { addView(tv) }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("지난번에 앱이 멈췄어요")
+            .setMessage("아래 내용을 화면 캡처해서 보내 주시면 고칠 수 있어요.")
+            .setView(scroll)
+            .setPositiveButton("닫기", null)
+            .setNeutralButton("복사") { _, _ ->
+                val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("우리집 오류", report))
+                toast("복사했어요")
+            }
+            .show()
     }
 
     override fun onStart() {

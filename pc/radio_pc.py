@@ -130,7 +130,7 @@ def set_autostart(enabled):
     if os.name != "nt":
         return
     import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:   # 키가 없는 새 계정도 됨
         if enabled:
             winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, autostart_command())
         else:
@@ -1712,14 +1712,20 @@ def make_desktop_shortcut():
         return False, "Windows에서만 돼요"
     target = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     try:
-        import subprocess
-        ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\\우리집.lnk');"
-              "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Description='우리집';$s.Save()"
+        # 한글 이름이 어느 언어 Windows에서도 깨지지 않도록 스크립트 파일(UTF-8 BOM)로 만들어 실행
+        ps = ("$ErrorActionPreference='Stop'\n"
+              "$desk=[Environment]::GetFolderPath('DesktopDirectory')\n"
+              "if(-not (Test-Path $desk)){ New-Item -ItemType Directory -Force $desk | Out-Null }\n"
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $desk '우리집.lnk'))\n"
+              "$s.TargetPath='%s'\n$s.WorkingDirectory='%s'\n$s.IconLocation='%s,0'\n$s.Description='우리집'\n$s.Save()\n"
               % (target.replace("'", "''"), os.path.dirname(target).replace("'", "''"), target.replace("'", "''")))
-        r = subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-                           creationflags=0x08000000, timeout=20, capture_output=True, text=True)
+        script = os.path.join(data_dir(), "shortcut.ps1")
+        with open(script, "w", encoding="utf-8-sig") as f:
+            f.write(ps)
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script],
+                           creationflags=0x08000000, timeout=30, capture_output=True)
         if r.returncode != 0:
-            log("바로가기 만들기 실패: %s" % r.stderr.strip()[:200])
+            log("바로가기 만들기 실패: %s" % (r.stderr or r.stdout).decode("utf-8", "replace").strip()[:300])
             return False, "바로가기를 만들지 못했어요"
         return True, "바탕화면에 '우리집' 바로가기를 만들었어요"
     except Exception as e:

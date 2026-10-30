@@ -71,7 +71,7 @@ object Notifs {
         }
         val talkLabel = if (Radio.talking || Radio.requesting) "말하기 끝" else "말하기 시작"
         return NotificationCompat.Builder(ctx, CH_STANDBY)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_star)
             .setContentTitle(title)
             .setContentText(text)
             .setOngoing(true)
@@ -133,7 +133,7 @@ object Notifs {
             else -> "${secs}초 · 눌러서 들어 보세요"
         }
         val b = NotificationCompat.Builder(ctx, CH_CLIP)
-            .setSmallIcon(if (clip.isText) android.R.drawable.ic_dialog_email else android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_star)
             .setContentTitle(clip.title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
@@ -155,7 +155,7 @@ object Notifs {
     fun showBootReminder(ctx: Context) {
         if (!canNotify(ctx)) return
         val n = NotificationCompat.Builder(ctx, CH_STANDBY)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_star)
             .setContentTitle("우리집 무전기")
             .setContentText("눌러서 수신 대기를 다시 켜 주세요")
             .setAutoCancel(true)

@@ -835,15 +835,21 @@ def toast(title, text):
         pass
 
 
-def make_icon(color):
+def make_icon(color, size=64):
+    """별 모양 아이콘 (color = 바탕색: 연결됨 초록 / 끊김 회색 / 기본 파랑)"""
+    import math
     from PIL import Image, ImageDraw
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    S = size * 4
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((8, 4, 56, 60), radius=14, fill=color)
-    d.rounded_rectangle((22, 14, 42, 38), radius=10, fill=(255, 255, 255, 255))   # 마이크
-    d.rectangle((30, 40, 34, 50), fill=(255, 255, 255, 255))
-    d.rectangle((22, 50, 42, 54), fill=(255, 255, 255, 255))
-    return img
+    d.rounded_rectangle((S * 0.04, S * 0.04, S * 0.96, S * 0.96), radius=S * 0.22, fill=color)
+    pts = []
+    for i in range(10):
+        r = S * 0.38 if i % 2 == 0 else S * 0.16
+        a = -math.pi / 2 + i * math.pi / 5
+        pts.append((S / 2 + r * math.cos(a), S * 0.52 + r * math.sin(a)))
+    d.polygon(pts, fill=(255, 205, 0, 255))
+    return img.resize((size, size), Image.LANCZOS)
 
 
 # ---------------------------------------------------------------- 화면
@@ -862,6 +868,12 @@ def run_ui(start_minimized):
     root = tk.Tk()
     root.title(APP_TITLE)
     root.configure(bg=BG)
+    try:
+        from PIL import ImageTk
+        _win_icon = ImageTk.PhotoImage(make_icon((37, 99, 235, 255), 64))
+        root.iconphoto(True, _win_icon)
+    except Exception:
+        pass
     root.geometry("460x800")
     root.minsize(420, 640)
 
@@ -1049,7 +1061,6 @@ def run_ui(start_minimized):
                     set_autostart(cfg.autostart)
                 except Exception:
                     pass
-                make_desktop_shortcut()
                 radio.client.reconnect()
                 w.destroy()
             tk.Button(w, text="시작", font=(F, 11), width=12, command=start).pack(pady=16)
@@ -1101,6 +1112,11 @@ def run_ui(start_minimized):
         tk.Checkbutton(w, text="Windows 시작 시 자동 실행 (트레이에 조용히 켜짐)", variable=auto_var, font=(F, 10),
                        fg=TXT, bg=BG, selectcolor=BG, activebackground=BG, activeforeground=TXT
                        ).pack(anchor="w", padx=12, pady=(12, 0))
+
+        def shortcut():
+            ok, msg = make_desktop_shortcut()
+            (messagebox.showinfo if ok else messagebox.showwarning)("바로가기", msg + ("\n\n작업 표시줄에 두고 싶으면 그 바로가기를 작업 표시줄로 끌어다 놓으세요." if ok else ""), parent=w)
+        tk.Button(w, text="바탕화면에 바로가기 만들기", font=(F, 9), command=shortcut).pack(anchor="w", padx=16, pady=(8, 0))
 
         def save():
             hk = hk_entry.get().strip()
@@ -1400,8 +1416,6 @@ def run_ui(start_minimized):
         set_autostart(cfg.autostart)
     except Exception:
         pass
-    if cfg.name:
-        make_desktop_shortcut()
     start_tray()
     bind_hotkey()
     radio.start()
@@ -1472,22 +1486,24 @@ def single_instance():
 
 
 def make_desktop_shortcut():
-    """바탕화면에 '우리집 무전기' 바로가기 (exe로 실행 중일 때만, 한 번만)"""
-    if os.name != "nt" or not getattr(sys, "frozen", False):
-        return
-    flag = os.path.join(data_dir(), "shortcut_made")
-    if os.path.exists(flag):
-        return
+    """바탕화면에 '우리집 무전기' 바로가기를 만듦. 같은 이름 파일을 덮어쓰므로 여러 번 눌러도 하나만 생김"""
+    if os.name != "nt":
+        return False, "Windows에서만 돼요"
+    target = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     try:
         import subprocess
         ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\\우리집 무전기.lnk');"
-              "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.Description='우리집 무전기';$s.Save()"
-              % (sys.executable.replace("'", "''"), os.path.dirname(sys.executable).replace("'", "''")))
-        subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-                       creationflags=0x08000000, timeout=20)
-        open(flag, "w").close()
+              "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Description='우리집 무전기';$s.Save()"
+              % (target.replace("'", "''"), os.path.dirname(target).replace("'", "''"), target.replace("'", "''")))
+        r = subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                           creationflags=0x08000000, timeout=20, capture_output=True, text=True)
+        if r.returncode != 0:
+            log("바로가기 만들기 실패: %s" % r.stderr.strip()[:200])
+            return False, "바로가기를 만들지 못했어요"
+        return True, "바탕화면에 '우리집 무전기' 바로가기를 만들었어요"
     except Exception as e:
         log("바로가기 만들기 실패: %s" % e)
+        return False, "바로가기를 만들지 못했어요"
 
 
 if __name__ == "__main__":

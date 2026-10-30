@@ -31,13 +31,6 @@ jobs:
           echo "--- 서버 기록 ---"; cat pcout/server.log 2>/dev/null || true
           if [ "$RC" != "0" ]; then echo "::error title=PC 자가 점검 실패::$(grep FAIL pcout/selftest.log | tr '\n' ' ' | cut -c1-800)"; fi
           exit $RC
-      - name: 점검에 실패하면 내용을 이슈로 남김
-        if: failure()
-        shell: bash
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          { echo '```'; cat pcout/selftest.log 2>/dev/null | tail -150; echo; echo "--- 서버 기록 ---"; tail -40 pcout/server.log 2>/dev/null; echo; echo "--- 설치·교체 점검 ---"; cat pcout/install.log 2>/dev/null | tail -60; echo '```'; } > body.md
-          gh issue create --title "PC 자가 점검 실패 (${{ github.run_number }})" --body-file body.md
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray --collect-all customtkinter pc/radio_pc.py
       - name: 실제 exe로 설치·교체 흐름 점검 (내려받은 파일 실행 → 자가 설치 → 새 파일로 교체 → 종료)
         shell: pwsh
@@ -64,8 +57,10 @@ jobs:
           Start-Sleep 8
           $p3 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
           $log += "3) 종료 요청 → 실행 중: $($p3.Count)개"
-          $okPaths = ($p2.Count -gt 0) -and (($p2 | Where-Object { $_.Path -ne $inst }).Count -eq 0)
-          $pass = (Test-Path $inst) -and ($p1.Count -ge 1) -and ($p2.Count -ge 1) -and $okPaths -and ($p3.Count -eq 0)
+          $bad = @($p2 | Where-Object { -not [string]::Equals([string]$_.Path, [string]$inst, 'OrdinalIgnoreCase') })
+          $c1 = [bool](Test-Path $inst); $c2 = ($p1.Count -ge 1); $c3 = ($p2.Count -ge 1); $c4 = ($bad.Count -eq 0); $c5 = ($p3.Count -eq 0)
+          $pass = $c1 -and $c2 -and $c3 -and $c4 -and $c5
+          $log += "조건: 설치본=$c1 실행=$c2 교체후실행=$c3 경로일치=$c4(다른경로 $($bad.Count)개) 종료=$c5"
           $log += "결과: " + $(if ($pass) { "통과" } else { "실패" })
           $log += "--- 기록 파일 ---"
           $log += (Get-Content (Join-Path $env:APPDATA 'WoorizipRadio\log.txt') -ErrorAction SilentlyContinue)
@@ -77,6 +72,13 @@ jobs:
         with:
           name: pc
           path: pcout/
+      - name: 점검에 실패하면 내용을 이슈로 남김
+        if: failure()
+        shell: bash
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          { echo '```'; cat pcout/selftest.log 2>/dev/null | tail -150; echo; echo "--- 서버 기록 ---"; tail -40 pcout/server.log 2>/dev/null; echo; echo "--- 설치·교체 점검 ---"; cat pcout/install.log 2>/dev/null | tail -80; echo '```'; } > body.md
+          gh issue create --title "PC 자가 점검 실패 (${{ github.run_number }})" --body-file body.md
 
   android:
     name: 안드로이드 앱 (.apk)

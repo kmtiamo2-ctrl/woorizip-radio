@@ -53,6 +53,7 @@ def data_dir():
 class Config:
     # 우리 집 기본값 (가족 전용 빌드). 설정 창에서 바꿀 수 있음
     DEFAULTS = {"host": "192.168.0.6", "out_host": "100.83.179.121", "name": "", "key": "105403", "hotkey": "",
+                "quick": "네,아니요,알겠어요,지금 갈게요,조금 있다가요,지금은 못 해요",
                 "target": "all", "dnd": False, "autostart": True}
 
     def __init__(self):
@@ -419,7 +420,7 @@ class Radio:
         self.incoming_mode = None
         self.notice = ""
         self.clips = []          # 최근 메시지 (새것이 앞): 음성 dict(kind=clip, file) 또는 문자 dict(kind=text, text)
-        self.quick_replies = ["응", "알았어", "지금 가", "조금 있다가", "지금은 못 해"]
+        self.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
         self.pending = {}
         self.playing = None
         self.on_event = None     # ("incoming"|"clip"|"state", 정보) → 화면 알림용
@@ -820,8 +821,13 @@ def run_ui(start_minimized):
     def send_text(t):
         if radio.send_text(t):
             entry.delete(0, "end")
-    for q in radio.quick_replies:
-        tk.Button(chip_row, text=q, font=(F, 9), command=lambda q=q: send_text(q)).pack(side="left", padx=2, pady=2)
+
+    def render_chips():
+        for c in chip_row.winfo_children():
+            c.destroy()
+        for q in radio.quick_replies:
+            tk.Button(chip_row, text=q, font=(F, 9), command=lambda q=q: send_text(q)).pack(side="left", padx=2, pady=2)
+    render_chips()
     entry_row = tk.Frame(text_box, bg=CARD)
     entry_row.pack(fill="x", padx=8, pady=(2, 8))
     entry = tk.Entry(entry_row, font=(F, 11))
@@ -904,7 +910,8 @@ def run_ui(start_minimized):
         rows = [("host", "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)"),
                 ("out_host", "밖 주소 — Tailscale(예: 100.101.102.103) 또는 DDNS. 비우면 집에서만"),
                 ("key", "가족 암호 (NAS 설정과 같게)"),
-                ("hotkey", "말하기 단축키 (비우면 없음. 예: f9, scroll lock)")]
+                ("hotkey", "말하기 단축키 (비우면 없음. 예: f9, scroll lock)"),
+                ("quick", "빠른 답장 문구 (쉼표로 구분)")]
         for k, label in rows:
             tk.Label(w, text=label, font=(F, 9), fg=SUB, bg=BG, wraplength=380, justify="left").pack(anchor="w", padx=16, pady=(10, 0))
             e = tk.Entry(w, font=(F, 11), width=40, show="*" if k == "key" else "")
@@ -932,6 +939,8 @@ def run_ui(start_minimized):
             except Exception as e:
                 messagebox.showwarning("설정", "자동 실행 등록 실패: %s" % e, parent=w)
             bind_hotkey()
+            radio.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
+            render_chips()
             radio.client.reconnect()
             w.destroy()
         tk.Button(w, text="저장하고 연결", font=(F, 10), command=save).pack(pady=14)

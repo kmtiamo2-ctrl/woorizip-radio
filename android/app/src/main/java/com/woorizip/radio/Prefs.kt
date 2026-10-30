@@ -46,6 +46,11 @@ class Prefs(ctx: Context) {
         get() = sp.getString("target", "all") ?: "all"
         set(v) = sp.edit().putString("target", v).apply()
 
+    /** 빠른 답장 문구 (쉼표로 구분). 각자 설정에서 바꿀 수 있음 */
+    var quickReplies: List<String>
+        get() = (sp.getString("quick", null) ?: DEFAULT_QUICK).split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        set(v) = sp.edit().putString("quick", v.joinToString(",")).apply()
+
     val isConfigured: Boolean get() = host.isNotBlank() && name.isNotBlank() && key.isNotBlank()
 
     companion object {
@@ -53,6 +58,7 @@ class Prefs(ctx: Context) {
         const val DEFAULT_HOST = "192.168.0.6"
         const val DEFAULT_OUT_HOST = "100.83.179.121"
         const val DEFAULT_KEY = "105403"
+        const val DEFAULT_QUICK = "네,아니요,알겠어요,지금 갈게요,조금 있다가요,지금은 못 해요"
 
         /** "192.168.0.10", "192.168.0.10:8765", "wss://xxx.synology.me" 등을 WebSocket 주소로 */
         fun toWsUrl(addr: String): String {

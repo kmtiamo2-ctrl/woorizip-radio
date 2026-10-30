@@ -50,6 +50,24 @@ class MainActivity : ComponentActivity() {
     private lateinit var clipsBox: LinearLayout
     private lateinit var clipsList: LinearLayout
     private lateinit var input: EditText
+    private lateinit var chipRow: LinearLayout
+    private var chipSig = ""
+
+    private fun renderChips() {
+        val list = prefs.quickReplies
+        val sig = list.joinToString("|")
+        if (sig == chipSig) return
+        chipSig = sig
+        chipRow.removeAllViews()
+        list.forEach { q ->
+            chipRow.addView(TextView(this).apply {
+                text = q; textSize = 14f; setTextColor(textMain); background = rounded(Color.parseColor("#334155"), 20)
+                setPadding(dp(14), dp(8), dp(14), dp(8))
+                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
+                setOnClickListener { if (Radio.sendText(q)) toast("보냈어요: $q") }
+            })
+        }
+    }
     private val refresh: () -> Unit = { render() }
     private val h = Handler(Looper.getMainLooper())
 
@@ -158,15 +176,8 @@ class MainActivity : ComponentActivity() {
         }
         textBox.addView(label("말하기 어려우면 글로 보내기", 13f, textSub))
         val chips = android.widget.HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
-        val chipRow = LinearLayout(this)
-        Radio.quickReplies.forEach { q ->
-            chipRow.addView(TextView(this).apply {
-                text = q; textSize = 14f; setTextColor(textMain); background = rounded(Color.parseColor("#334155"), 20)
-                setPadding(dp(14), dp(8), dp(14), dp(8))
-                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
-                setOnClickListener { if (Radio.sendText(q)) toast("보냈어요: $q") }
-            })
-        }
+        chipRow = LinearLayout(this)
+        renderChips()
         chips.addView(chipRow)
         textBox.addView(chips, lp(top = 8))
         val inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
@@ -271,6 +282,7 @@ class MainActivity : ComponentActivity() {
         whoButtons.firstOrNull { it.text == prefs.name }?.let { whoGroup.check(it.id) }
         box.addView(whoGroup)
         val key = field(box, "가족 암호 (NAS 설정과 같게)", prefs.key, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        val quick = field(box, "빠른 답장 문구 (쉼표로 구분)", prefs.quickReplies.joinToString(", "), InputType.TYPE_CLASS_TEXT)
 
         box.addView(label("화면 꺼짐 상태 볼륨 버튼", 13f, textSub), lp(top = 14))
         val modes = RadioGroup(this)
@@ -289,6 +301,9 @@ class MainActivity : ComponentActivity() {
                 prefs.name = whoButtons.firstOrNull { it.id == whoGroup.checkedRadioButtonId }?.text?.toString() ?: ""
                 if (prefs.name.isBlank()) { toast("이 폰이 누구 것인지 골라 주세요"); return@setOnClickListener }
                 prefs.key = key.text.toString()
+                prefs.quickReplies = quick.text.toString().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                    .ifEmpty { Prefs.DEFAULT_QUICK.split(",") }
+                renderChips()
                 prefs.keyMode = if (modes.checkedRadioButtonId == dbl.id) "double" else "hold"
                 if (!prefs.isConfigured) { toast("집 주소와 가족 암호를 입력하세요"); return@setOnClickListener }
                 settingsBox.visibility = View.GONE

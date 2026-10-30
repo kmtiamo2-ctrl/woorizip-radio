@@ -50,7 +50,7 @@ object Radio : RadioClient.Listener {
     private val pendingClips = HashMap<Int, JSONObject>()   // 헤더는 왔는데 음성은 아직
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    val quickReplies = listOf("응", "알았어", "지금 가", "조금 있다가", "지금은 못 해")
+    val quickReplies: List<String> get() = Prefs(app).quickReplies
 
     // ---- 화면에 보여줄 상태 ----
     @Volatile var connected = false; private set

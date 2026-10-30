@@ -55,11 +55,17 @@ jobs:
       - run: |
           mv out/pc/WoorizipRadio.exe out/WoorizipRadio-PC-v${{ github.run_number }}.exe
           mv out/apk/app-release.apk out/WoorizipRadio-Phone-v${{ github.run_number }}.apk
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.run_number }}
-          name: 우리집 무전기 ${{ github.run_number }}번째 빌드
-          body: |
-            - **PC(Windows)**: `WoorizipRadio-PC-v${{ github.run_number }}.exe` 를 내려받아 더블클릭 (실행 중인 옛 버전은 먼저 종료)
-            - **폰(안드로이드)**: `WoorizipRadio-Phone-v${{ github.run_number }}.apk` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)
-          files: out/*
+      - uses: actions/checkout@v4
+        with: { path: src }
+      - name: 릴리스 만들기
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          N=${{ github.run_number }}
+          printf '%s\n' "- **PC(Windows)**: \`WoorizipRadio-PC-v$N.exe\` 를 내려받아 더블클릭 (실행 중인 옛 버전은 먼저 종료)" \
+                         "- **폰(안드로이드)**: \`WoorizipRadio-Phone-v$N.apk\` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)" > notes.md
+          gh release create "v$N" out/*.exe out/*.apk --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest 2>&1 | tee release.log
+          test ${PIPESTATUS[0]} -eq 0
+      - name: 실패하면 이슈로 남김
+        if: failure()
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh issue create --repo "$GITHUB_REPOSITORY" --title "릴리스 만들기 실패 ($(date +%H:%M))" --body "$(ls -R out; cat release.log 2>/dev/null)"

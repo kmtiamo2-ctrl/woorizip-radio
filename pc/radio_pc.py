@@ -1727,7 +1727,7 @@ def _instance_running():
 
 def ensure_installed():
     """
-    exe를 사용자 폴더(LOCALAPPDATA\WoorizipRadio)에 복사해 두고 그 복사본을 실행함.
+    exe를 사용자 폴더(LOCALAPPDATA 아래 WoorizipRadio)에 복사해 두고 그 복사본을 실행함.
     → 다운로드한 파일은 지워도 되고, 새 버전은 그냥 실행만 하면 교체됨. 자동 시작도 복사본을 가리킴.
     설치 복사본으로 실행된 게 아니면 복사 후 True (호출한 쪽은 종료)
     """

@@ -1,0 +1,2 @@
+sounddevice>=0.4.6
+keyboard>=0.13.5

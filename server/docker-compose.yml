@@ -1,0 +1,13 @@
+services:
+  woorizip-radio:
+    build: .
+    container_name: woorizip-radio
+    restart: unless-stopped
+    # 집 안 Wi-Fi에서 폰이 NAS에 바로 붙을 수 있도록 호스트 네트워크 사용
+    network_mode: host
+    environment:
+      FAMILY_KEY: "여기에-가족-암호-입력"
+      MEMBERS: "엄마,아빠,첫째,둘째,셋째"
+      PORT: "8765"
+      MAX_TALK_SEC: "60"
+      TZ: "Asia/Seoul"

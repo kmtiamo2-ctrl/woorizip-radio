@@ -1,0 +1,10 @@
+android/build/
+android/.gradle/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+__pycache__/
+pc/build/
+pc/dist/
+*.spec

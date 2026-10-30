@@ -8,12 +8,12 @@ class Prefs(ctx: Context) {
 
     /** 집 안에서 쓰는 NAS 주소 (예: 192.168.0.10 또는 192.168.0.10:8765) */
     var host: String
-        get() = sp.getString("host", "") ?: ""
+        get() = sp.getString("host", DEFAULT_HOST) ?: DEFAULT_HOST
         set(v) = sp.edit().putString("host", v.trim()).apply()
 
     /** 밖에서 쓰는 주소 (Tailscale 주소 100.x.x.x 또는 DDNS 주소 wss://xxx.synology.me). 비우면 집에서만 동작 */
     var outHost: String
-        get() = sp.getString("outHost", "") ?: ""
+        get() = sp.getString("outHost", DEFAULT_OUT_HOST) ?: DEFAULT_OUT_HOST
         set(v) = sp.edit().putString("outHost", v.trim()).apply()
 
     /** 내 이름 (서버의 MEMBERS 중 하나) */
@@ -23,7 +23,7 @@ class Prefs(ctx: Context) {
 
     /** 가족 공용 암호 (서버의 FAMILY_KEY) */
     var key: String
-        get() = sp.getString("key", "") ?: ""
+        get() = sp.getString("key", DEFAULT_KEY) ?: DEFAULT_KEY
         set(v) = sp.edit().putString("key", v).apply()
 
     /** 화면 꺼짐 볼륨키 방식: "hold" = 길게 누르는 동안 말하기, "double" = 두 번 눌러 켜고 끄기 */
@@ -49,6 +49,11 @@ class Prefs(ctx: Context) {
     val isConfigured: Boolean get() = host.isNotBlank() && name.isNotBlank() && key.isNotBlank()
 
     companion object {
+        // 우리 집 기본값 (가족 전용 빌드). 설정 화면에서 바꿀 수 있음
+        const val DEFAULT_HOST = "192.168.0.6"
+        const val DEFAULT_OUT_HOST = "100.83.179.121"
+        const val DEFAULT_KEY = "105403"
+
         /** "192.168.0.10", "192.168.0.10:8765", "wss://xxx.synology.me" 등을 WebSocket 주소로 */
         fun toWsUrl(addr: String): String {
             val a = addr.trim()

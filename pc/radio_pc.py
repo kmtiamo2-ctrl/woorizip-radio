@@ -47,7 +47,8 @@ def data_dir():
 
 
 class Config:
-    DEFAULTS = {"host": "", "out_host": "", "name": "", "key": "", "hotkey": "",
+    # 우리 집 기본값 (가족 전용 빌드). 설정 창에서 바꿀 수 있음
+    DEFAULTS = {"host": "192.168.0.6", "out_host": "100.83.179.121", "name": "", "key": "105403", "hotkey": "",
                 "target": "all", "dnd": False, "autostart": True}
 
     def __init__(self):

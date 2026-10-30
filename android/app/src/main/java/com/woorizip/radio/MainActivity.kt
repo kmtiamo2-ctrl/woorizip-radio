@@ -260,7 +260,7 @@ class MainActivity : ComponentActivity() {
         val host = field(box, "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         val outHost = field(box, "밖 주소 — Tailscale 주소(예: 100.101.102.103) 또는 DDNS 주소. 비우면 집에서만", prefs.outHost, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         // 누구의 기기인지: 타이핑 대신 버튼으로 고름
-        box.addView(label("이 폰은 누구 것인가요?", 13f, textSub), lp(top = 14))
+        box.addView(label("이 폰은 누구 것인가요? (고르고 아래 '저장하고 연결'만 누르면 돼요)", 13f, textSub), lp(top = 14))
         val whoGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
         val names = Radio.members.ifEmpty { listOf("엄마", "아빠", "첫째", "둘째", "셋째") }
         val whoButtons = names.map { n ->

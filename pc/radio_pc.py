@@ -1706,6 +1706,7 @@ def run_ui(start_minimized, selftest=False):
             root.focus_force()
             ask_password(root, lambda: events.put(("quit", None)), prompt="완전히 종료하려면 가족 암호를 입력하세요")
         elif kind == "quit":
+            busy["quitting"] = True   # 창을 닫는 중에는 화면 갱신을 하지 않음
             radio.stop_talk()
             if tray["icon"]:
                 try:
@@ -1731,7 +1732,7 @@ def run_ui(start_minimized, selftest=False):
 
     def refresh():
         """0.15초마다 화면 갱신. 오류가 나도 멈추지 않고, 겹쳐 불리지 않게 함"""
-        if busy["refresh"]:
+        if busy["refresh"] or busy.get("quitting"):
             return
         busy["refresh"] = True
         try:
@@ -1748,6 +1749,8 @@ def run_ui(start_minimized, selftest=False):
 
     def _refresh_body():
         pump_events()
+        if busy.get("quitting"):
+            return
         tick_popup()
         if updater.enabled and updater.ready and not updater.applied:
             # 새 버전을 받아 둔 상태: 아무도 말하지 않고 답장 중도 아닐 때, 창이 숨겨져 있으면 바로 / 열려 있으면 30분 뒤에 교체

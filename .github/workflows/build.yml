@@ -20,6 +20,7 @@ jobs:
         shell: bash
         env: { PYTHONIOENCODING: utf-8, PYTHONUTF8: "1", FAMILY_KEY: "105403" }
         run: |
+          set +e
           mkdir -p pcout
           export DATA_DIR="$RUNNER_TEMP"
           GITHUB_REPO= python -u server/server.py > pcout/server.out 2> pcout/server.log &
@@ -81,6 +82,7 @@ jobs:
         shell: bash
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
+          set +e
           { echo '```'; cat pcout/selftest.log 2>/dev/null | tail -150; echo; echo "--- 서버 기록 ---"; tail -40 pcout/server.log 2>/dev/null; echo; echo "--- 설치·교체 점검 ---"; cat pcout/install.log 2>/dev/null | tail -80; echo '```'; } > body.md
           gh issue create --title "PC 자가 점검 실패 (${{ github.run_number }})" --body-file body.md
 

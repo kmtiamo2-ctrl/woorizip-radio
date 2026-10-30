@@ -1161,29 +1161,65 @@ def run_ui(start_minimized, selftest=False):
             hotkey_label.configure(text="단축키 [%s]를 등록할 수 없어요" % key)
 
     # ---- 오른쪽 아래 팝업 ----
-    popup = {"win": None, "timer": None}
+    # 닫히는 규칙(0.15초마다 tick_popup이 확인):
+    #  · 기본: seconds 뒤 닫힘
+    #  · 마우스가 팝업 위에 있으면 잠시 더 두지만, 그래도 20초를 넘기지 않음 (팝업이 마우스 밑에 떠서 안 닫히던 문제)
+    #  · 답장칸을 연 뒤에는 1분 동안 아무 입력이 없거나, 본 창을 클릭하면 닫힘
+    popup = {"win": None, "created": 0.0, "deadline": 0.0, "replying": False, "last_active": 0.0, "hover_keeps": True}
 
     def close_popup():
+        w, popup["win"] = popup["win"], None
         popup["replying"] = False
-        if popup["timer"]:
+        if w:
             try:
-                root.after_cancel(popup["timer"])
+                w.destroy()
             except Exception:
                 pass
-            popup["timer"] = None
-        if popup["win"]:
-            try:
-                popup["win"].destroy()
-            except Exception:
-                pass
+
+    def popup_hovered():
+        pw = popup["win"]
+        if not pw:
+            return False
+        try:
+            x, y = root.winfo_pointerxy()
+            px, py, w_, h_ = pw.winfo_rootx(), pw.winfo_rooty(), pw.winfo_width(), pw.winfo_height()
+            return px <= x < px + w_ and py <= y < py + h_
+        except Exception:
+            return False
+
+    def tick_popup():
+        pw = popup["win"]
+        if not pw:
+            return
+        try:
+            alive = pw.winfo_exists()
+        except Exception:
+            alive = False
+        if not alive:
             popup["win"] = None
+            return
+        now = time.monotonic()
+        if popup["replying"]:
+            if now - popup["last_active"] > 60:
+                close_popup()
+            return
+        if now - popup["created"] > 20:
+            close_popup()
+            return
+        if popup["hover_keeps"] and popup_hovered():
+            popup["deadline"] = max(popup["deadline"], now + 2.0)
+            return
+        if now >= popup["deadline"]:
+            close_popup()
+
+    def popup_touch(*_):
+        popup["last_active"] = time.monotonic()
 
     def show_popup(title, text, reply_to=None, seconds=5, clip=None):
-        if popup["win"] and popup.get("replying"):
+        if popup["win"] and popup["replying"]:
             flash()   # 답장을 쓰는 중이면 팝업을 바꾸지 않음 (새 메시지는 목록에 있음)
             return
         close_popup()
-        popup["replying"] = False
         pw = ctk.CTkToplevel(root, fg_color=AMBER)
         pw.overrideredirect(True)
         pw.attributes("-topmost", True)
@@ -1199,35 +1235,19 @@ def run_ui(start_minimized, selftest=False):
         hint.pack(fill="x", padx=14, pady=(2, 10))
         reply_box = ctk.CTkFrame(inner, fg_color="transparent")
 
-        def keep(*_):   # 마우스가 올라와 있는 동안은 안 사라짐
-            if popup["timer"]:
-                try:
-                    root.after_cancel(popup["timer"])
-                except Exception:
-                    pass
-                popup["timer"] = None
-
-        def leave(e=None):   # 마우스가 떠나면 (답장 중이 아닐 때) 3초 뒤 닫힘
-            if popup["win"] is not pw or popup.get("replying"):
-                return
-            try:
-                inside = pw.winfo_containing(e.x_root, e.y_root) if e else None
-            except Exception:
-                inside = None
-            if inside is not None and str(inside).startswith(str(pw)):
-                return
-            keep()
-            popup["timer"] = root.after(3000, close_popup)
-
         def send_reply(t):
             t = t.strip()
             if t and reply_to and radio.send_text(t, to=reply_to):
+                # 새 창을 띄우지 않고 같은 팝업 안, 메시지 바로 아래에 '보냈어요'를 표시한 뒤 잠시 후 닫힘
+                reply_box.pack_forget()
+                ctk.CTkLabel(inner, text="✓ 보냈어요: %s" % t, font=font(12, True), text_color=GREEN, anchor="w").pack(fill="x", padx=14, pady=(2, 10))
                 popup["replying"] = False
-                close_popup()
-                show_popup("보냈어요", "%s님에게: %s" % (reply_to, t), seconds=2)
+                popup["hover_keeps"] = False          # 마우스가 위에 있어도 2.5초 뒤 닫힘
+                popup["deadline"] = time.monotonic() + 2.5
+                place()
 
         def show_reply(*_):
-            keep()
+            popup_touch()
             if clip:
                 radio.mark_seen(clip)
             if reply_box.winfo_ismapped() or not reply_to:
@@ -1245,18 +1265,16 @@ def run_ui(start_minimized, selftest=False):
             ent = ctk.CTkEntry(erow, font=font(12), height=32, corner_radius=12, fg_color=BG, border_color=OUTLINE)
             ent.pack(side="left", fill="x", expand=True)
             ent.bind("<Return>", lambda e: send_reply(ent.get()))
+            ent.bind("<Key>", popup_touch)
             pill(erow, "보내기", lambda: send_reply(ent.get()), width=64).pack(side="left", padx=(6, 0))
             ent.focus_set()
             place()
 
         for wdg in (pw, inner, head_, hint):
-            wdg.bind("<Enter>", keep)
             wdg.bind("<Button-1>", show_reply)
-        pw.bind("<Leave>", leave)
         for child in inner.winfo_children():
             try:
                 child.bind("<Button-1>", show_reply)
-                child.bind("<Enter>", keep)
             except Exception:
                 pass
 
@@ -1269,8 +1287,15 @@ def run_ui(start_minimized, selftest=False):
             pw.geometry("%dx%d+%d+%d" % (round(w_ / sc), round(h_ / sc), sw - w_ - 16, sh - h_ - 60))
         place()
         star_icon(pw)
-        popup["win"] = pw
-        popup["timer"] = root.after(int(seconds * 1000), close_popup)
+        now = time.monotonic()
+        popup.update(win=pw, created=now, deadline=now + seconds, replying=False, last_active=now, hover_keeps=True)
+
+    def main_window_focused(*_):
+        """본 창을 클릭하면 답장 중이던 팝업은 곧 닫힘"""
+        if popup["win"] and popup["replying"]:
+            popup["replying"] = False
+            popup["deadline"] = time.monotonic() + 3
+    root.bind("<FocusIn>", main_window_focused)
 
     # ---- 설정 ----
     def ask_password(parent, on_ok):
@@ -1619,6 +1644,7 @@ def run_ui(start_minimized, selftest=False):
 
     def _refresh_body():
         pump_events()
+        tick_popup()
         with radio.lock:
             me = cfg.name
             others = [m for m in radio.members if m != me]
@@ -2019,8 +2045,23 @@ def _selftest_start(ctx):
     step("엄마가 문자 보냄 → 팝업", lambda: helper.send({"type": "text", "to": "아빠", "text": "지금 갈게요"}),
          until=lambda: ctx["popup"]["win"] is not None and labels_with("지금 갈게요", ctx["popup"]["win"]))
     step("팝업 클릭 → 답장칸", lambda: ctx["popup"]["win"].event_generate("<Button-1>"), until=lambda: widgets(ctx["popup"]["win"], ctk.CTkEntry))
-    step("빠른 답장 '알겠어요'", lambda: button("알겠어요", ctx["popup"]["win"]).invoke(), until=lambda: helper.find("text", text="알겠어요", mode="direct"))
+
+    def new_text_while_replying():
+        ctx["reply_popup"] = ctx["popup"]["win"]
+        helper.send({"type": "text", "to": "아빠", "text": "하나 더"})
+    step("답장 쓰는 중 새 문자 → 팝업 유지", new_text_while_replying,
+         until=lambda: any(c.get("text") == "하나 더" for c in radio.clips) and ctx["popup"]["win"] is ctx["reply_popup"] and widgets(ctx["popup"]["win"], ctk.CTkEntry))
+    step("빠른 답장 '알겠어요' → 팝업 안에 '보냈어요'", lambda: button("알겠어요", ctx["popup"]["win"]).invoke(),
+         until=lambda: helper.find("text", text="알겠어요", mode="direct") and ctx["popup"]["win"] is ctx["reply_popup"] and labels_with("✓ 보냈어요", ctx["popup"]["win"]))
+    step("'보냈어요' 팝업은 저절로 닫힘", until=lambda: ctx["popup"]["win"] is None, timeout=8)
     step("엄마 쪽에 '봄' 확인 도착", until=lambda: any((m.get("status") or {}).get("아빠") == "seen" for m in helper.find("receipt")))
+    step("답장칸 열어 두고 본 창 클릭 → 닫힘", lambda: (helper.send({"type": "text", "to": "아빠", "text": "밥은?"}), None)[1],
+         until=lambda: ctx["popup"]["win"] is not None and labels_with("밥은?", ctx["popup"]["win"]))
+
+    def open_reply_then_focus_main():
+        ctx["popup"]["win"].event_generate("<Button-1>")
+        root.after(400, lambda: root.event_generate("<FocusIn>"))
+    step("  → 답장칸 열고 본 창에 포커스", open_reply_then_focus_main, until=lambda: ctx["popup"]["win"] is None, timeout=10)
 
     # 4. 실시간 말하기 수신 배너
     step("엄마 말하기 → 배너", lambda: helper.send({"type": "talk_start", "to": "all"}),

@@ -31,7 +31,10 @@ jobs:
           echo "--- 서버 기록 ---"; cat pcout/server.log 2>/dev/null || true
           if [ "$RC" != "0" ]; then echo "::error title=PC 자가 점검 실패::$(grep FAIL pcout/selftest.log | tr '\n' ' ' | cut -c1-800)"; fi
           exit $RC
-      - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray --collect-all customtkinter pc/radio_pc.py
+      - name: 프로그램 폴더(빠른 실행) + 설치 파일 만들기
+        run: |
+          pyinstaller --noconfirm --clean --onedir --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray --collect-all customtkinter pc/radio_pc.py
+          pyinstaller --noconfirm --onefile --windowed --name "WoorizipRadio-Setup" --icon pc/icon.ico --add-data "dist/WoorizipRadio;app" pc/setup.py
       - name: 실제 exe로 설치·교체 흐름 점검 (내려받은 파일 실행 → 자가 설치 → 새 파일로 교체 → 종료)
         shell: pwsh
         timeout-minutes: 6
@@ -41,14 +44,14 @@ jobs:
           $env:APPDATA = Join-Path $env:RUNNER_TEMP 'ra'
           New-Item -ItemType Directory -Force (Join-Path $env:APPDATA 'WoorizipRadio') | Out-Null
           Set-Content -Encoding UTF8 (Join-Path $env:APPDATA 'WoorizipRadio\config.json') '{"host":"127.0.0.1","out_host":"","name":"아빠","key":"105403","autostart":false}'
-          $inst = Join-Path $env:LOCALAPPDATA 'WoorizipRadio\WoorizipRadio.exe'
+          $inst = Join-Path $env:LOCALAPPDATA 'WoorizipRadio\app\WoorizipRadio.exe'
           $log = @()
-          Copy-Item dist\WoorizipRadio.exe (Join-Path $env:RUNNER_TEMP 'dl1.exe')
+          Copy-Item dist\WoorizipRadio-Setup.exe (Join-Path $env:RUNNER_TEMP 'dl1.exe')
           Start-Process (Join-Path $env:RUNNER_TEMP 'dl1.exe') -ArgumentList '--minimized'
           Start-Sleep 20
           $p1 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
           $log += "1) 내려받은 파일 실행 → 설치본 존재: $(Test-Path $inst) / 실행 중: $($p1.Count)개 / 경로: $(($p1 | ForEach-Object { $_.Path }) -join ' , ')"
-          Copy-Item dist\WoorizipRadio.exe (Join-Path $env:RUNNER_TEMP 'dl2.exe')
+          Copy-Item dist\WoorizipRadio-Setup.exe (Join-Path $env:RUNNER_TEMP 'dl2.exe')
           Start-Process (Join-Path $env:RUNNER_TEMP 'dl2.exe') -ArgumentList '--minimized','--updated'
           Start-Sleep 25
           $p2 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
@@ -68,7 +71,7 @@ jobs:
           $log | Out-File -Encoding utf8 pcout/install.log
           $log | Write-Host
           if (-not $pass) { Get-Process WoorizipRadio -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host "::error title=설치·교체 점검 실패::$($log[0..3] -join ' | ')"; exit 1 }
-      - run: Copy-Item dist/WoorizipRadio.exe pcout/
+      - run: Copy-Item dist/WoorizipRadio-Setup.exe pcout/WoorizipRadio.exe
       - uses: actions/upload-artifact@v4
         with:
           name: pc

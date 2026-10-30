@@ -121,6 +121,8 @@ object Radio : RadioClient.Listener {
     fun removeListener(l: () -> Unit) { listeners.remove(l) }
     private fun changed() { main.post { listeners.forEach { it() } } }
 
+    val httpBase: String? get() = client.httpBase
+    val currentNetwork: android.net.Network? get() = client.currentNetwork
     fun startConnection() { me = Prefs(app).name; client.start() }
     fun stopConnection() { stopTalk(); client.stop() }
     fun reconnect() { me = Prefs(app).name; client.reconnectNow() }

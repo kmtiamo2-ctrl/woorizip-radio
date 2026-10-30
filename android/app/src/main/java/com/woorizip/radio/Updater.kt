@@ -71,43 +71,64 @@ object Updater {
         }
     }
 
+    /** 설정의 [지금 업데이트 확인] 버튼: 결과를 글로 돌려줌 */
+    fun checkNow(ctx: Context, onResult: (String) -> Unit) {
+        val base = Radio.httpBase
+        if (base.isNullOrBlank() || !Radio.connected) { onResult("서버에 연결된 뒤에 확인할 수 있어요"); return }
+        if (busy) { onResult("이미 확인 중이에요"); return }
+        busy = true
+        lastCheck = System.currentTimeMillis()
+        val app = ctx.applicationContext
+        val net = Radio.currentNetwork
+        thread(name = "updater", isDaemon = true) {
+            try {
+                onResult(check(app, base.trimEnd('/'), net))
+            } catch (e: Exception) {
+                onResult("확인 실패: ${e.message ?: e}")
+            } finally {
+                busy = false
+            }
+        }
+    }
+
     private fun currentVersionCode(ctx: Context): Long = try {
         val pi = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
         if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode else @Suppress("DEPRECATION") pi.versionCode.toLong()
     } catch (_: Exception) { 0L }
 
-    private fun check(ctx: Context, base: String, network: Network?) {
+    private fun check(ctx: Context, base: String, network: Network?): String {
         // 집 주소는 Wi-Fi 망으로만 (폰이 모바일 데이터를 기본으로 쓰더라도)
         val client = if (network == null) http else http.newBuilder()
             .socketFactory(network.socketFactory)
             .dns(object : Dns { override fun lookup(hostname: String): List<InetAddress> = network.getAllByName(hostname).toList() })
             .build()
         val infoText = client.newCall(Request.Builder().url("$base/update/latest.json").build()).execute().use { r ->
-            if (!r.isSuccessful) return
-            r.body?.string() ?: return
+            if (!r.isSuccessful) return "서버에 아직 업데이트 정보가 없어요"
+            r.body?.string() ?: return "서버에 아직 업데이트 정보가 없어요"
         }
         val info = JSONObject(infoText)
-        val phone = info.optJSONObject("phone") ?: return
+        val phone = info.optJSONObject("phone") ?: return "서버에 폰용 새 버전이 없어요"
         val number = info.optLong("number", 0)
-        if (number <= currentVersionCode(ctx)) return
+        if (number <= currentVersionCode(ctx)) return "지금이 최신 버전이에요 (v${currentVersionCode(ctx)})"
         val name = File(phone.optString("file")).name
         val sha = phone.optString("sha256")
-        if (name.isBlank() || sha.isBlank()) return
+        if (name.isBlank() || sha.isBlank()) return "서버의 업데이트 정보가 이상해요"
         val dir = File(ctx.cacheDir, "update").apply { mkdirs() }
         dir.listFiles()?.forEach { if (it.name != name) it.delete() }
         val apk = File(dir, name)
         if (!(apk.exists() && sha256(apk) == sha)) {
             val tmp = File(dir, "$name.part")
             client.newCall(Request.Builder().url("$base/update/$name").build()).execute().use { r ->
-                if (!r.isSuccessful) return
-                val body = r.body ?: return
+                if (!r.isSuccessful) return "새 버전 파일을 받지 못했어요"
+                val body = r.body ?: return "새 버전 파일을 받지 못했어요"
                 tmp.outputStream().use { out -> body.byteStream().copyTo(out) }
             }
-            if (sha256(tmp) != sha) { tmp.delete(); Log.w(TAG, "받은 파일이 손상됨"); return }
-            if (!tmp.renameTo(apk)) { tmp.delete(); return }
+            if (sha256(tmp) != sha) { tmp.delete(); Log.w(TAG, "받은 파일이 손상됨"); return "받은 파일이 손상돼서 다음에 다시 받아요" }
+            if (!tmp.renameTo(apk)) { tmp.delete(); return "파일 저장 실패" }
         }
         Log.i(TAG, "새 버전 v$number 받음 → 설치 요청")
         install(ctx, apk, number)
+        return "새 버전 v$number 을 받았어요. 설치를 진행해요 (처음이면 알림을 눌러 허용)"
     }
 
     private fun sha256(f: File): String {

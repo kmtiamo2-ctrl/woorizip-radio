@@ -464,6 +464,10 @@ class MainActivity : AppCompatActivity() {
             if (RadioService.running) Radio.reconnect() else ensurePermissionsThenStart()
             render()
         }, lp(top = 12))
+        normal.addView(textButton("지금 업데이트 확인", cSub) {
+            toast("확인 중…")
+            Updater.checkNow(this) { r -> runOnUiThread { toast(r) } }
+        }, lp(top = 4))
         normal.addView(textButton("사용자·주소 변경 (가족 암호 필요)", cSub) {
             val pw = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD; hint = "가족 암호" }
             val wrap = FrameLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(pw) }

@@ -86,8 +86,8 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         Radio.uiVisible = true
         Radio.addListener(refresh)
-        // 서비스가 듣기 전용으로 살아 있었다면, 앱이 보이는 지금 마이크 포함으로 다시 올림
-        if (RadioService.running && !Radio.micReady && hasMic()) RadioService.start(this)
+        // 앱이 보이는 지금 서비스를 다시 올려 마이크 권한을 확실히 받아 둠 (백그라운드에서 시작됐으면 마이크가 무음이기 때문)
+        if (RadioService.running && hasMic()) RadioService.start(this)
         render()
     }
 

@@ -277,12 +277,17 @@ object Radio : RadioClient.Listener {
         Thread {
             try {
                 val pcm = clip.file.readBytes()
+                val t0 = System.nanoTime()
                 var i = 0
+                var n = 0L
                 while (i < pcm.size && playingClip === clip) {
                     val end = minOf(i + AudioSpec.FRAME_BYTES, pcm.size)
                     player.feed(pcm.copyOfRange(i, end))
                     i = end
-                    Thread.sleep(18)   // 20ms 프레임보다 살짝 빠르게 넣어 끊김 방지
+                    n++
+                    // 실제 시간에 맞춰 20ms마다 한 프레임 (너무 빨리 넣으면 버퍼가 넘쳐 끊김)
+                    val waitMs = (t0 + n * 20_000_000L - System.nanoTime()) / 1_000_000
+                    if (waitMs > 0) Thread.sleep(waitMs)
                 }
                 Thread.sleep(400)
             } catch (_: Exception) {

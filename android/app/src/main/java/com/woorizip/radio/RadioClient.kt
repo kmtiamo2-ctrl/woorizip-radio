@@ -144,7 +144,13 @@ class RadioClient(private val ctx: Context, private val listener: Listener) {
                 override fun lookup(hostname: String): List<InetAddress> = net.getAllByName(hostname).toList()
             })
         }
-        val req = Request.Builder().url(url).build()
+        val req = try {
+            Request.Builder().url(url).build()
+        } catch (_: IllegalArgumentException) {
+            setState(false, null, if (useHome) "집 주소 형식이 잘못됐어요" else "밖 주소 형식이 잘못됐어요")
+            return
+        }
+        var gotWelcome = false
         ws = builder.build().newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 val device = "android-" + Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID)
@@ -158,9 +164,11 @@ class RadioClient(private val ctx: Context, private val listener: Listener) {
                 val msg = try { JSONObject(text) } catch (_: Exception) { return }
                 when (msg.optString("type")) {
                     "welcome" -> {
+                        gotWelcome = true
                         backoff = 2000L
                         skipHome = false
                         setState(true, targetWhere, if (useHome) "집에서 연결됨" else "밖에서 연결됨")
+                        if (!useHome) scheduleHomeProbe()
                     }
                     "error" -> lastError = when (msg.optString("reason")) {
                         "auth" -> "가족 암호가 서버와 달라요"
@@ -180,23 +188,32 @@ class RadioClient(private val ctx: Context, private val listener: Listener) {
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                dropped(webSocket, useHome, "연결 끊김")
+                dropped(webSocket, useHome && !gotWelcome, "연결 끊김")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                dropped(webSocket, useHome, if (useHome) "집 주소로 연결 안 됨" else "밖 주소로 연결 안 됨")
+                dropped(webSocket, useHome && !gotWelcome, if (useHome) "집 주소로 연결 안 됨" else "밖 주소로 연결 안 됨")
             }
         })
     }
 
-    private fun dropped(w: WebSocket, wasHome: Boolean, why: String) {
+    /** 밖 주소로 붙어 있는 동안 Wi-Fi가 있으면 1분마다 집 주소를 다시 시도 (집에 돌아왔을 때 집 모드로 복귀) */
+    private fun scheduleHomeProbe() {
+        handler.postDelayed({
+            if (!running || where != "out") return@postDelayed
+            if (wifi != null || findWifi() != null) reconnectNow() else scheduleHomeProbe()
+        }, 60_000L)
+    }
+
+    /** homeFailed: 집 주소로 아예 연결이 안 된 경우(연결됐다가 끊긴 게 아니라) → 바로 밖 주소 시도 */
+    private fun dropped(w: WebSocket, homeFailed: Boolean, why: String) {
         handler.post {
             if (ws !== w) return@post
             ws = null
             val hadError = lastError != null
             setState(false, null, lastError ?: why)
             if (!running) return@post
-            if (wasHome && !hadError && Prefs(ctx).outHost.isNotBlank()) {
+            if (homeFailed && !hadError && Prefs(ctx).outHost.isNotBlank()) {
                 skipHome = true          // 집 주소 실패 → 바로 밖 주소로
                 connect()
             } else {

@@ -93,7 +93,8 @@ class RadioService : Service() {
         else ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
         return try {
             ServiceCompat.startForeground(this, Notifs.ID_STANDBY, notif, withMic)
-            Radio.micReady = true
+            // 앱 화면이 보일 때 시작한 경우에만 마이크를 믿을 수 있음 (백그라운드 시작은 안드로이드가 마이크를 무음 처리)
+            Radio.micReady = Radio.uiVisible
             true
         } catch (_: Exception) {
             try {

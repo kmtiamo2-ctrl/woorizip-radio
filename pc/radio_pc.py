@@ -12,6 +12,7 @@ import base64
 import json
 import math
 import os
+import queue
 import socket
 import ssl
 import struct
@@ -138,6 +139,7 @@ class WSClient:
         self.kick = threading.Event()
         self.last_error = None
         self.where = None
+        self.next_probe = 0.0
 
     def start(self):
         self.running = True
@@ -227,6 +229,10 @@ class WSClient:
         reason = "연결 끊김"
         msg_op, parts = None, []
         while self.running and self.sock is s:
+            if where == "out" and time.monotonic() > self.next_probe:
+                # 밖 주소로 붙어 있는 동안 1분마다 집 주소가 되는지 확인 → 되면 집 모드로 복귀
+                self.next_probe = time.monotonic() + 60
+                threading.Thread(target=self._probe_home, args=(s,), daemon=True).start()
             b1, b2 = self._recv_exact(s, 2)
             fin, op, n = b1 & 0x80, b1 & 0x0F, b2 & 0x7F
             if n == 126:
@@ -262,6 +268,15 @@ class WSClient:
                     self.on_bin(payload)
                 msg_op = None
         return reason
+
+    def _probe_home(self, current):
+        try:
+            host, port, _, _ = parse_addr(self.cfg.host)
+            socket.create_connection((host, port), timeout=2).close()
+        except Exception:
+            return
+        if self.sock is current:
+            self.reconnect()   # 현재 연결을 끊으면 루프가 집 주소부터 다시 시도
 
     def _send(self, op, payload):
         s = self.sock
@@ -344,10 +359,11 @@ class Audio:
             self.q.popleft()
 
     def play_all(self, pcm):
-        """클립 전체 재생 (큐 제한 없이)"""
+        """클립 전체 재생 (큐 제한 없이). 앞에 알림음을 붙임"""
         self.q.clear()
-        for i in range(0, len(pcm), FRAME_BYTES):
-            self.q.append(pcm[i:i + FRAME_BYTES])
+        for chunk in (BEEP_IN, bytes(1600), pcm):
+            for i in range(0, len(chunk), FRAME_BYTES):
+                self.q.append(chunk[i:i + FRAME_BYTES])
         self.waiting = False
 
     def stop_playback(self):
@@ -598,9 +614,8 @@ class Radio:
             if self.incoming_from or self.talking:
                 return
             self.playing = clip
-            self.audio.effect(BEEP_IN)
             self.audio.play_all(clip["pcm"])
-            threading.Timer(clip["seconds"] + 0.6, self._clip_done, [clip]).start()
+            threading.Timer(clip["seconds"] + 0.8, self._clip_done, [clip]).start()
 
     def _clip_done(self, clip):
         with self.lock:
@@ -668,25 +683,17 @@ def run_ui(start_minimized):
     tray = {"icon": None}
 
     def show_window(*_):
-        root.after(0, lambda: (root.deiconify(), root.lift(), root.focus_force()))
+        events.put(("show", None))   # 트레이 스레드에서 불리므로 큐로 넘김
 
     def hide_window():
         root.withdraw()
 
     def quit_app(*_):
-        def _q():
-            radio.stop_talk()
-            if tray["icon"]:
-                try:
-                    tray["icon"].stop()
-                except Exception:
-                    pass
-            root.destroy()
-        root.after(0, _q)
+        events.put(("quit", None))
 
     def toggle_dnd(*_):
         cfg.set(dnd=not cfg.dnd)
-        root.after(0, lambda: dnd_var.set(cfg.dnd))
+        events.put(("dnd", None))
 
     def start_tray():
         try:
@@ -826,9 +833,23 @@ def run_ui(start_minimized):
         w.transient(root)
         w.grab_set()
 
-    # ---- 이벤트 (다른 스레드에서 옴) ----
-    def on_event(kind, info):
-        def ui():
+    # ---- 이벤트 (다른 스레드에서 옴 → 큐에 넣고 화면 스레드에서 처리. 다른 스레드에서 tkinter를 건드리면 멈출 수 있음) ----
+    events = queue.Queue()
+    radio.on_event = lambda kind, info: events.put((kind, info))
+
+    def pump_events():
+        while True:
+            try:
+                kind, info = events.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                handle_event(kind, info)
+            except Exception:
+                pass
+
+    def handle_event(kind, info):
+        if True:
             if kind == "incoming":
                 flash()
                 who = info.get("from")
@@ -842,13 +863,24 @@ def run_ui(start_minimized):
                     show_window()
             elif kind == "state":
                 set_tray(radio.connected, radio.where)
-        root.after(0, ui)
-    radio.on_event = on_event
+            elif kind == "dnd":
+                dnd_var.set(cfg.dnd)
+            elif kind == "show":
+                root.deiconify(); root.lift(); root.focus_force()
+            elif kind == "quit":
+                radio.stop_talk()
+                if tray["icon"]:
+                    try:
+                        tray["icon"].stop()
+                    except Exception:
+                        pass
+                root.destroy()
 
     # ---- 화면 갱신 ----
     cache = {"buttons": None, "clips": None}
 
     def refresh():
+        pump_events()
         with radio.lock:
             me = cfg.name
             others = [m for m in radio.members if m != me]

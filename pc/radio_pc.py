@@ -121,7 +121,8 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 def autostart_command():
     if getattr(sys, "frozen", False):
-        return '"%s" --minimized' % sys.executable
+        exe = installed_exe_path() if os.path.exists(installed_exe_path()) else sys.executable   # 항상 설치본을 가리킴
+        return '"%s" --minimized' % exe
     exe = sys.executable.replace("python.exe", "pythonw.exe")
     return '"%s" "%s" --minimized' % (exe, os.path.abspath(__file__))
 
@@ -172,7 +173,7 @@ class WSClient:
         threading.Thread(target=self._heartbeat, daemon=True).start()
 
     def _heartbeat(self):
-        """20초마다 서버에 신호를 보내고, 60초 동안 아무 응답이 없으면 죽은 연결로 보고 다시 붙음"""
+        """30초마다 서버에 신호를 보내고, 2분 동안 아무 응답이 없으면 죽은 연결로 보고 다시 붙음"""
         while self.running:
             time.sleep(5)
             s = self.sock
@@ -753,16 +754,17 @@ class Radio:
         text = text.strip()
         if not text:
             return False
-        target = to if to else self.target_json()
-        if self.connected and self.client.send_json({"type": "text", "to": target, "text": text}):
-            log("문자 보내기 -> %r: %s" % (target, text))
-            return True
-        # 연결이 없거나 보내는 중 끊김 → 보관했다가 연결되면 자동 전송
-        self.outbox.append({"to": target, "text": text, "ts": time.time(), "from": self.cfg.name})
-        del self.outbox[:-50]
-        self._save_outbox()
-        self.notice = "지금 연결이 없어서 보관했어요. 연결되면 자동으로 보내요 (%d개 대기)" % len(self.outbox)
-        log("문자 보관(연결 없음, %s) -> %r: %s" % (self.status, target, text))
+        with self.lock:
+            target = to if to else self.target_json()
+            if self.connected and self.client.send_json({"type": "text", "to": target, "text": text}):
+                log("문자 보내기 -> %r: %s" % (target, text))
+                return True
+            # 연결이 없거나 보내는 중 끊김 → 보관했다가 연결되면 자동 전송
+            self.outbox.append({"to": target, "text": text, "ts": time.time(), "from": self.cfg.name})
+            del self.outbox[:-50]
+            self._save_outbox()
+            self.notice = "지금 연결이 없어서 보관했어요. 연결되면 자동으로 보내요 (%d개 대기)" % len(self.outbox)
+            log("문자 보관(연결 없음, %s) -> %r: %s" % (self.status, target, text))
         self.client.reconnect()   # 혹시 죽은 연결이면 바로 다시 붙도록
         return True
 
@@ -811,7 +813,8 @@ class Radio:
         if not mid or clip.get("mine") or mid in self.seen_sent:
             return
         self.seen_sent.add(mid)
-        self.client.send_json({"type": "seen", "mid": mid})
+        if not self.client.send_json({"type": "seen", "mid": mid}):
+            self.seen_sent.discard(mid)   # 연결이 없으면 다음 갱신 때 다시 시도
 
     def receipt_text(self, c):
         """내가 보낸 메시지의 가족별 확인 표시: ✓ 받음, ✓✓ 봄(들음)"""
@@ -921,25 +924,45 @@ def run_ui(start_minimized, selftest=False):
     AMBER, AMBER_D, ON_AMBER, GREEN, RED, BLUE, OUTLINE = "#F5B301", "#C98F00", "#1A1200", "#34D399", "#F26D6D", "#8FB3FF", "#2B3752"
     FAM = "Malgun Gothic"
 
-    def font(size, bold=False):
-        return ctk.CTkFont(family=FAM, size=size, weight="bold" if bold else "normal")
+    _fonts = {}
+
+    def font(size, bold=False):   # 같은 글꼴은 한 번만 만듦 (목록을 다시 그릴 때 빨라짐)
+        k = (size, bold)
+        if k not in _fonts:
+            _fonts[k] = ctk.CTkFont(family=FAM, size=size, weight="bold" if bold else "normal")
+        return _fonts[k]
 
     root = ctk.CTk(fg_color=BG)
     root.title(APP_TITLE)
-    root.geometry("480x900")
-    root.minsize(440, 720)
+
+    def scaling(win):
+        try:
+            return float(ctk.ScalingTracker.get_window_scaling(win)) or 1.0
+        except Exception:
+            return 1.0
+
+    # 창 크기는 논리 픽셀(배율 적용 전). 125%·150% 배율 노트북에서도 화면 안에 들어가게 높이를 맞춤
+    avail = int(root.winfo_screenheight() / scaling(root)) - 90
+    root.geometry("480x%d" % max(600, min(900, avail)))
+    root.minsize(440, max(600, min(720, avail)))
+
+    ico_path = os.path.join(data_dir(), "icon.ico")
     try:
         # customtkinter는 0.2초 뒤 제목줄 아이콘을 자기 로고로 바꿈 → iconbitmap을 먼저 불러 두면 안 바꿈
-        ico_path = os.path.join(data_dir(), "icon.ico")
         make_icon((37, 99, 235, 255), 64).save(ico_path, format="ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64)])
         root.iconbitmap(ico_path)
     except Exception:
-        pass
+        ico_path = None
     try:
         _win_icon = ImageTk.PhotoImage(make_icon((37, 99, 235, 255), 64))
         root.iconphoto(True, _win_icon)
     except Exception:
         pass
+
+    def star_icon(win):
+        """새 창(Toplevel)에도 별 아이콘. customtkinter가 0.2초 뒤 자기 로고로 바꾸므로 그 뒤에 다시 지정"""
+        if ico_path:
+            win.after(350, lambda: win.winfo_exists() and win.iconbitmap(ico_path))
 
     # ---- 이벤트 큐 (다른 스레드 → 화면 스레드) ----
     events = queue.Queue()
@@ -1008,11 +1031,9 @@ def run_ui(start_minimized, selftest=False):
         return ctk.CTkButton(parent, text=text, command=cmd, font=font(12), width=48, height=28, corner_radius=10,
                              fg_color="transparent", hover_color=CARD2, text_color=color)
 
-    # ---- 본문 (스크롤) ----
-    page = ctk.CTkScrollableFrame(root, fg_color=BG, corner_radius=0, scrollbar_button_color=CARD2, scrollbar_button_hover_color=OUTLINE)
-    page.pack(fill="both", expand=True)
-    body = ctk.CTkFrame(page, fg_color="transparent")
-    body.pack(fill="x", padx=18, pady=(14, 20))
+    # ---- 본문: 위는 고정, 메시지 목록만 남은 높이를 채우며 스크롤 (목록 위에서 휠을 굴려도 다른 게 안 움직임) ----
+    body = ctk.CTkFrame(root, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=18, pady=(14, 16))
 
     # 머리글
     head = ctk.CTkFrame(body, fg_color="transparent")
@@ -1080,25 +1101,26 @@ def run_ui(start_minimized, selftest=False):
                           width=10).pack(side="left", padx=(0, 6), pady=2)
     render_chips()
 
-    # 메시지 목록
-    msg_card, msg_inner = card(body, pad=12)
-    section(msg_inner, "메시지  ·  최근 것이 위").pack(anchor="w", padx=4)
-    msg_list = ctk.CTkScrollableFrame(msg_inner, fg_color="transparent", height=230, scrollbar_button_color=CARD2)
-    msg_list.pack(fill="x", pady=(4, 0))
-
-    # 하단: 단축키 안내 + 설정
+    # 하단: 단축키 안내 + 설정 (먼저 아래쪽에 붙여 두고, 메시지 목록이 남은 공간을 채움)
     foot = ctk.CTkFrame(body, fg_color="transparent")
-    foot.pack(fill="x", pady=(14, 0))
+    foot.pack(side="bottom", fill="x", pady=(10, 0))
     hotkey_label = ctk.CTkLabel(foot, text="", font=font(11), text_color=SUB, anchor="w", wraplength=320, justify="left")
     hotkey_label.pack(side="left", fill="x", expand=True)
     pill(foot, "설정", lambda: open_settings(), filled=False, width=70).pack(side="right")
+
+    # 메시지 목록
+    msg_card, msg_inner = card(body, pad=12)
+    msg_card.pack(fill="both", expand=True, pady=(14, 0))
+    section(msg_inner, "메시지  ·  최근 것이 위").pack(anchor="w", padx=4)
+    msg_list = ctk.CTkScrollableFrame(msg_inner, fg_color="transparent", scrollbar_button_color=CARD2, scrollbar_button_hover_color=OUTLINE)
+    msg_list.pack(fill="both", expand=True, pady=(4, 0))
 
     # ---- 단축키 ----
     hk = {"down": False}
 
     def bind_hotkey():
         global keyboard
-        key = cfg.hotkey.strip().lower().replace(" ", "")
+        key = "+".join(k.strip() for k in cfg.hotkey.strip().lower().split("+") if k.strip())   # 'scroll lock'처럼 띄어쓴 이름 유지
         if not key:
             if keyboard is not None:
                 try:
@@ -1142,6 +1164,7 @@ def run_ui(start_minimized, selftest=False):
     popup = {"win": None, "timer": None}
 
     def close_popup():
+        popup["replying"] = False
         if popup["timer"]:
             try:
                 root.after_cancel(popup["timer"])
@@ -1156,7 +1179,11 @@ def run_ui(start_minimized, selftest=False):
             popup["win"] = None
 
     def show_popup(title, text, reply_to=None, seconds=5, clip=None):
+        if popup["win"] and popup.get("replying"):
+            flash()   # 답장을 쓰는 중이면 팝업을 바꾸지 않음 (새 메시지는 목록에 있음)
+            return
         close_popup()
+        popup["replying"] = False
         pw = ctk.CTkToplevel(root, fg_color=AMBER)
         pw.overrideredirect(True)
         pw.attributes("-topmost", True)
@@ -1172,7 +1199,7 @@ def run_ui(start_minimized, selftest=False):
         hint.pack(fill="x", padx=14, pady=(2, 10))
         reply_box = ctk.CTkFrame(inner, fg_color="transparent")
 
-        def keep(*_):
+        def keep(*_):   # 마우스가 올라와 있는 동안은 안 사라짐
             if popup["timer"]:
                 try:
                     root.after_cancel(popup["timer"])
@@ -1180,9 +1207,22 @@ def run_ui(start_minimized, selftest=False):
                     pass
                 popup["timer"] = None
 
+        def leave(e=None):   # 마우스가 떠나면 (답장 중이 아닐 때) 3초 뒤 닫힘
+            if popup["win"] is not pw or popup.get("replying"):
+                return
+            try:
+                inside = pw.winfo_containing(e.x_root, e.y_root) if e else None
+            except Exception:
+                inside = None
+            if inside is not None and str(inside).startswith(str(pw)):
+                return
+            keep()
+            popup["timer"] = root.after(3000, close_popup)
+
         def send_reply(t):
             t = t.strip()
             if t and reply_to and radio.send_text(t, to=reply_to):
+                popup["replying"] = False
                 close_popup()
                 show_popup("보냈어요", "%s님에게: %s" % (reply_to, t), seconds=2)
 
@@ -1192,6 +1232,7 @@ def run_ui(start_minimized, selftest=False):
                 radio.mark_seen(clip)
             if reply_box.winfo_ismapped() or not reply_to:
                 return
+            popup["replying"] = True
             hint.pack_forget()
             reply_box.pack(fill="x", padx=12, pady=(6, 12))
             chips = ctk.CTkFrame(reply_box, fg_color="transparent")
@@ -1211,6 +1252,7 @@ def run_ui(start_minimized, selftest=False):
         for wdg in (pw, inner, head_, hint):
             wdg.bind("<Enter>", keep)
             wdg.bind("<Button-1>", show_reply)
+        pw.bind("<Leave>", leave)
         for child in inner.winfo_children():
             try:
                 child.bind("<Button-1>", show_reply)
@@ -1219,11 +1261,14 @@ def run_ui(start_minimized, selftest=False):
                 pass
 
         def place():
+            # winfo_* 는 실제 픽셀, geometry()의 크기는 배율 적용 전 값이라 나눠서 넣음 (125%·150% 화면에서 잘리지 않게)
             pw.update_idletasks()
-            w_, h_ = max(pw.winfo_reqwidth(), 330), pw.winfo_reqheight()
+            sc = scaling(pw)
+            w_, h_ = max(pw.winfo_reqwidth(), int(330 * sc)), pw.winfo_reqheight()
             sw, sh = pw.winfo_screenwidth(), pw.winfo_screenheight()
-            pw.geometry("%dx%d+%d+%d" % (w_, h_, sw - w_ - 16, sh - h_ - 60))
+            pw.geometry("%dx%d+%d+%d" % (round(w_ / sc), round(h_ / sc), sw - w_ - 16, sh - h_ - 60))
         place()
+        star_icon(pw)
         popup["win"] = pw
         popup["timer"] = root.after(int(seconds * 1000), close_popup)
 
@@ -1241,20 +1286,32 @@ def run_ui(start_minimized, selftest=False):
         def ok(*_):
             if e.get() == cfg.key:
                 d.destroy()
+                try:
+                    parent.grab_set()   # 설정 창의 '모달'을 되살림
+                except Exception:
+                    pass
                 on_ok()
             else:
                 messagebox.showerror("설정", "암호가 달라요", parent=d)
         e.bind("<Return>", ok)
         pill(d, "확인", ok, width=100).pack(pady=14)
+        star_icon(d)
         d.grab_set()
+
+    wins = {"settings": None}
 
     def open_settings():
         show_window()
+        if wins["settings"] and wins["settings"].winfo_exists():
+            wins["settings"].lift()
+            return
         w = ctk.CTkToplevel(root, fg_color=BG)
+        wins["settings"] = w
         w.title("설정")
         w.geometry("460x560")
         w.resizable(False, True)
         w.transient(root)
+        star_icon(w)
         members = radio.members or DEFAULT_MEMBERS
         box = ctk.CTkScrollableFrame(w, fg_color=BG)
         box.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1388,13 +1445,15 @@ def run_ui(start_minimized, selftest=False):
         w.title("예약 메시지")
         w.geometry("460x600")
         w.transient(root)
+        star_icon(w)
         sched["w"] = w
         box = ctk.CTkFrame(w, fg_color="transparent")
         box.pack(fill="both", expand=True, padx=16, pady=14)
         ctk.CTkLabel(box, text="⏰ 예약 메시지", font=font(18, True), text_color=TXT, anchor="w").pack(anchor="w")
         ctk.CTkLabel(box, text="받는 사람: %s  (창에서 고른 상대)" % radio.target_label(), font=font(12), text_color=SUB, anchor="w").pack(anchor="w", pady=(2, 10))
         t_entry = ctk.CTkEntry(box, placeholder_text="내용", font=font(14), height=40, corner_radius=14, fg_color=CARD, border_color=OUTLINE)
-        t_entry.insert(0, entry.get().strip())
+        if entry.get().strip():
+            t_entry.insert(0, entry.get().strip())
         t_entry.pack(fill="x")
         row = ctk.CTkFrame(box, fg_color="transparent")
         row.pack(fill="x", pady=(10, 0))
@@ -1434,7 +1493,9 @@ def run_ui(start_minimized, selftest=False):
                 messagebox.showwarning("예약", "지금 연결이 없어요. 연결된 뒤 다시 시도하세요", parent=w)
                 return
             t_entry.delete(0, "end")
-        pill(box, "예약 추가", add, width=140).pack(pady=(12, 8))
+        pill(box, "예약 추가", add, width=140).pack(pady=(12, 4))
+        sched["notice"] = ctk.CTkLabel(box, text="", font=font(12), text_color=RED, anchor="w")
+        sched["notice"].pack(anchor="w")
         section(box, "내 예약 목록").pack(anchor="w")
         lst = ctk.CTkScrollableFrame(box, fg_color=CARD, corner_radius=14, height=220)
         lst.pack(fill="both", expand=True, pady=(4, 0))
@@ -1446,6 +1507,10 @@ def run_ui(start_minimized, selftest=False):
         lst = sched.get("list")
         if not lst or not lst.winfo_exists():
             return
+        try:   # 예약 실패 사유는 예약 창 안에 보여 줌
+            sched["notice"].configure(text=radio.notice if radio.notice.startswith("예약 실패") else "")
+        except Exception:
+            pass
         for c in lst.winfo_children():
             c.destroy()
         items = radio.schedules
@@ -1533,7 +1598,26 @@ def run_ui(start_minimized, selftest=False):
                              text_color=ON_AMBER if sel else (TXT if (on or value == "all") else SUB),
                              border_width=0 if sel else 1, border_color=OUTLINE)
 
+    busy = {"refresh": False}
+
     def refresh():
+        """0.15초마다 화면 갱신. 오류가 나도 멈추지 않고, 겹쳐 불리지 않게 함"""
+        if busy["refresh"]:
+            return
+        busy["refresh"] = True
+        try:
+            _refresh_body()
+        except Exception as e:
+            log("화면 갱신 오류: %r" % e)
+        finally:
+            busy["refresh"] = False
+            try:
+                if root.winfo_exists():
+                    root.after(150, refresh)
+            except Exception:
+                pass
+
+    def _refresh_body():
         pump_events()
         with radio.lock:
             me = cfg.name
@@ -1575,7 +1659,7 @@ def run_ui(start_minimized, selftest=False):
                 talk.configure(fg_color=AMBER); talk_title.configure(text="누르고 말하기", text_color=ON_AMBER); talk_sub.configure(text=who, text_color=ON_AMBER)
             notice.configure(text=radio.notice)
 
-            window_visible = root.state() == "normal"
+            window_visible = root.state() in ("normal", "zoomed")   # 최대화된 창도 보이는 것
             csig = tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
                           window_visible and c.get("kind") == "text" and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent)
                          for c in radio.clips[:20])
@@ -1583,9 +1667,9 @@ def run_ui(start_minimized, selftest=False):
                 cache["clips"] = csig
                 for c in msg_list.winfo_children():
                     c.destroy()
-                if radio.clips:
-                    if not msg_card.winfo_ismapped():
-                        msg_card.pack(fill="x", pady=(14, 0), after=compose_card)
+                if not radio.clips:
+                    ctk.CTkLabel(msg_list, text="아직 메시지가 없어요", font=font(12), text_color=SUB).pack(pady=24)
+                else:
                     for c in radio.clips[:20]:
                         playing = radio.playing is c
                         row = ctk.CTkFrame(msg_list, fg_color=CARD2, corner_radius=12)
@@ -1612,9 +1696,6 @@ def run_ui(start_minimized, selftest=False):
                             small(btns, "답장", lambda c=c: (radio.set_target(c["from"]), entry.focus_set())).pack(side="right")
                         if c.get("kind") == "clip":
                             small(btns, "정지" if playing else "듣기", lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c)).pack(side="right")
-                elif msg_card.winfo_ismapped():
-                    msg_card.pack_forget()
-        root.after(150, refresh)
 
     def on_close():
         if tray["icon"]:
@@ -1626,10 +1707,11 @@ def run_ui(start_minimized, selftest=False):
             quit_app()
     root.protocol("WM_DELETE_WINDOW", on_close)
 
-    try:
-        set_autostart(cfg.autostart)
-    except Exception:
-        pass
+    if running_from_install():   # 다운로드 폴더에서 그냥 돌고 있을 때는 그 경로를 자동 시작에 등록하지 않음
+        try:
+            set_autostart(cfg.autostart)
+        except Exception:
+            pass
     start_tray()
     bind_hotkey()
     radio.start()
@@ -1660,10 +1742,7 @@ def single_instance():
     already = False
     if os.name == "nt":
         try:
-            import ctypes
-            k32 = ctypes.windll.kernel32
-            _mutex_handle = k32.CreateMutexW(None, False, "Local\\WoorizipRadio_single_instance")
-            already = (k32.GetLastError() == 183)   # ERROR_ALREADY_EXISTS
+            _, _mutex_handle, already = _create_mutex()
         except Exception as e:
             log("뮤텍스 확인 실패: %s" % e)
     s = None
@@ -1716,8 +1795,11 @@ def make_desktop_shortcut():
         ps = ("$ErrorActionPreference='Stop'\n"
               "$desk=[Environment]::GetFolderPath('DesktopDirectory')\n"
               "if(-not (Test-Path $desk)){ New-Item -ItemType Directory -Force $desk | Out-Null }\n"
-              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $desk '우리집.lnk'))\n"
+              # WScript.Shell은 영문판 Windows에서 한글 파일 이름을 못 쓰므로 영문 이름으로 만든 뒤 바꿈
+              "$tmp=Join-Path $desk 'WoorizipRadio.lnk'\n"
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($tmp)\n"
               "$s.TargetPath='%s'\n$s.WorkingDirectory='%s'\n$s.IconLocation='%s,0'\n$s.Description='우리집'\n$s.Save()\n"
+              "Move-Item -Force -LiteralPath $tmp -Destination (Join-Path $desk '우리집.lnk')\n"
               % (target.replace("'", "''"), os.path.dirname(target).replace("'", "''"), target.replace("'", "''")))
         script = os.path.join(data_dir(), "shortcut.ps1")
         with open(script, "w", encoding="utf-8-sig") as f:
@@ -1733,18 +1815,41 @@ def make_desktop_shortcut():
         return False, "바로가기를 만들지 못했어요"
 
 
+MUTEX_NAME = "Local\\WoorizipRadio_single_instance"
+
+
+def _create_mutex():
+    """(핸들, 이미 있었는지). GetLastError는 ctypes의 use_last_error로 안전하게 읽음"""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, ctypes.c_wchar_p]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.CreateMutexW(None, False, MUTEX_NAME)
+    return k32, h, ctypes.get_last_error() == 183   # ERROR_ALREADY_EXISTS
+
+
 def _instance_running():
     """다른 인스턴스가 떠 있는지 (Windows 뮤텍스)"""
     try:
-        import ctypes
-        k32 = ctypes.windll.kernel32
-        h = k32.CreateMutexW(None, False, "Local\\WoorizipRadio_single_instance")
-        exists = (k32.GetLastError() == 183)
+        k32, h, exists = _create_mutex()
         if h:
             k32.CloseHandle(h)
         return exists
     except Exception:
         return False
+
+
+def installed_exe_path():
+    return os.path.join(os.environ.get("LOCALAPPDATA") or data_dir(), "WoorizipRadio", "WoorizipRadio.exe")
+
+
+def running_from_install():
+    """자동 시작에 등록해도 되는 위치(설치본 또는 개발용 스크립트)에서 실행 중인지"""
+    if not getattr(sys, "frozen", False):
+        return True
+    return os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(installed_exe_path())
 
 
 def ensure_installed():
@@ -1755,8 +1860,8 @@ def ensure_installed():
     """
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return False
-    target_dir = os.path.join(os.environ.get("LOCALAPPDATA") or data_dir(), "WoorizipRadio")
-    target = os.path.join(target_dir, "WoorizipRadio.exe")
+    target = installed_exe_path()
+    target_dir = os.path.dirname(target)
     cur = os.path.abspath(sys.executable)
     if os.path.normcase(cur) == os.path.normcase(target):
         return False
@@ -1776,6 +1881,14 @@ def ensure_installed():
             if not _instance_running():
                 break
             time.sleep(0.25)
+        if _instance_running():
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, "실행 중인 '우리집'을 먼저 종료해 주세요.\n(오른쪽 아래 시계 옆 별 아이콘 → 완전히 종료)\n\n그 다음 이 파일을 다시 실행하면 새 버전으로 바뀌어요.",
+                                                 "우리집 설치", 0x30)
+            except Exception:
+                pass
+            return True   # 호출한 쪽은 종료 (옛 버전이 계속 돌고 있음)
     copied = False
     for _ in range(30):
         try:

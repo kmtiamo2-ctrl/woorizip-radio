@@ -1415,16 +1415,37 @@ def run_ui(start_minimized):
 
 GUARD_PORT = 47651
 show_requests = queue.Queue()   # 두 번째 실행이 "창 열어 줘"라고 보낸 요청
+_mutex_handle = None
 
 
 def single_instance():
-    """이미 실행 중이면 그 프로그램에 '창 열어 줘'를 보내고 None을 돌려줌"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", GUARD_PORT))
-        s.listen(2)
-    except OSError:
+    """
+    프로그램이 하나만 돌게 함. 이미 실행 중이면 그 프로그램에 '창 열어 줘'를 보내고 None을 돌려줌.
+    Windows에서는 소켓 포트 검사가 믿을 수 없어서(같은 포트를 둘이 열 수 있음) 이름 있는 뮤텍스로 확인함.
+    """
+    global _mutex_handle
+    already = False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            _mutex_handle = k32.CreateMutexW(None, False, "Local\\WoorizipRadio_single_instance")
+            already = (k32.GetLastError() == 183)   # ERROR_ALREADY_EXISTS
+        except Exception as e:
+            log("뮤텍스 확인 실패: %s" % e)
+    s = None
+    if not already:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name == "nt":
+                s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1)
+            s.bind(("127.0.0.1", GUARD_PORT))
+            s.listen(2)
+        except OSError:
+            s = None
+            if os.name != "nt":
+                already = True
+    if already:
         try:
             c = socket.create_connection(("127.0.0.1", GUARD_PORT), timeout=1)
             c.sendall(b"show")
@@ -1432,6 +1453,8 @@ def single_instance():
         except Exception:
             pass
         return None
+    if s is None:
+        return object()   # 뮤텍스는 잡았지만 '창 열어 줘' 통로는 못 만듦 → 그래도 실행
 
     def accept_loop():
         while True:

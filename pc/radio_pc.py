@@ -10,6 +10,8 @@
 """
 import base64
 import json
+import shutil
+import subprocess
 import math
 import os
 import queue
@@ -28,7 +30,7 @@ try:
     from version import __version__
 except Exception:
     __version__ = "dev"
-APP_TITLE = "우리집 무전기 " + __version__
+APP_TITLE = "우리집 " + __version__
 RATE = 16000
 FRAME_BYTES = 640  # 20ms, 16비트 모노
 LIVE, CLIP = 1, 2
@@ -898,36 +900,45 @@ def make_icon(color, size=64):
     return img.resize((size, size), Image.LANCZOS)
 
 
-# ---------------------------------------------------------------- 화면
+# ---------------------------------------------------------------- 화면 (customtkinter: 둥근 카드, 어두운 남색 + 앰버 포인트)
 
 def run_ui(start_minimized):
     import tkinter as tk
     from tkinter import messagebox
+    import customtkinter as ctk
+    from PIL import ImageTk
+
+    ctk.set_appearance_mode("dark")
 
     cfg = Config()
     radio = Radio(cfg)
 
-    BG, CARD, TXT, SUB = "#0F172A", "#1E293B", "#F1F5F9", "#94A3B8"
-    ACCENT, GREEN, RED, BLUE = "#F59E0B", "#22C55E", "#EF4444", "#2563EB"
-    F = "Malgun Gothic"
+    BG, CARD, CARD2, TXT, SUB = "#0B1220", "#141C2E", "#1C2740", "#F3F5F9", "#9AA6BC"
+    AMBER, AMBER_D, ON_AMBER, GREEN, RED, BLUE, OUTLINE = "#F5B301", "#C98F00", "#1A1200", "#34D399", "#F26D6D", "#8FB3FF", "#2B3752"
+    FAM = "Malgun Gothic"
 
-    root = tk.Tk()
+    def font(size, bold=False):
+        return ctk.CTkFont(family=FAM, size=size, weight="bold" if bold else "normal")
+
+    root = ctk.CTk(fg_color=BG)
     root.title(APP_TITLE)
-    root.configure(bg=BG)
+    root.geometry("480x900")
+    root.minsize(440, 720)
     try:
-        from PIL import ImageTk
         _win_icon = ImageTk.PhotoImage(make_icon((37, 99, 235, 255), 64))
         root.iconphoto(True, _win_icon)
     except Exception:
         pass
-    root.geometry("460x800")
-    root.minsize(420, 640)
 
-    # ---- 트레이 아이콘 ----
+    # ---- 이벤트 큐 (다른 스레드 → 화면 스레드) ----
+    events = queue.Queue()
+    radio.on_event = lambda kind, info: events.put((kind, info))
+
+    # ---- 트레이 ----
     tray = {"icon": None}
 
     def show_window(*_):
-        events.put(("show", None))   # 트레이 스레드에서 불리므로 큐로 넘김
+        events.put(("show", None))
 
     def hide_window():
         root.withdraw()
@@ -967,161 +978,111 @@ def run_ui(start_minimized):
             except Exception:
                 pass
 
-    # ---- 화면 요소 ----
-    tk.Label(root, text=APP_TITLE, font=(F, 20, "bold"), fg=TXT, bg=BG).pack(anchor="w", padx=20, pady=(18, 0))  # 제목에 버전 표시
-    status = tk.Label(root, text="", font=(F, 10), fg=SUB, bg=BG)
-    status.pack(anchor="w", padx=20)
-    incoming = tk.Label(root, text="", font=(F, 13, "bold"), fg="black", bg=ACCENT, pady=8)
+    # ---- 공통 위젯 ----
+    def card(parent, pad=16):
+        f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=18, border_width=1, border_color=OUTLINE)
+        inner = ctk.CTkFrame(f, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=pad, pady=pad)
+        return f, inner
 
-    tk.Label(root, text="누구에게 말할까요? (여러 명 고를 수 있어요)", font=(F, 10), fg=SUB, bg=BG).pack(anchor="w", padx=20, pady=(14, 4))
-    grid = tk.Frame(root, bg=BG)
-    grid.pack(fill="x", padx=16)
+    def section(parent, text):
+        return ctk.CTkLabel(parent, text=text, font=font(12, True), text_color=SUB, anchor="w")
 
-    talk = tk.Label(root, text="", font=(F, 18, "bold"), fg="white", bg=BLUE, height=4, cursor="hand2")
-    talk.pack(fill="x", padx=20, pady=(14, 6))
-    talk.bind("<ButtonPress-1>", lambda e: radio.start_talk())
-    talk.bind("<ButtonRelease-1>", lambda e: radio.stop_talk())
-    notice = tk.Label(root, text="", font=(F, 11), fg=ACCENT, bg=BG, wraplength=400)
-    notice.pack(pady=(0, 6))
+    def pill(parent, text, cmd, filled=True, width=90):
+        return ctk.CTkButton(parent, text=text, command=cmd, font=font(13, filled), width=width, height=36, corner_radius=14,
+                             fg_color=AMBER if filled else CARD2, hover_color=AMBER_D if filled else "#263654",
+                             text_color=ON_AMBER if filled else TXT, border_width=0 if filled else 1, border_color=OUTLINE)
 
-    # 글로 보내기 (말할 수 없을 때)
-    text_box = tk.Frame(root, bg=CARD)
-    text_box.pack(fill="x", padx=20, pady=6)
-    tk.Label(text_box, text="말하기 어려우면 글로 보내기", font=(F, 9), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(8, 2))
-    chip_row = tk.Frame(text_box, bg=CARD)
-    chip_row.pack(fill="x", padx=6)
+    def small(parent, text, cmd, color=BLUE):
+        return ctk.CTkButton(parent, text=text, command=cmd, font=font(12), width=48, height=28, corner_radius=10,
+                             fg_color="transparent", hover_color=CARD2, text_color=color)
+
+    # ---- 본문 (스크롤) ----
+    page = ctk.CTkScrollableFrame(root, fg_color=BG, corner_radius=0, scrollbar_button_color=CARD2, scrollbar_button_hover_color=OUTLINE)
+    page.pack(fill="both", expand=True)
+    body = ctk.CTkFrame(page, fg_color="transparent")
+    body.pack(fill="x", padx=18, pady=(14, 20))
+
+    # 머리글
+    head = ctk.CTkFrame(body, fg_color="transparent")
+    head.pack(fill="x")
+    star_img = ctk.CTkImage(light_image=make_icon((37, 99, 235, 255), 128), dark_image=make_icon((37, 99, 235, 255), 128), size=(40, 40))
+    ctk.CTkLabel(head, image=star_img, text="").pack(side="left", padx=(0, 12))
+    titles = ctk.CTkFrame(head, fg_color="transparent")
+    titles.pack(side="left", fill="x", expand=True)
+    ctk.CTkLabel(titles, text="우리집", font=font(26, True), text_color=TXT, anchor="w").pack(anchor="w")
+    status = ctk.CTkLabel(titles, text="", font=font(12), text_color=SUB, anchor="w")
+    status.pack(anchor="w")
+    ctk.CTkLabel(head, text=__version__, font=font(11), text_color=SUB).pack(side="right", anchor="n", pady=4)
+
+    # 지금 말하는 사람 배너
+    incoming = ctk.CTkLabel(body, text="", font=font(15, True), text_color=ON_AMBER, fg_color=AMBER, corner_radius=16, height=46)
+
+    # 가족 선택
+    section(body, "누구에게  ·  여러 명 고를 수 있어요").pack(anchor="w", pady=(20, 6))
+    grid = ctk.CTkFrame(body, fg_color="transparent")
+    grid.pack(fill="x")
+    for c in range(3):
+        grid.columnconfigure(c, weight=1, uniform="fam")
+
+    # 말하기 버튼
+    talk = ctk.CTkFrame(body, fg_color=AMBER, corner_radius=28, height=140)
+    talk.pack(fill="x", pady=(18, 0))
+    talk.pack_propagate(False)
+    talk_title = ctk.CTkLabel(talk, text="", font=font(24, True), text_color=ON_AMBER)
+    talk_title.pack(pady=(34, 0))
+    talk_sub = ctk.CTkLabel(talk, text="", font=font(13), text_color=ON_AMBER)
+    talk_sub.pack()
+    for wdg in (talk, talk_title, talk_sub):
+        wdg.bind("<ButtonPress-1>", lambda e: radio.start_talk())
+        wdg.bind("<ButtonRelease-1>", lambda e: radio.stop_talk())
+        wdg.configure(cursor="hand2")
+    notice = ctk.CTkLabel(body, text="", font=font(13), text_color=AMBER, wraplength=400)
+    notice.pack(pady=(8, 0))
+
+    # 글로 보내기
+    compose_card, compose = card(body)
+    compose_card.pack(fill="x", pady=(16, 0))
+    section(compose, "글로 보내기  ·  말하기 어려울 때").pack(anchor="w")
+    chip_row = ctk.CTkFrame(compose, fg_color="transparent")
+    chip_row.pack(fill="x", pady=(8, 0))
+    entry_row = ctk.CTkFrame(compose, fg_color="transparent")
+    entry_row.pack(fill="x", pady=(10, 0))
+    entry = ctk.CTkEntry(entry_row, placeholder_text="직접 입력", font=font(14), height=40, corner_radius=14,
+                         fg_color=BG, border_color=OUTLINE, text_color=TXT)
+    entry.pack(side="left", fill="x", expand=True)
 
     def send_text(t):
         if radio.send_text(t):
             entry.delete(0, "end")
+    entry.bind("<Return>", lambda e: send_text(entry.get()))
+    pill(entry_row, "보내기", lambda: send_text(entry.get()), width=80).pack(side="left", padx=(8, 0))
+    pill(entry_row, "⏰ 예약", lambda: open_schedule(), filled=False, width=80).pack(side="left", padx=(6, 0))
+    ctk.CTkLabel(compose, text="보낸 메시지 아래 표시  ·  ✓ 받음   ✓✓ 봄(들음)", font=font(11), text_color=SUB, anchor="w").pack(anchor="w", pady=(8, 0))
 
     def render_chips():
         for c in chip_row.winfo_children():
             c.destroy()
         for q in radio.quick_replies:
-            tk.Button(chip_row, text=q, font=(F, 9), command=lambda q=q: send_text(q)).pack(side="left", padx=2, pady=2)
+            ctk.CTkButton(chip_row, text=q, command=lambda q=q: send_text(q), font=font(12), height=30, corner_radius=15,
+                          fg_color=CARD2, hover_color="#263654", text_color=TXT, border_width=1, border_color=OUTLINE,
+                          width=10).pack(side="left", padx=(0, 6), pady=2)
     render_chips()
-    entry_row = tk.Frame(text_box, bg=CARD)
-    entry_row.pack(fill="x", padx=8, pady=(2, 8))
-    entry = tk.Entry(entry_row, font=(F, 11))
-    entry.pack(side="left", fill="x", expand=True)
-    entry.bind("<Return>", lambda e: send_text(entry.get()))
-    tk.Button(entry_row, text="보내기", font=(F, 10), command=lambda: send_text(entry.get())).pack(side="left", padx=(6, 0))
-    tk.Button(entry_row, text="⏰ 예약", font=(F, 10), command=lambda: open_schedule()).pack(side="left", padx=(4, 0))
-    tk.Label(text_box, text="보낸 메시지 옆 표시: ✓ 받음 · ✓✓ 봄(들음)", font=(F, 8), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(0, 6))
 
-    # ---- 예약 메시지 창 ----
-    sched_win = {"w": None, "list": None}
+    # 메시지 목록
+    msg_card, msg_inner = card(body, pad=12)
+    section(msg_inner, "메시지  ·  최근 것이 위").pack(anchor="w", padx=4)
+    msg_list = ctk.CTkScrollableFrame(msg_inner, fg_color="transparent", height=230, scrollbar_button_color=CARD2)
+    msg_list.pack(fill="x", pady=(4, 0))
 
-    def open_schedule():
-        if sched_win["w"] and sched_win["w"].winfo_exists():
-            sched_win["w"].lift()
-            return
-        w = tk.Toplevel(root)
-        w.title("예약 메시지")
-        w.configure(bg=BG)
-        w.resizable(False, False)
-        sched_win["w"] = w
-        tk.Label(w, text="받는 사람: %s (창에서 고른 상대)" % radio.target_label(), font=(F, 10), fg=TXT, bg=BG).pack(anchor="w", padx=14, pady=(12, 0))
-        tk.Label(w, text="내용", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=14, pady=(8, 0))
-        t_entry = tk.Entry(w, font=(F, 11), width=40)
-        t_entry.insert(0, entry.get().strip())
-        t_entry.pack(padx=14)
-        row = tk.Frame(w, bg=BG)
-        row.pack(anchor="w", padx=14, pady=(8, 0))
-        tk.Label(row, text="시간", font=(F, 9), fg=SUB, bg=BG).pack(side="left")
-        now = time.localtime(time.time() + 600)
-        hh = tk.Spinbox(row, from_=0, to=23, width=3, format="%02.0f", font=(F, 11))
-        hh.delete(0, "end"); hh.insert(0, "%02d" % now.tm_hour)
-        hh.pack(side="left", padx=(6, 2))
-        tk.Label(row, text=":", font=(F, 11), fg=TXT, bg=BG).pack(side="left")
-        mm = tk.Spinbox(row, from_=0, to=59, width=3, format="%02.0f", font=(F, 11))
-        mm.delete(0, "end"); mm.insert(0, "%02d" % ((now.tm_min // 5) * 5))
-        mm.pack(side="left", padx=(2, 12))
-        day_var = tk.StringVar(value="오늘")
-        for d in ("오늘", "내일"):
-            tk.Radiobutton(row, text=d, value=d, variable=day_var, font=(F, 10), fg=TXT, bg=BG,
-                           selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left")
-        row2 = tk.Frame(w, bg=BG)
-        row2.pack(anchor="w", padx=14, pady=(6, 0))
-        tk.Label(row2, text="반복", font=(F, 9), fg=SUB, bg=BG).pack(side="left", padx=(0, 6))
-        rep_var = tk.StringVar(value="once")
-        for label, val in (("한 번", "once"), ("매일", "daily"), ("평일", "weekdays"), ("주말", "weekends")):
-            tk.Radiobutton(row2, text=label, value=val, variable=rep_var, font=(F, 10), fg=TXT, bg=BG,
-                           selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left")
+    # 하단: 단축키 안내 + 설정
+    foot = ctk.CTkFrame(body, fg_color="transparent")
+    foot.pack(fill="x", pady=(14, 0))
+    hotkey_label = ctk.CTkLabel(foot, text="", font=font(11), text_color=SUB, anchor="w", wraplength=320, justify="left")
+    hotkey_label.pack(side="left", fill="x", expand=True)
+    pill(foot, "설정", lambda: open_settings(), filled=False, width=70).pack(side="right")
 
-        def add():
-            text = t_entry.get().strip()
-            try:
-                h, m = int(hh.get()), int(mm.get())
-                assert 0 <= h < 24 and 0 <= m < 60
-            except Exception:
-                messagebox.showerror("예약", "시간을 확인하세요", parent=w)
-                return
-            if not text:
-                messagebox.showerror("예약", "내용을 입력하세요", parent=w)
-                return
-            lt = time.localtime()
-            base = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1))
-            if day_var.get() == "내일":
-                base += 86400
-            if rep_var.get() == "once" and base < time.time() - 60:
-                messagebox.showerror("예약", "이미 지난 시간이에요. '내일'을 고르세요", parent=w)
-                return
-            if not radio.schedule_add(text, base, rep_var.get()):
-                messagebox.showwarning("예약", "지금 연결이 없어요. 연결된 뒤 다시 시도하세요", parent=w)
-                return
-            t_entry.delete(0, "end")
-        tk.Button(w, text="예약 추가", font=(F, 10), command=add).pack(pady=(10, 6))
-        tk.Label(w, text="내 예약 목록", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=14)
-        lst = tk.Frame(w, bg=CARD)
-        lst.pack(fill="x", padx=14, pady=(2, 14))
-        sched_win["list"] = lst
-        render_schedules()
-        radio.client.send_json({"type": "schedule_list"})
-
-    def render_schedules():
-        lst = sched_win.get("list")
-        if not lst or not lst.winfo_exists():
-            return
-        for c in lst.winfo_children():
-            c.destroy()
-        items = radio.schedules
-        if not items:
-            tk.Label(lst, text="예약이 없어요", font=(F, 9), fg=SUB, bg=CARD).pack(anchor="w", padx=8, pady=6)
-            return
-        rep_label = {"once": "한 번", "daily": "매일", "weekdays": "평일", "weekends": "주말"}
-        for it in items:
-            r = tk.Frame(lst, bg=CARD)
-            r.pack(fill="x", padx=6, pady=2)
-            to = it.get("to")
-            to_s = "모두" if to == "all" else ", ".join(to if isinstance(to, list) else [str(to)])
-            when = time.strftime("%m/%d %H:%M", time.localtime(it["at"]))
-            tk.Label(r, text="%s · %s · %s\n%s" % (when, rep_label.get(it["repeat"], ""), to_s, it["text"]),
-                     font=(F, 9), fg=TXT, bg=CARD, justify="left").pack(side="left", padx=4)
-            tk.Button(r, text="삭제", font=(F, 9), command=lambda sid=it["sid"]: radio.schedule_delete(sid)).pack(side="right", padx=2)
-
-    # 메시지 목록: 입력칸 아래, 높이 고정 + 스크롤 (목록이 늘어나도 입력칸을 밀지 않음)
-    clips_box = tk.Frame(root, bg=CARD)
-    tk.Label(clips_box, text="메시지 (최근 것이 위)", font=(F, 10), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(8, 2))
-    clips_canvas = tk.Canvas(clips_box, bg=CARD, highlightthickness=0, height=170)
-    clips_scroll = tk.Scrollbar(clips_box, orient="vertical", command=clips_canvas.yview)
-    clips_canvas.configure(yscrollcommand=clips_scroll.set)
-    clips_scroll.pack(side="right", fill="y", pady=(0, 8))
-    clips_canvas.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 8))
-    clips_list = tk.Frame(clips_canvas, bg=CARD)
-    clips_win = clips_canvas.create_window((0, 0), window=clips_list, anchor="nw")
-    clips_list.bind("<Configure>", lambda e: clips_canvas.configure(scrollregion=clips_canvas.bbox("all")))
-    clips_canvas.bind("<Configure>", lambda e: clips_canvas.itemconfigure(clips_win, width=e.width))
-    clips_canvas.bind("<MouseWheel>", lambda e: clips_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-
-    opts = tk.Frame(root, bg=CARD)
-    opts.pack(fill="x", padx=20, pady=6, side="bottom")
-    hotkey_label = tk.Label(opts, text="", font=(F, 9), fg=SUB, bg=CARD)
-    hotkey_label.pack(anchor="w", padx=10, pady=(0, 4))
-    tk.Button(opts, text="설정", font=(F, 10), command=lambda: open_settings()).pack(pady=(0, 8))
-
-    # ---- 단축키 (선택) ----
+    # ---- 단축키 ----
     hk = {"down": False}
 
     def bind_hotkey():
@@ -1133,14 +1094,14 @@ def run_ui(start_minimized):
                     keyboard.unhook_all()
                 except Exception:
                     pass
-            hotkey_label.config(text="단축키 없음 (설정에서 정하면 다른 창에서도 말하기 가능)")
+            hotkey_label.configure(text="단축키 없음 · 설정에서 정하면 다른 창에서도 말할 수 있어요")
             return
         if keyboard is None:
             try:
                 import keyboard as _kb
                 keyboard = _kb
             except Exception:
-                hotkey_label.config(text="단축키 기능을 쓸 수 없어요")
+                hotkey_label.configure(text="단축키 기능을 쓸 수 없어요")
                 return
         try:
             keyboard.unhook_all()
@@ -1158,157 +1119,15 @@ def run_ui(start_minimized):
         try:
             main_key = key.split("+")[-1]
             if "+" in key:
-                keyboard.add_hotkey(key, down)          # 조합키 (예: ctrl+alt+r)
+                keyboard.add_hotkey(key, down)
             else:
-                keyboard.on_press_key(main_key, down)   # 단일키 (예: f9)
-            keyboard.on_release_key(main_key, up)       # 마지막 키를 떼면 끝
-            hotkey_label.config(text="[%s] 누르고 있는 동안 말하기 (다른 창에서도)" % key.upper())
+                keyboard.on_press_key(main_key, down)
+            keyboard.on_release_key(main_key, up)
+            hotkey_label.configure(text="[%s] 누르고 있는 동안 말하기 · 다른 창에서도" % key.upper())
         except Exception:
-            hotkey_label.config(text="단축키 [%s]를 등록할 수 없어요" % key)
+            hotkey_label.configure(text="단축키 [%s]를 등록할 수 없어요" % key)
 
-    # ---- 설정 창 ----
-    def open_settings():
-        show_window()
-        w = tk.Toplevel(root)
-        w.title("설정")
-        w.configure(bg=BG)
-        w.resizable(False, False)
-        w.transient(root)
-        w.grab_set()
-        members = radio.members or DEFAULT_MEMBERS
-
-        def who_picker(parent, title):
-            tk.Label(parent, text=title, font=(F, 10), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(12, 0))
-            var = tk.StringVar(value=cfg.name)
-            row = tk.Frame(parent, bg=BG)
-            row.pack(anchor="w", padx=12)
-            for n in members:
-                tk.Radiobutton(row, text=n, value=n, variable=var, font=(F, 12), fg=TXT, bg=BG,
-                               selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left", padx=6)
-            return var
-
-        # ---- 처음 실행: 누구 것인지만 고르면 끝 ----
-        if not cfg.name:
-            var = who_picker(w, "이 PC는 누구 것인가요?")
-
-            def start():
-                if not var.get():
-                    messagebox.showerror("설정", "누구 것인지 골라 주세요", parent=w)
-                    return
-                cfg.set(name=var.get())
-                try:
-                    set_autostart(cfg.autostart)
-                except Exception:
-                    pass
-                radio.client.reconnect()
-                w.destroy()
-            tk.Button(w, text="시작", font=(F, 11), width=12, command=start).pack(pady=16)
-            return
-
-        # ---- 평소 설정 ----
-        tk.Label(w, text="이 PC: %s" % cfg.name, font=(F, 12, "bold"), fg=TXT, bg=BG).pack(anchor="w", padx=16, pady=(12, 0))
-        fields = {}
-        tk.Label(w, text="말하기 단축키 (비우면 없음)", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(10, 0))
-        row = tk.Frame(w, bg=BG)
-        row.pack(anchor="w", padx=16, fill="x")
-        hk_entry = tk.Entry(row, font=(F, 11), width=26)
-        hk_entry.insert(0, cfg.hotkey)
-        hk_entry.pack(side="left")
-
-        def capture():
-            """키(조합 가능)를 직접 눌러서 지정"""
-            global keyboard
-            if keyboard is None:
-                try:
-                    import keyboard as _kb
-                    keyboard = _kb
-                except Exception:
-                    messagebox.showwarning("단축키", "단축키 기능을 쓸 수 없어요", parent=w)
-                    return
-            hk_entry.delete(0, "end")
-            hk_entry.insert(0, "키를 누르세요…")
-
-            def worker():
-                try:
-                    combo = keyboard.read_hotkey(suppress=False)
-                except Exception:
-                    combo = ""
-                events.put(("hotkey_captured", (hk_entry, combo)))
-            threading.Thread(target=worker, daemon=True).start()
-        tk.Button(row, text="키 눌러서 지정", font=(F, 9), command=capture).pack(side="left", padx=(6, 0))
-        tk.Button(row, text="없음", font=(F, 9), command=lambda: hk_entry.delete(0, "end")).pack(side="left", padx=(4, 0))
-        tk.Label(w, text="예: F9, Scroll Lock, Ctrl+Alt+R. 게임·다른 프로그램과 겹치지 않는 키가 좋아요.",
-                 font=(F, 8), fg=SUB, bg=BG).pack(anchor="w", padx=16)
-        fields["hotkey"] = hk_entry
-
-        tk.Label(w, text="빠른 답장 문구 (쉼표로 구분)", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(10, 0))
-        q_entry = tk.Entry(w, font=(F, 11), width=44)
-        q_entry.insert(0, cfg.quick)
-        q_entry.pack(padx=16)
-        fields["quick"] = q_entry
-
-        auto_var = tk.BooleanVar(value=cfg.autostart)
-        tk.Checkbutton(w, text="Windows 시작 시 자동 실행 (트레이에 조용히 켜짐)", variable=auto_var, font=(F, 10),
-                       fg=TXT, bg=BG, selectcolor=BG, activebackground=BG, activeforeground=TXT
-                       ).pack(anchor="w", padx=12, pady=(12, 0))
-
-        def shortcut():
-            ok, msg = make_desktop_shortcut()
-            (messagebox.showinfo if ok else messagebox.showwarning)("바로가기", msg + ("\n\n작업 표시줄에 두고 싶으면 그 바로가기를 작업 표시줄로 끌어다 놓으세요." if ok else ""), parent=w)
-        tk.Button(w, text="바탕화면에 바로가기 만들기", font=(F, 9), command=shortcut).pack(anchor="w", padx=16, pady=(8, 0))
-
-        def save():
-            hk = hk_entry.get().strip()
-            if hk.startswith("키를"):
-                hk = cfg.hotkey
-            cfg.set(hotkey=hk, quick=q_entry.get().strip() or Config.DEFAULTS["quick"], autostart=auto_var.get())
-            try:
-                set_autostart(cfg.autostart)
-            except Exception as e:
-                messagebox.showwarning("설정", "자동 실행 등록 실패: %s" % e, parent=w)
-            bind_hotkey()
-            radio.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
-            render_chips()
-            w.destroy()
-        tk.Button(w, text="저장", font=(F, 10), width=12, command=save).pack(pady=(14, 6))
-
-        # ---- 관리자 설정: 가족 암호를 알아야 열림 ----
-        admin = tk.Frame(w, bg=BG)
-
-        def open_admin():
-            from tkinter import simpledialog
-            pw = simpledialog.askstring("가족 암호", "가족 암호를 입력하세요", show="*", parent=w)
-            if pw is None:
-                return
-            if pw != cfg.key:
-                messagebox.showerror("설정", "암호가 달라요", parent=w)
-                return
-            admin_btn.pack_forget()
-            admin.pack(fill="x", pady=(4, 10))
-            a_var = who_picker(admin, "이 PC는 누구 것인가요? (바꾸면 바로 적용)")
-            a_fields = {}
-            for k, label in [("host", "집 주소"), ("out_host", "밖 주소 (Tailscale)"), ("key", "가족 암호")]:
-                tk.Label(admin, text=label, font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(8, 0))
-                e = tk.Entry(admin, font=(F, 11), width=44)
-                e.insert(0, str(getattr(cfg, k)))
-                e.pack(padx=16)
-                a_fields[k] = e
-
-            def save_admin():
-                v = {k: e.get().strip() for k, e in a_fields.items()}
-                v["name"] = a_var.get()
-                if not (v["name"] and v["host"] and v["key"]):
-                    messagebox.showerror("설정", "사용자·집 주소·암호는 비울 수 없어요", parent=w)
-                    return
-                cfg.set(**v)
-                radio.client.reconnect()
-                w.destroy()
-            tk.Button(admin, text="변경 저장하고 다시 연결", font=(F, 10), command=save_admin).pack(pady=10)
-        admin_btn = tk.Button(w, text="사용자·주소 변경 (가족 암호 필요)", font=(F, 9), command=open_admin)
-        admin_btn.pack(pady=(0, 12))
-
-
-    # ---- 오른쪽 아래 작은 팝업 (5초 뒤 사라짐, 마우스를 올리거나 누르면 유지 + 바로 답장) ----
+    # ---- 오른쪽 아래 팝업 ----
     popup = {"win": None, "timer": None}
 
     def close_popup():
@@ -1327,23 +1146,28 @@ def run_ui(start_minimized):
 
     def show_popup(title, text, reply_to=None, seconds=5, clip=None):
         close_popup()
-        pw = tk.Toplevel(root)
+        pw = ctk.CTkToplevel(root, fg_color=AMBER)
         pw.overrideredirect(True)
         pw.attributes("-topmost", True)
-        try:
-            pw.attributes("-alpha", 0.96)
-        except Exception:
-            pass
-        pw.configure(bg=ACCENT)
-        inner = tk.Frame(pw, bg=CARD)
+        inner = ctk.CTkFrame(pw, fg_color=CARD, corner_radius=14)
         inner.pack(padx=2, pady=2, fill="both", expand=True)
-        head = tk.Frame(inner, bg=CARD)
-        head.pack(fill="x", padx=12, pady=(10, 0))
-        tk.Label(head, text=title, font=(F, 11, "bold"), fg=TXT, bg=CARD, anchor="w").pack(side="left")
-        tk.Button(head, text="✕", font=(F, 9), bd=0, fg=SUB, bg=CARD, activebackground=CARD, command=close_popup).pack(side="right")
+        head_ = ctk.CTkFrame(inner, fg_color="transparent")
+        head_.pack(fill="x", padx=14, pady=(12, 0))
+        ctk.CTkLabel(head_, text=title, font=font(13, True), text_color=TXT, anchor="w").pack(side="left")
+        ctk.CTkButton(head_, text="✕", width=26, height=26, fg_color="transparent", hover_color=CARD2, text_color=SUB, command=close_popup).pack(side="right")
         if text:
-            tk.Label(inner, text=text, font=(F, 11), fg=TXT, bg=CARD, wraplength=300, justify="left", anchor="w").pack(fill="x", padx=12, pady=(4, 0))
-        reply_box = tk.Frame(inner, bg=CARD)
+            ctk.CTkLabel(inner, text=text, font=font(13), text_color=TXT, wraplength=300, justify="left", anchor="w").pack(fill="x", padx=14, pady=(4, 0))
+        hint = ctk.CTkLabel(inner, text="클릭하면 바로 답장" if reply_to else "", font=font(10), text_color=SUB, anchor="w")
+        hint.pack(fill="x", padx=14, pady=(2, 10))
+        reply_box = ctk.CTkFrame(inner, fg_color="transparent")
+
+        def keep(*_):
+            if popup["timer"]:
+                try:
+                    root.after_cancel(popup["timer"])
+                except Exception:
+                    pass
+                popup["timer"] = None
 
         def send_reply(t):
             t = t.strip()
@@ -1357,53 +1181,285 @@ def run_ui(start_minimized):
                 radio.mark_seen(clip)
             if reply_box.winfo_ismapped() or not reply_to:
                 return
-            reply_box.pack(fill="x", padx=10, pady=(8, 10))
-            chips = tk.Frame(reply_box, bg=CARD)
+            hint.pack_forget()
+            reply_box.pack(fill="x", padx=12, pady=(6, 12))
+            chips = ctk.CTkFrame(reply_box, fg_color="transparent")
             chips.pack(fill="x")
             for q in radio.quick_replies[:6]:
-                tk.Button(chips, text=q, font=(F, 9), command=lambda q=q: send_reply(q)).pack(side="left", padx=2, pady=2)
-            erow = tk.Frame(reply_box, bg=CARD)
-            erow.pack(fill="x", pady=(4, 0))
-            ent = tk.Entry(erow, font=(F, 10))
+                ctk.CTkButton(chips, text=q, command=lambda q=q: send_reply(q), font=font(11), height=26, corner_radius=13, width=10,
+                              fg_color=CARD2, hover_color="#263654", text_color=TXT).pack(side="left", padx=(0, 4), pady=2)
+            erow = ctk.CTkFrame(reply_box, fg_color="transparent")
+            erow.pack(fill="x", pady=(6, 0))
+            ent = ctk.CTkEntry(erow, font=font(12), height=32, corner_radius=12, fg_color=BG, border_color=OUTLINE)
             ent.pack(side="left", fill="x", expand=True)
             ent.bind("<Return>", lambda e: send_reply(ent.get()))
-            tk.Button(erow, text="보내기", font=(F, 9), command=lambda: send_reply(ent.get())).pack(side="left", padx=(4, 0))
+            pill(erow, "보내기", lambda: send_reply(ent.get()), width=64).pack(side="left", padx=(6, 0))
             ent.focus_set()
             place()
 
-        def keep(*_):
-            if popup["timer"]:
-                try:
-                    root.after_cancel(popup["timer"])
-                except Exception:
-                    pass
-                popup["timer"] = None
-
-        if reply_to:
-            tk.Label(inner, text="클릭하면 바로 답장", font=(F, 8), fg=SUB, bg=CARD, anchor="w").pack(fill="x", padx=12, pady=(2, 8))
-        else:
-            tk.Frame(inner, bg=CARD, height=8).pack()
-        for wdg in (pw, inner, head):
+        for wdg in (pw, inner, head_, hint):
             wdg.bind("<Enter>", keep)
             wdg.bind("<Button-1>", show_reply)
         for child in inner.winfo_children():
-            child.bind("<Button-1>", show_reply)
-            child.bind("<Enter>", keep)
+            try:
+                child.bind("<Button-1>", show_reply)
+                child.bind("<Enter>", keep)
+            except Exception:
+                pass
 
         def place():
             pw.update_idletasks()
-            w_, h_ = max(pw.winfo_reqwidth(), 320), pw.winfo_reqheight()
+            w_, h_ = max(pw.winfo_reqwidth(), 330), pw.winfo_reqheight()
             sw, sh = pw.winfo_screenwidth(), pw.winfo_screenheight()
             pw.geometry("%dx%d+%d+%d" % (w_, h_, sw - w_ - 16, sh - h_ - 60))
         place()
         popup["win"] = pw
         popup["timer"] = root.after(int(seconds * 1000), close_popup)
 
-    # ---- 이벤트 (다른 스레드에서 옴 → 큐에 넣고 화면 스레드에서 처리. 다른 스레드에서 tkinter를 건드리면 멈출 수 있음) ----
-    events = queue.Queue()
-    radio.on_event = lambda kind, info: events.put((kind, info))
+    # ---- 설정 ----
+    def ask_password(parent, on_ok):
+        d = ctk.CTkToplevel(parent, fg_color=BG)
+        d.title("가족 암호")
+        d.geometry("300x150")
+        d.transient(parent)
+        ctk.CTkLabel(d, text="가족 암호를 입력하세요", font=font(13), text_color=TXT).pack(pady=(18, 8))
+        e = ctk.CTkEntry(d, show="*", font=font(14), width=200, justify="center")
+        e.pack()
+        e.focus_set()
 
+        def ok(*_):
+            if e.get() == cfg.key:
+                d.destroy()
+                on_ok()
+            else:
+                messagebox.showerror("설정", "암호가 달라요", parent=d)
+        e.bind("<Return>", ok)
+        pill(d, "확인", ok, width=100).pack(pady=14)
+        d.grab_set()
+
+    def open_settings():
+        show_window()
+        w = ctk.CTkToplevel(root, fg_color=BG)
+        w.title("설정")
+        w.geometry("460x560")
+        w.resizable(False, True)
+        w.transient(root)
+        members = radio.members or DEFAULT_MEMBERS
+        box = ctk.CTkScrollableFrame(w, fg_color=BG)
+        box.pack(fill="both", expand=True, padx=8, pady=8)
+
+        if not cfg.name:   # 처음 실행: 누구 것인지만
+            section(box, "이 PC는 누구 것인가요?").pack(anchor="w", padx=12, pady=(14, 6))
+            who = ctk.CTkSegmentedButton(box, values=members, font=font(14), height=40, selected_color=AMBER,
+                                         selected_hover_color=AMBER_D, unselected_color=CARD2, text_color=TXT)
+            who.pack(padx=12, fill="x")
+
+            def start():
+                n = who.get()
+                if not n:
+                    messagebox.showerror("설정", "누구 것인지 골라 주세요", parent=w)
+                    return
+                cfg.set(name=n)
+                try:
+                    set_autostart(cfg.autostart)
+                except Exception:
+                    pass
+                radio.client.reconnect()
+                w.destroy()
+            pill(box, "시작", start, width=140).pack(pady=18)
+            w.grab_set()
+            return
+
+        ctk.CTkLabel(box, text="이 PC: %s" % cfg.name, font=font(16, True), text_color=TXT, anchor="w").pack(anchor="w", padx=12, pady=(10, 0))
+
+        section(box, "말하기 단축키 (비우면 없음)").pack(anchor="w", padx=12, pady=(14, 4))
+        row = ctk.CTkFrame(box, fg_color="transparent")
+        row.pack(fill="x", padx=12)
+        hk_entry = ctk.CTkEntry(row, font=font(13), height=36, corner_radius=12, fg_color=CARD, border_color=OUTLINE)
+        hk_entry.insert(0, cfg.hotkey)
+        hk_entry.pack(side="left", fill="x", expand=True)
+
+        def capture():
+            global keyboard
+            if keyboard is None:
+                try:
+                    import keyboard as _kb
+                    keyboard = _kb
+                except Exception:
+                    messagebox.showwarning("단축키", "단축키 기능을 쓸 수 없어요", parent=w)
+                    return
+            hk_entry.delete(0, "end")
+            hk_entry.insert(0, "키를 누르세요…")
+
+            def worker():
+                try:
+                    combo = keyboard.read_hotkey(suppress=False)
+                except Exception:
+                    combo = ""
+                events.put(("hotkey_captured", (hk_entry, combo)))
+            threading.Thread(target=worker, daemon=True).start()
+        pill(row, "키 눌러서 지정", capture, filled=False, width=110).pack(side="left", padx=(6, 0))
+        pill(row, "없음", lambda: hk_entry.delete(0, "end"), filled=False, width=50).pack(side="left", padx=(4, 0))
+        ctk.CTkLabel(box, text="예: F9, Scroll Lock, Ctrl+Alt+R. 게임·다른 프로그램과 겹치지 않는 키가 좋아요.", font=font(10), text_color=SUB,
+                     anchor="w", wraplength=420, justify="left").pack(anchor="w", padx=12)
+
+        section(box, "빠른 답장 문구 (쉼표로 구분)").pack(anchor="w", padx=12, pady=(12, 4))
+        q_entry = ctk.CTkEntry(box, font=font(13), height=36, corner_radius=12, fg_color=CARD, border_color=OUTLINE)
+        q_entry.insert(0, cfg.quick)
+        q_entry.pack(fill="x", padx=12)
+
+        auto_var = tk.BooleanVar(value=cfg.autostart)
+        ctk.CTkSwitch(box, text="Windows 시작 시 자동 실행 (트레이에 조용히 켜짐)", variable=auto_var, font=font(13),
+                      text_color=TXT, progress_color=AMBER).pack(anchor="w", padx=12, pady=(14, 0))
+
+        def shortcut():
+            ok, msg = make_desktop_shortcut()
+            (messagebox.showinfo if ok else messagebox.showwarning)(
+                "바로가기", msg + ("\n\n작업 표시줄에 두고 싶으면 그 바로가기를 작업 표시줄로 끌어다 놓으세요." if ok else ""), parent=w)
+        pill(box, "바탕화면에 바로가기 만들기", shortcut, filled=False, width=200).pack(anchor="w", padx=12, pady=(10, 0))
+
+        def save():
+            hk_ = hk_entry.get().strip()
+            if hk_.startswith("키를"):
+                hk_ = cfg.hotkey
+            cfg.set(hotkey=hk_, quick=q_entry.get().strip() or Config.DEFAULTS["quick"], autostart=auto_var.get())
+            try:
+                set_autostart(cfg.autostart)
+            except Exception as e:
+                messagebox.showwarning("설정", "자동 실행 등록 실패: %s" % e, parent=w)
+            bind_hotkey()
+            radio.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
+            render_chips()
+            w.destroy()
+        pill(box, "저장", save, width=120).pack(pady=(16, 6))
+
+        admin = ctk.CTkFrame(box, fg_color=CARD, corner_radius=14)
+
+        def open_admin():
+            admin_btn.pack_forget()
+            admin.pack(fill="x", padx=12, pady=(4, 12))
+            section(admin, "이 PC는 누구 것인가요? (바꾸면 바로 적용)").pack(anchor="w", padx=12, pady=(12, 4))
+            a_who = ctk.CTkSegmentedButton(admin, values=members, font=font(13), selected_color=AMBER, selected_hover_color=AMBER_D,
+                                           unselected_color=CARD2, text_color=TXT)
+            a_who.set(cfg.name)
+            a_who.pack(fill="x", padx=12)
+            a_fields = {}
+            for k, label in [("host", "집 주소"), ("out_host", "밖 주소 (Tailscale)"), ("key", "가족 암호")]:
+                section(admin, label).pack(anchor="w", padx=12, pady=(10, 2))
+                e = ctk.CTkEntry(admin, font=font(13), height=34, corner_radius=10, fg_color=BG, border_color=OUTLINE)
+                e.insert(0, str(getattr(cfg, k)))
+                e.pack(fill="x", padx=12)
+                a_fields[k] = e
+
+            def save_admin():
+                v = {k: e.get().strip() for k, e in a_fields.items()}
+                v["name"] = a_who.get()
+                if not (v["name"] and v["host"] and v["key"]):
+                    messagebox.showerror("설정", "사용자·집 주소·암호는 비울 수 없어요", parent=w)
+                    return
+                cfg.set(**v)
+                radio.client.reconnect()
+                w.destroy()
+            pill(admin, "변경 저장하고 다시 연결", save_admin, width=180).pack(pady=12)
+        admin_btn = ctk.CTkButton(box, text="사용자·주소 변경 (가족 암호 필요)", command=lambda: ask_password(w, open_admin), font=font(11),
+                                  fg_color="transparent", hover_color=CARD, text_color=SUB, height=28)
+        admin_btn.pack(pady=(0, 10))
+        w.grab_set()
+
+    # ---- 예약 메시지 ----
+    sched = {"w": None, "list": None}
+
+    def open_schedule():
+        if sched["w"] and sched["w"].winfo_exists():
+            sched["w"].lift()
+            return
+        w = ctk.CTkToplevel(root, fg_color=BG)
+        w.title("예약 메시지")
+        w.geometry("460x600")
+        w.transient(root)
+        sched["w"] = w
+        box = ctk.CTkFrame(w, fg_color="transparent")
+        box.pack(fill="both", expand=True, padx=16, pady=14)
+        ctk.CTkLabel(box, text="⏰ 예약 메시지", font=font(18, True), text_color=TXT, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(box, text="받는 사람: %s  (창에서 고른 상대)" % radio.target_label(), font=font(12), text_color=SUB, anchor="w").pack(anchor="w", pady=(2, 10))
+        t_entry = ctk.CTkEntry(box, placeholder_text="내용", font=font(14), height=40, corner_radius=14, fg_color=CARD, border_color=OUTLINE)
+        t_entry.insert(0, entry.get().strip())
+        t_entry.pack(fill="x")
+        row = ctk.CTkFrame(box, fg_color="transparent")
+        row.pack(fill="x", pady=(10, 0))
+        now = time.localtime(time.time() + 600)
+        hh = ctk.CTkOptionMenu(row, values=["%02d" % i for i in range(24)], width=70, font=font(13), fg_color=CARD2, button_color=OUTLINE, dropdown_font=font(12))
+        hh.set("%02d" % now.tm_hour)
+        hh.pack(side="left")
+        ctk.CTkLabel(row, text=":", font=font(16), text_color=TXT).pack(side="left", padx=4)
+        mm = ctk.CTkOptionMenu(row, values=["%02d" % i for i in range(0, 60, 5)], width=70, font=font(13), fg_color=CARD2, button_color=OUTLINE, dropdown_font=font(12))
+        mm.set("%02d" % ((now.tm_min // 5) * 5))
+        mm.pack(side="left")
+        day = ctk.CTkSegmentedButton(row, values=["오늘", "내일"], font=font(12), selected_color=AMBER, selected_hover_color=AMBER_D,
+                                     unselected_color=CARD2, text_color=TXT, width=120)
+        day.set("오늘")
+        day.pack(side="left", padx=(12, 0))
+        rep_labels = [("한 번", "once"), ("매일", "daily"), ("평일", "weekdays"), ("주말", "weekends")]
+        rep = ctk.CTkSegmentedButton(box, values=[l for l, _ in rep_labels], font=font(12), selected_color=AMBER, selected_hover_color=AMBER_D,
+                                     unselected_color=CARD2, text_color=TXT)
+        rep.set("한 번")
+        rep.pack(fill="x", pady=(10, 0))
+
+        def add():
+            text = t_entry.get().strip()
+            if not text:
+                messagebox.showerror("예약", "내용을 입력하세요", parent=w)
+                return
+            h_, m_ = int(hh.get()), int(mm.get())
+            lt = time.localtime()
+            base = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h_, m_, 0, 0, 0, -1))
+            if day.get() == "내일":
+                base += 86400
+            repeat = dict(rep_labels)[rep.get()]
+            if repeat == "once" and base < time.time() - 60:
+                messagebox.showerror("예약", "이미 지난 시간이에요. '내일'을 고르세요", parent=w)
+                return
+            if not radio.schedule_add(text, base, repeat):
+                messagebox.showwarning("예약", "지금 연결이 없어요. 연결된 뒤 다시 시도하세요", parent=w)
+                return
+            t_entry.delete(0, "end")
+        pill(box, "예약 추가", add, width=140).pack(pady=(12, 8))
+        section(box, "내 예약 목록").pack(anchor="w")
+        lst = ctk.CTkScrollableFrame(box, fg_color=CARD, corner_radius=14, height=220)
+        lst.pack(fill="both", expand=True, pady=(4, 0))
+        sched["list"] = lst
+        render_schedules()
+        radio.client.send_json({"type": "schedule_list"})
+
+    def render_schedules():
+        lst = sched.get("list")
+        if not lst or not lst.winfo_exists():
+            return
+        for c in lst.winfo_children():
+            c.destroy()
+        items = radio.schedules
+        if not items:
+            ctk.CTkLabel(lst, text="예약이 없어요", font=font(12), text_color=SUB).pack(anchor="w", padx=8, pady=8)
+            return
+        rep_label = {"once": "한 번", "daily": "매일", "weekdays": "평일", "weekends": "주말"}
+        for it in items:
+            r = ctk.CTkFrame(lst, fg_color="transparent")
+            r.pack(fill="x", padx=6, pady=3)
+            to = it.get("to")
+            to_s = "모두" if to == "all" else ", ".join(to if isinstance(to, list) else [str(to)])
+            when = time.strftime("%m/%d %H:%M", time.localtime(it["at"]))
+            ctk.CTkLabel(r, text="%s · %s · %s\n%s" % (when, rep_label.get(it["repeat"], ""), to_s, it["text"]), font=font(12),
+                         text_color=TXT, justify="left", anchor="w").pack(side="left", padx=4)
+            small(r, "삭제", lambda sid=it["sid"]: radio.schedule_delete(sid), color=RED).pack(side="right")
+
+    # ---- 이벤트 처리 ----
     def pump_events():
+        try:
+            while True:
+                req = show_requests.get_nowait()
+                events.put(("quit", None) if req == "quit" else ("show", None))
+        except queue.Empty:
+            pass
         while True:
             try:
                 kind, info = events.get_nowait()
@@ -1411,58 +1467,63 @@ def run_ui(start_minimized):
                 return
             try:
                 handle_event(kind, info)
-            except Exception:
-                pass
+            except Exception as e:
+                log("화면 이벤트 오류 %s: %s" % (kind, e))
 
     def handle_event(kind, info):
-        if True:
-            if kind == "incoming":
-                flash()
-                who = info.get("from")
-                show_popup("🔊 %s님이 말해요" % who, "전체 방송" if info.get("mode") == "all" else "나에게", reply_to=who, seconds=8)
-            elif kind == "clip":
-                c = info["clip"]
-                flash()
-                show_popup("🔊 " + radio.clip_title(c), "%d초 · %s" % (max(1, int(c["seconds"])),
-                           "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"), reply_to=c["from"], clip=c)
-                if not info["auto"]:
-                    events.put(("show", None))
-            elif kind == "text":
-                flash()
-                show_popup("💬 " + radio.clip_title(info), info.get("text", ""), reply_to=info["from"], clip=info)
-            elif kind == "state":
-                set_tray(radio.connected, radio.where)
-            elif kind == "schedules":
-                render_schedules()
-            elif kind == "hotkey_captured":
-                entry, combo = info
+        if kind == "incoming":
+            flash()
+            who = info.get("from")
+            show_popup("🔊 %s님이 말해요" % who, "전체 방송" if info.get("mode") == "all" else "나에게", reply_to=who, seconds=8)
+        elif kind == "clip":
+            c = info["clip"]
+            flash()
+            show_popup("🔊 " + radio.clip_title(c), "%d초 · %s" % (max(1, int(c["seconds"])), "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"),
+                       reply_to=c["from"], clip=c)
+            if not info["auto"]:
+                events.put(("show", None))
+        elif kind == "text":
+            flash()
+            show_popup("💬 " + radio.clip_title(info), info.get("text", ""), reply_to=info["from"], clip=info)
+        elif kind == "state":
+            set_tray(radio.connected, radio.where)
+        elif kind == "schedules":
+            render_schedules()
+        elif kind == "hotkey_captured":
+            ent, combo = info
+            try:
+                ent.delete(0, "end")
+                ent.insert(0, combo)
+            except Exception:
+                pass
+        elif kind == "show":
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+        elif kind == "quit":
+            radio.stop_talk()
+            if tray["icon"]:
                 try:
-                    entry.delete(0, "end")
-                    entry.insert(0, combo)
+                    tray["icon"].stop()
                 except Exception:
                     pass
-            elif kind == "show":
-                root.deiconify(); root.lift(); root.focus_force()
-            elif kind == "quit":
-                radio.stop_talk()
-                if tray["icon"]:
-                    try:
-                        tray["icon"].stop()
-                    except Exception:
-                        pass
-                root.destroy()
+            root.destroy()
 
     # ---- 화면 갱신 ----
-    cache = {"buttons": None, "clips": None}
+    cache = {"buttons": None, "clips": None, "tray_tip": False}
+
+    def member_button(parent, label, value, on, sel):
+        place_ = ""
+        if value != "all" and on:
+            place_ = "  ·  " + ("밖" if radio.member_where.get(value) == "out" else "집")
+        text = label if value == "all" else ("● " if on else "○ ") + label + place_
+        return ctk.CTkButton(parent, text=text, command=lambda v=value: radio.toggle_target(v), font=font(13, sel), height=42, corner_radius=16,
+                             fg_color=AMBER if sel else CARD, hover_color=AMBER_D if sel else CARD2,
+                             text_color=ON_AMBER if sel else (TXT if (on or value == "all") else SUB),
+                             border_width=0 if sel else 1, border_color=OUTLINE)
 
     def refresh():
         pump_events()
-        try:
-            while True:
-                show_requests.get_nowait()
-                events.put(("show", None))
-        except queue.Empty:
-            pass
         with radio.lock:
             me = cfg.name
             others = [m for m in radio.members if m != me]
@@ -1478,40 +1539,30 @@ def run_ui(start_minimized):
                 items = [("전체", "all", True)] + [(m, m, m in radio.online) for m in others]
                 for i, (label, value, on) in enumerate(items):
                     sel = (radio.target == "all") if value == "all" else (value in radio.target_list)
-                    place = ""
-                    if value != "all" and on:
-                        place = "\n" + ("밖" if radio.member_where.get(value) == "out" else "집")
-                    text = label if value == "all" else ("● " if on else "○ ") + label + place
-                    b = tk.Label(grid, text=text, font=(F, 11, "bold"), pady=6,
-                                 fg="black" if sel else (TXT if on else SUB), bg=ACCENT if sel else CARD, cursor="hand2")
-                    b.grid(row=i // 3, column=i % 3, sticky="nsew", padx=4, pady=4)
-                    b.bind("<Button-1>", lambda e, v=value: radio.toggle_target(v))
-                for c in range(3):
-                    grid.columnconfigure(c, weight=1)
+                    member_button(grid, label, value, on, sel).grid(row=i // 3, column=i % 3, sticky="nsew", padx=4, pady=4)
 
             if radio.connected:
-                status.config(text="● %s · 지금 %s · 가족 %d명 접속 중" % (me, "집" if radio.where == "home" else "밖", len(radio.online)), fg=GREEN)
+                status.configure(text="●  %s · 지금 %s · 가족 %d명 접속 중" % (me, "집" if radio.where == "home" else "밖", len(radio.online)), text_color=GREEN)
             else:
-                status.config(text=radio.status, fg=SUB)
+                status.configure(text="●  " + radio.status, text_color=SUB)
 
             if radio.incoming_from:
-                incoming.config(text=("🔊 %s님 전체 방송 중" if radio.incoming_mode == "all"
-                                      else "🔊 %s님이 나에게 말하는 중") % radio.incoming_from)
+                incoming.configure(text=("🔊  %s님 전체 방송 중" if radio.incoming_mode == "all" else "🔊  %s님이 나에게 말하는 중") % radio.incoming_from)
                 if not incoming.winfo_ismapped():
-                    incoming.pack(fill="x", padx=20, pady=(10, 0), after=status)
+                    incoming.pack(fill="x", pady=(14, 0), after=head)
             elif incoming.winfo_ismapped():
                 incoming.pack_forget()
 
             who = radio.target_label()
             if radio.talking:
-                talk.config(text="🎙 말하는 중…\n떼면 끝", bg=RED)
+                talk.configure(fg_color=RED); talk_title.configure(text="말하는 중…", text_color="white"); talk_sub.configure(text="손을 떼면 끝", text_color="white")
             elif radio.requesting:
-                talk.config(text="잠깐만요…", bg="#B45309")
+                talk.configure(fg_color=AMBER_D); talk_title.configure(text="잠깐만요…", text_color=ON_AMBER); talk_sub.configure(text="", text_color=ON_AMBER)
             elif not radio.connected:
-                talk.config(text="연결 대기 중", bg="#334155")
+                talk.configure(fg_color=CARD2); talk_title.configure(text="연결 대기 중", text_color=SUB); talk_sub.configure(text=radio.status, text_color=SUB)
             else:
-                talk.config(text="누르고 말하기\n(%s)" % who, bg=BLUE)
-            notice.config(text=radio.notice)
+                talk.configure(fg_color=AMBER); talk_title.configure(text="누르고 말하기", text_color=ON_AMBER); talk_sub.configure(text=who, text_color=ON_AMBER)
+            notice.configure(text=radio.notice)
 
             window_visible = root.state() == "normal"
             csig = tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
@@ -1519,47 +1570,45 @@ def run_ui(start_minimized):
                          for c in radio.clips[:20])
             if csig != cache["clips"]:
                 cache["clips"] = csig
-                for c in clips_list.winfo_children():
+                for c in msg_list.winfo_children():
                     c.destroy()
                 if radio.clips:
-                    if not clips_box.winfo_ismapped():
-                        clips_box.pack(fill="x", padx=20, pady=6, after=text_box)
+                    if not msg_card.winfo_ismapped():
+                        msg_card.pack(fill="x", pady=(14, 0), after=compose_card)
                     for c in radio.clips[:20]:
-                        row = tk.Frame(clips_list, bg=CARD)
-                        row.pack(fill="x", pady=2)
-                        row.bind("<MouseWheel>", lambda e: clips_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
                         playing = radio.playing is c
+                        row = ctk.CTkFrame(msg_list, fg_color=CARD2, corner_radius=12)
+                        row.pack(fill="x", pady=3)
                         when_ = time.strftime("%m/%d %H:%M", time.localtime(c["ts"]))
+                        top = ctk.CTkFrame(row, fg_color="transparent")
+                        top.pack(fill="x", padx=10, pady=(8, 0))
+                        ctk.CTkLabel(top, text=radio.clip_title(c), font=font(11, True), text_color=SUB if c.get("mine") else AMBER, anchor="w").pack(side="left")
+                        ctk.CTkLabel(top, text=when_, font=font(10), text_color=SUB).pack(side="right")
                         if c.get("kind") == "text":
-                            desc = "%s\n💬 %s\n%s" % (radio.clip_title(c), c.get("text", ""), when_)
-                        elif c.get("kind") == "voice_sent":
-                            desc = "%s\n%s" % (radio.clip_title(c), when_)
-                        else:
-                            desc = "%s%s\n%s · %d초" % ("🔊 " if playing else "", radio.clip_title(c), when_, max(1, int(c["seconds"])))
+                            ctk.CTkLabel(row, text=c.get("text", ""), font=font(14), text_color=TXT, anchor="w", wraplength=330, justify="left").pack(fill="x", padx=10)
+                        elif c.get("kind") == "clip":
+                            ctk.CTkLabel(row, text="%s · %d초" % ("🔊 재생 중" if playing else "🎙 음성", max(1, int(c["seconds"]))), font=font(13), text_color=TXT, anchor="w").pack(fill="x", padx=10)
                         if c.get("mine"):
                             rt = radio.receipt_text(c)
                             if rt:
-                                desc += "\n" + rt
+                                ctk.CTkLabel(row, text=rt, font=font(11), text_color=AMBER, anchor="w").pack(fill="x", padx=10)
                         elif c.get("kind") == "text" and window_visible:
-                            radio.mark_seen(c)   # 창이 화면에 보이는 상태에서 표시됨 = 봤음
-                        tk.Label(row, text=desc, font=(F, 9), fg=SUB if c.get("mine") else TXT, bg=CARD,
-                                 justify="left", wraplength=240).pack(side="left", padx=4)
-                        tk.Button(row, text="삭제", font=(F, 9), command=lambda c=c: radio.delete_clip(c)).pack(side="right", padx=2)
+                            radio.mark_seen(c)
+                        btns = ctk.CTkFrame(row, fg_color="transparent")
+                        btns.pack(fill="x", padx=6, pady=(0, 4))
+                        small(btns, "삭제", lambda c=c: radio.delete_clip(c), color=SUB).pack(side="right")
                         if not c.get("mine"):
-                            tk.Button(row, text="답장", font=(F, 9),
-                                      command=lambda c=c: (radio.set_target(c["from"]), entry.focus_set())).pack(side="right", padx=2)
+                            small(btns, "답장", lambda c=c: (radio.set_target(c["from"]), entry.focus_set())).pack(side="right")
                         if c.get("kind") == "clip":
-                            tk.Button(row, text="정지" if playing else "듣기", font=(F, 9),
-                                      command=(lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c))).pack(side="right", padx=2)
-                elif clips_box.winfo_ismapped():
-                    clips_box.pack_forget()
+                            small(btns, "정지" if playing else "듣기", lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c)).pack(side="right")
+                elif msg_card.winfo_ismapped():
+                    msg_card.pack_forget()
         root.after(150, refresh)
 
-    # 창 닫기 = 트레이로 (계속 듣기). 완전 종료는 트레이 메뉴에서
     def on_close():
         if tray["icon"]:
             hide_window()
-            if not cache.get("tray_tip"):
+            if not cache["tray_tip"]:
                 cache["tray_tip"] = True
                 toast(APP_TITLE, "오른쪽 아래 시계 옆 아이콘에서 계속 듣고 있어요. 완전히 끄려면 아이콘 → 완전히 종료")
         else:
@@ -1633,6 +1682,8 @@ def single_instance():
                 conn.close()
                 if data.startswith(b"show"):
                     show_requests.put(True)
+                elif data.startswith(b"quit"):
+                    show_requests.put("quit")
             except Exception:
                 pass
     threading.Thread(target=accept_loop, daemon=True).start()
@@ -1646,21 +1697,88 @@ def make_desktop_shortcut():
     target = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     try:
         import subprocess
-        ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\\우리집 무전기.lnk');"
-              "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Description='우리집 무전기';$s.Save()"
+        ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\\우리집.lnk');"
+              "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.IconLocation='%s,0';$s.Description='우리집';$s.Save()"
               % (target.replace("'", "''"), os.path.dirname(target).replace("'", "''"), target.replace("'", "''")))
         r = subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
                            creationflags=0x08000000, timeout=20, capture_output=True, text=True)
         if r.returncode != 0:
             log("바로가기 만들기 실패: %s" % r.stderr.strip()[:200])
             return False, "바로가기를 만들지 못했어요"
-        return True, "바탕화면에 '우리집 무전기' 바로가기를 만들었어요"
+        return True, "바탕화면에 '우리집' 바로가기를 만들었어요"
     except Exception as e:
         log("바로가기 만들기 실패: %s" % e)
         return False, "바로가기를 만들지 못했어요"
 
 
+def _instance_running():
+    """다른 인스턴스가 떠 있는지 (Windows 뮤텍스)"""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.CreateMutexW(None, False, "Local\\WoorizipRadio_single_instance")
+        exists = (k32.GetLastError() == 183)
+        if h:
+            k32.CloseHandle(h)
+        return exists
+    except Exception:
+        return False
+
+
+def ensure_installed():
+    """
+    exe를 사용자 폴더(LOCALAPPDATA\WoorizipRadio)에 복사해 두고 그 복사본을 실행함.
+    → 다운로드한 파일은 지워도 되고, 새 버전은 그냥 실행만 하면 교체됨. 자동 시작도 복사본을 가리킴.
+    설치 복사본으로 실행된 게 아니면 복사 후 True (호출한 쪽은 종료)
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return False
+    target_dir = os.path.join(os.environ.get("LOCALAPPDATA") or data_dir(), "WoorizipRadio")
+    target = os.path.join(target_dir, "WoorizipRadio.exe")
+    cur = os.path.abspath(sys.executable)
+    if os.path.normcase(cur) == os.path.normcase(target):
+        return False
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception:
+        return False
+    # 이미 실행 중인 프로그램이 있으면 끄라고 부탁하고 꺼질 때까지 잠깐 기다림
+    if _instance_running():
+        try:
+            c = socket.create_connection(("127.0.0.1", GUARD_PORT), timeout=1)
+            c.sendall(b"quit")
+            c.close()
+        except Exception:
+            pass
+        for _ in range(40):
+            if not _instance_running():
+                break
+            time.sleep(0.25)
+    copied = False
+    for _ in range(30):
+        try:
+            shutil.copy2(cur, target)
+            copied = True
+            break
+        except PermissionError:
+            time.sleep(0.5)
+        except Exception as e:
+            log("설치 복사 실패: %s" % e)
+            break
+    if not copied:
+        return False   # 설치 못 하면 지금 위치에서 그냥 실행
+    log("설치: %s -> %s" % (cur, target))
+    try:
+        subprocess.Popen([target] + sys.argv[1:], close_fds=True, cwd=target_dir)
+    except Exception as e:
+        log("설치본 실행 실패: %s" % e)
+        return False
+    return True
+
+
 if __name__ == "__main__":
+    if ensure_installed():
+        sys.exit(0)
     _guard = single_instance()
     if _guard is None:
         sys.exit(0)   # 이미 실행 중 → 그쪽 창이 열림

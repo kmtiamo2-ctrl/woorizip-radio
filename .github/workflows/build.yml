@@ -16,7 +16,7 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -r pc/requirements.txt pyinstaller
       - run: echo '__version__ = "v${{ github.run_number }}"' > pc/version.py
-      - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray pc/radio_pc.py
+      - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray --collect-all customtkinter pc/radio_pc.py
       - uses: actions/upload-artifact@v4
         with:
           name: pc

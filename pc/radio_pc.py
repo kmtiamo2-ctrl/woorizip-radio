@@ -978,7 +978,7 @@ def run_ui(start_minimized, selftest=False):
         root.withdraw()
 
     def quit_app(*_):
-        events.put(("quit", None))
+        events.put(("ask_quit", None))   # 아이들이 함부로 끄지 못하게 가족 암호를 물은 뒤 종료
 
     def start_tray():
         try:
@@ -988,7 +988,7 @@ def run_ui(start_minimized, selftest=False):
         menu = pystray.Menu(
             pystray.MenuItem("열기", show_window, default=True),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("완전히 종료", quit_app),
+            pystray.MenuItem("완전히 종료 (가족 암호)", quit_app),
         )
         icon = pystray.Icon(APP_NAME, make_icon((37, 99, 235, 255)), APP_TITLE, menu)
         tray["icon"] = icon
@@ -1298,12 +1298,12 @@ def run_ui(start_minimized, selftest=False):
     root.bind("<FocusIn>", main_window_focused)
 
     # ---- 설정 ----
-    def ask_password(parent, on_ok):
+    def ask_password(parent, on_ok, prompt="가족 암호를 입력하세요"):
         d = ctk.CTkToplevel(parent, fg_color=BG)
         d.title("가족 암호")
-        d.geometry("300x150")
+        d.geometry("340x160")
         d.transient(parent)
-        ctk.CTkLabel(d, text="가족 암호를 입력하세요", font=font(13), text_color=TXT).pack(pady=(18, 8))
+        ctk.CTkLabel(d, text=prompt, font=font(13), text_color=TXT, wraplength=300).pack(pady=(18, 8))
         e = ctk.CTkEntry(d, show="*", font=font(14), width=200, justify="center")
         e.pack()
         e.focus_set()
@@ -1601,6 +1601,11 @@ def run_ui(start_minimized, selftest=False):
             root.deiconify()
             root.lift()
             root.focus_force()
+        elif kind == "ask_quit":
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+            ask_password(root, lambda: events.put(("quit", None)), prompt="완전히 종료하려면 가족 암호를 입력하세요")
         elif kind == "quit":
             radio.stop_talk()
             if tray["icon"]:
@@ -1728,7 +1733,7 @@ def run_ui(start_minimized, selftest=False):
             hide_window()
             if not cache["tray_tip"]:
                 cache["tray_tip"] = True
-                toast(APP_TITLE, "오른쪽 아래 시계 옆 아이콘에서 계속 듣고 있어요. 완전히 끄려면 아이콘 → 완전히 종료")
+                toast(APP_TITLE, "오른쪽 아래 시계 옆 아이콘에서 계속 듣고 있어요. 완전히 끄려면 아이콘 → 완전히 종료 (가족 암호)")
         else:
             quit_app()
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -1738,6 +1743,8 @@ def run_ui(start_minimized, selftest=False):
             set_autostart(cfg.autostart)
         except Exception:
             pass
+        if getattr(sys, "frozen", False):   # 고정된 작업 표시줄·시작 메뉴 바로가기가 옛 파일을 가리키면 설치본으로 고침
+            threading.Thread(target=repair_shortcuts, daemon=True).start()
     start_tray()
     bind_hotkey()
     radio.start()
@@ -1749,7 +1756,8 @@ def run_ui(start_minimized, selftest=False):
     if selftest:
         _selftest_ctx.update(root=root, ctk=ctk, cfg=cfg, radio=radio, events=events, popup=popup, sched=sched, entry=entry,
                              grid=grid, msg_list=msg_list, incoming=incoming, tray=tray, messagebox=messagebox,
-                             open_settings=open_settings, open_schedule=open_schedule, handle_event=handle_event, on_close=on_close)
+                             open_settings=open_settings, open_schedule=open_schedule, handle_event=handle_event, on_close=on_close,
+                             quit_app=quit_app)
         root.after(800, _selftest_start, _selftest_ctx)
     root.mainloop()
 
@@ -1854,6 +1862,55 @@ def _create_mutex():
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     h = k32.CreateMutexW(None, False, MUTEX_NAME)
     return k32, h, ctypes.get_last_error() == 183   # ERROR_ALREADY_EXISTS
+
+
+def repair_shortcuts(exe=None):
+    """
+    작업 표시줄·시작 메뉴·바탕화면에 있는 우리집 바로가기가 옛 파일(지운 다운로드 파일 등)을 가리키면 설치본으로 고침.
+    → '작업 표시줄에 고정'한 아이콘이 빈 문서 모양으로 나오던 문제. 시작 메뉴 항목(우리집)도 없으면 만듦.
+    돌려주는 값: (성공 여부, 고친 개수 또는 메시지)
+    """
+    if os.name != "nt":
+        return False, "Windows에서만 돼요"
+    exe = exe or (sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+    ps = (
+        "$ErrorActionPreference='Continue'\n"
+        "$exe='%s'\n"
+        "$sh=New-Object -ComObject WScript.Shell\n"
+        "$dirs=@((Join-Path $env:APPDATA 'Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar'),"
+        "(Join-Path $env:APPDATA 'Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\StartMenu'),"
+        "(Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs'),[Environment]::GetFolderPath('DesktopDirectory'))\n"
+        "$fixed=0\n"
+        "foreach($d in $dirs){ if(-not (Test-Path -LiteralPath $d)){ continue }\n"
+        "  Get-ChildItem -LiteralPath $d -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {\n"
+        "    try { $s=$sh.CreateShortcut($_.FullName); $t=[string]$s.TargetPath\n"
+        "      if($t -and ([IO.Path]::GetFileNameWithoutExtension($t) -like 'WoorizipRadio*')){\n"
+        "        if(($t -ne $exe) -or (-not ([string]$s.IconLocation).StartsWith($exe))){\n"
+        "          $s.TargetPath=$exe; $s.WorkingDirectory=(Split-Path $exe); $s.IconLocation=\"$exe,0\"; $s.Save(); $fixed++ } } } catch {} } }\n"
+        "$sm=Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs'\n"
+        "$final=Join-Path $sm '우리집.lnk'\n"
+        "if(-not (Test-Path -LiteralPath $sm)){ New-Item -ItemType Directory -Force $sm | Out-Null }\n"
+        "if(-not (Test-Path -LiteralPath $final)){ $tmp=Join-Path $sm 'WoorizipRadio.lnk'\n"
+        "  $s=$sh.CreateShortcut($tmp); $s.TargetPath=$exe; $s.WorkingDirectory=(Split-Path $exe); $s.IconLocation=\"$exe,0\"; $s.Description='우리집'; $s.Save()\n"
+        "  Move-Item -Force -LiteralPath $tmp -Destination $final }\n"
+        "if($fixed -gt 0){ try { Start-Process ie4uinit.exe -ArgumentList '-show' -WindowStyle Hidden } catch {} }\n"
+        "\"fixed=$fixed\"\n"
+    ) % exe.replace("'", "''")
+    try:
+        script = os.path.join(data_dir(), "repair_shortcuts.ps1")
+        with open(script, "w", encoding="utf-8-sig") as f:
+            f.write(ps)
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script],
+                           creationflags=0x08000000, timeout=60, capture_output=True)
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        if r.returncode != 0:
+            log("바로가기 점검 실패: %s" % (r.stderr or b"").decode("utf-8", "replace").strip()[:300])
+            return False, "바로가기를 점검하지 못했어요"
+        log("바로가기 점검: %s" % out[-100:])
+        return True, out
+    except Exception as e:
+        log("바로가기 점검 실패: %s" % e)
+        return False, str(e)
 
 
 def _instance_running():
@@ -2124,7 +2181,13 @@ def _selftest_start(ctx):
     step("창 닫기 → 트레이로 숨김", lambda: ctx["on_close"]() if ctx["tray"]["icon"] else None,
          until=lambda: root.state() == "withdrawn" if ctx["tray"]["icon"] else True, soft=True)
     step("트레이 → 창 열기", lambda: ctx["events"].put(("show", None)), until=lambda: root.state() == "normal")
+    step("완전히 종료 → 암호창", ctx["quit_app"], until=lambda: labels_with("완전히 종료하려면"))
+    step("암호창 닫으면 계속 실행", lambda: [t for t in tops() if labels_with("완전히 종료하려면", t)][0].destroy(),
+         until=lambda: not tops() and root.winfo_exists())
     step("자동 실행 등록·해제", lambda: (set_autostart(True), set_autostart(False)))
+    step("바로가기 점검 스크립트(시작 메뉴 항목)", lambda: ctx.update(repair=repair_shortcuts()),
+         until=lambda: ctx["repair"][0] and os.path.exists(os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "우리집.lnk")),
+         timeout=70, soft=True)
 
     def finish():
         bad = [r for r in results if not r[1] and not r[3]]

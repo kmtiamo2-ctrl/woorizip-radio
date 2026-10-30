@@ -4,6 +4,8 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions: { contents: read, issues: write }
+
 jobs:
   windows:
     name: Windows 설치 파일 (.exe)
@@ -27,8 +29,16 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
-      - run: chmod +x gradlew && ./gradlew assembleRelease --no-daemon
+      - name: 빌드
+        id: build
+        run: chmod +x gradlew && (./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log; exit ${PIPESTATUS[0]})
         working-directory: android
+      - name: 실패하면 오류 내용을 이슈로 남김
+        if: failure()
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          { echo '```'; grep -E "^e: |error:|What went wrong|Could not|Unresolved|FAILURE|Caused by" android/build.log | head -80; echo; echo "--- 마지막 60줄 ---"; tail -60 android/build.log; echo '```'; } > body.md
+          gh issue create --title "안드로이드 빌드 실패 (${{ github.run_number }})" --body-file body.md
       - uses: actions/upload-artifact@v4
         with:
           name: 폰용-우리집무전기

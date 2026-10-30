@@ -9,7 +9,9 @@
 필요한 패키지: sounddevice, pystray, Pillow, winotify, keyboard(선택)
 """
 import base64
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 import math
@@ -880,6 +882,101 @@ class Radio:
                 self._save_texts()
 
 
+# ---------------------------------------------------------------- 자동 업데이트 (NAS에서 새 버전을 받아 두었다가 한가할 때 교체)
+
+def version_number(v):
+    return int(re.sub(r"\D", "", v or "") or 0)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(256 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class Updater:
+    """
+    NAS 서버의 /update/latest.json 을 보고 새 버전이면 설치 파일을 받아 둠(sha256 확인).
+    적용은 화면 쪽(refresh)이 한가할 때 함: 받은 exe를 --minimized 로 실행하면 그 exe가 지금 프로그램을 끄고
+    설치본을 교체한 뒤 트레이로 다시 켬 (ensure_installed 흐름 그대로).
+    """
+    CHECK_EVERY = 4 * 3600
+
+    def __init__(self, radio):
+        self.radio = radio
+        self.ready = None        # (파일 경로, 버전 번호)
+        self.ready_since = 0.0
+        self.applied = False
+        self.enabled = getattr(sys, "frozen", False) and version_number(__version__) > 0
+        self.dir = os.path.join(os.path.dirname(installed_exe_path()), "update")
+
+    def start(self):
+        if self.enabled:
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        time.sleep(90)
+        while True:
+            try:
+                self.check()
+            except Exception as e:
+                log("업데이트 확인 실패: %r" % e)
+            time.sleep(self.CHECK_EVERY)
+
+    def base_url(self):
+        addr = self.radio.cfg.out_host if self.radio.where == "out" else self.radio.cfg.host
+        host, port, tls, _ = parse_addr(addr)
+        return "%s://%s:%d" % ("https" if tls else "http", host, port)
+
+    def check(self):
+        """새 버전이 있으면 받아 두고 True"""
+        if not self.radio.connected:
+            return False
+        import urllib.request
+        base = self.base_url()
+        with urllib.request.urlopen(base + "/update/latest.json", timeout=15) as r:
+            info = json.loads(r.read().decode("utf-8"))
+        pc = info.get("pc") or {}
+        num = int(info.get("number") or 0)
+        if not pc or num <= version_number(__version__):
+            return False
+        if self.ready and self.ready[1] == num and os.path.exists(self.ready[0]):
+            return True
+        os.makedirs(self.dir, exist_ok=True)
+        dest = os.path.join(self.dir, os.path.basename(pc["file"]))
+        if not (os.path.exists(dest) and sha256_file(dest) == pc["sha256"]):
+            tmp = dest + ".part"
+            h = hashlib.sha256()
+            with urllib.request.urlopen(base + "/update/" + pc["file"], timeout=120) as r, open(tmp, "wb") as f:
+                for chunk in iter(lambda: r.read(256 * 1024), b""):
+                    f.write(chunk)
+                    h.update(chunk)
+            if h.hexdigest() != pc["sha256"]:
+                os.remove(tmp)
+                raise RuntimeError("받은 파일이 손상됨 (sha256 불일치)")
+            os.replace(tmp, dest)
+        self.ready, self.ready_since = (dest, num), time.monotonic()
+        log("새 버전 받아 둠: v%d (%s)" % (num, dest))
+        return True
+
+    def apply(self):
+        path, num = self.ready
+        self.applied = True
+        log("업데이트 적용: v%d" % num)
+        subprocess.Popen([path, "--minimized", "--updated"], close_fds=True, cwd=os.path.dirname(path))
+
+    def cleanup(self):
+        """설치가 끝난 뒤(새 버전에서) 받아 둔 파일 정리"""
+        try:
+            for fn in os.listdir(self.dir):
+                if version_number(fn) <= version_number(__version__) or fn.endswith(".part"):
+                    os.remove(os.path.join(self.dir, fn))
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- 알림 풍선 / 트레이
 
 def toast(title, text):
@@ -919,6 +1016,7 @@ def run_ui(start_minimized, selftest=False):
 
     cfg = Config()
     radio = Radio(cfg)
+    updater = Updater(radio)
 
     BG, CARD, CARD2, TXT, SUB = "#0B1220", "#141C2E", "#1C2740", "#F3F5F9", "#9AA6BC"
     AMBER, AMBER_D, ON_AMBER, GREEN, RED, BLUE, OUTLINE = "#F5B301", "#C98F00", "#1A1200", "#34D399", "#F26D6D", "#8FB3FF", "#2B3752"
@@ -1650,6 +1748,12 @@ def run_ui(start_minimized, selftest=False):
     def _refresh_body():
         pump_events()
         tick_popup()
+        if updater.enabled and updater.ready and not updater.applied:
+            # 새 버전을 받아 둔 상태: 아무도 말하지 않고 답장 중도 아닐 때, 창이 숨겨져 있으면 바로 / 열려 있으면 30분 뒤에 교체
+            idle = not (radio.talking or radio.requesting or radio.incoming_from or radio.playing or popup["replying"])
+            hidden = root.state() in ("withdrawn", "iconic")
+            if idle and (hidden or time.monotonic() - updater.ready_since > 1800):
+                updater.apply()
         with radio.lock:
             me = cfg.name
             others = [m for m in radio.members if m != me]
@@ -1748,6 +1852,10 @@ def run_ui(start_minimized, selftest=False):
     start_tray()
     bind_hotkey()
     radio.start()
+    updater.start()
+    if "--updated" in sys.argv:   # 방금 자동 업데이트로 교체되어 켜짐
+        updater.cleanup()
+        toast(APP_TITLE, "새 버전 %s 으로 업데이트됐어요" % __version__)
     refresh()
     if start_minimized and cfg.configured and tray["icon"]:
         root.withdraw()
@@ -1757,7 +1865,7 @@ def run_ui(start_minimized, selftest=False):
         _selftest_ctx.update(root=root, ctk=ctk, cfg=cfg, radio=radio, events=events, popup=popup, sched=sched, entry=entry,
                              grid=grid, msg_list=msg_list, incoming=incoming, tray=tray, messagebox=messagebox,
                              open_settings=open_settings, open_schedule=open_schedule, handle_event=handle_event, on_close=on_close,
-                             quit_app=quit_app)
+                             quit_app=quit_app, updater=updater)
         root.after(800, _selftest_start, _selftest_ctx)
     root.mainloop()
 
@@ -2156,6 +2264,20 @@ def _selftest_start(ctx):
         button("변경 저장하고 다시 연결").invoke()
     step("관리 저장(다시 연결)", save_admin, until=lambda: not tops())
     step("새 연결로 다시 붙음", until=lambda: radio.connected and radio.client.sock is not None and radio.client.sock is not ctx["old_sock"], timeout=20)
+
+    def fake_update():   # 서버의 updates 폴더에 가짜 새 버전을 놓고, 클라이언트가 받아서 sha256까지 확인하는지
+        d = os.path.join(os.environ.get("DATA_DIR") or tempfile_dir(), "updates")
+        os.makedirs(d, exist_ok=True)
+        blob = os.urandom(300000)
+        with open(os.path.join(d, "WoorizipRadio-PC-v99999.exe"), "wb") as f:
+            f.write(blob)
+        with open(os.path.join(d, "latest.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": "v99999", "number": 99999,
+                       "pc": {"file": "WoorizipRadio-PC-v99999.exe", "size": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}}, f)
+        ctx["upd"] = ctx["updater"].check()
+    step("자동 업데이트: 새 버전 확인·받기(sha256)", fake_update,
+         until=lambda: ctx.get("upd") and ctx["updater"].ready and ctx["updater"].ready[1] == 99999 and os.path.getsize(ctx["updater"].ready[0]) == 300000,
+         soft=not os.environ.get("DATA_DIR"))
     step("설정창 다시 열기", ctx["open_settings"], until=lambda: any(txt(b) == "저장" for b in widgets(root, ctk.CTkButton)))
     step("바탕화면 바로가기 버튼", lambda: button("바탕화면에 바로가기 만들기").invoke(),
          until=lambda: dialogs and dialogs[-1][1] == "바로가기" and dialogs[-1][0] == "showinfo", timeout=30, soft=True)
@@ -2227,6 +2349,11 @@ def _selftest_start(ctx):
         else:
             root.after(100, run, i, started)
     run()
+
+
+def tempfile_dir():
+    import tempfile
+    return tempfile.gettempdir()
 
 
 def _selftest_main():

@@ -21,7 +21,8 @@ jobs:
         env: { PYTHONIOENCODING: utf-8, PYTHONUTF8: "1", FAMILY_KEY: "105403" }
         run: |
           mkdir -p pcout
-          DATA_DIR="$RUNNER_TEMP" python -u server/server.py > pcout/server.out 2> pcout/server.log &
+          export DATA_DIR="$RUNNER_TEMP"
+          GITHUB_REPO= python -u server/server.py > pcout/server.out 2> pcout/server.log &
           SRV=$!
           sleep 3
           python pc/radio_pc.py --selftest 2>&1 | tee pcout/selftest.log

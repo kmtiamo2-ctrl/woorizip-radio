@@ -178,7 +178,8 @@ class RadioService : Service() {
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED && Prefs(context).standby) {
+        val ok = intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_MY_PACKAGE_REPLACED
+        if (ok && Prefs(context).standby) {   // 재부팅 뒤, 그리고 자동 업데이트로 교체된 뒤 듣기 다시 켬
             Notifs.createChannels(context)
             try {
                 ContextCompat.startForegroundService(context, Intent(context, RadioService::class.java))

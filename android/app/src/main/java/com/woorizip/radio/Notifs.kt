@@ -22,6 +22,7 @@ object Notifs {
     const val CH_CLIP = "clip"
 
     fun createChannels(ctx: Context) {
+        Updater.createChannel(ctx)
         val nm = ctx.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CH_STANDBY, "수신 대기", NotificationManager.IMPORTANCE_LOW).apply {

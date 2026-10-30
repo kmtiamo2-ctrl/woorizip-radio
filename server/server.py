@@ -41,8 +41,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import struct
 import time
+import urllib.error
+import urllib.request
 
 FAMILY_KEY = os.environ.get("FAMILY_KEY", "")
 MEMBERS = [m.strip() for m in os.environ.get("MEMBERS", "엄마,아빠,첫째,둘째,셋째").split(",") if m.strip()]
@@ -59,6 +62,13 @@ QUIET_BEFORE_PING = 150 # 이만큼 조용한 연결에만 서버가 ping (평�
 IDLE_TIMEOUT = 330      # 이만큼 아무 신호가 없으면 끊긴 것으로 정리
 MAX_FRAME = 64 * 1024
 LIVE, CLIP = 1, 2
+
+# ---- 자동 업데이트: GitHub 릴리스에서 새 설치 파일을 받아 두고(updates/), 가족 기기들이 여기서 받아감 ----
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "kmtiamo2-ctrl/woorizip-radio")   # 비우면 자동 받기 안 함
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")                              # 저장소가 비공개일 때만 필요
+TOKEN_FILE = os.path.join(DATA_DIR, "github_token.txt")                        # 또는 이 파일에 토큰
+UPDATE_DIR = os.path.join(DATA_DIR, "updates")
+UPDATE_CHECK_MIN = float(os.environ.get("UPDATE_CHECK_MIN", "10"))             # 몇 분마다 확인
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%m-%d %H:%M:%S")
 log = logging.info
@@ -82,20 +92,47 @@ class WS:
 
     async def handshake(self):
         req = await asyncio.wait_for(self.r.readuntil(b"\r\n\r\n"), 10)
+        lines = req.decode("latin-1").split("\r\n")
+        parts = lines[0].split()
+        path = parts[1] if len(parts) >= 2 else "/"
         headers = {}
-        for line in req.decode("latin-1").split("\r\n")[1:]:
+        for line in lines[1:]:
             if ":" in line:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
         key = headers.get("sec-websocket-key")
         if not key or "websocket" not in headers.get("upgrade", "").lower():
-            self.w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                         b"Connection: close\r\n\r\nwoorizip-radio ok\n")
-            await self.w.drain()
+            await self.serve_http(path)
             raise Closed()
         accept = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
         self.w.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                       "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n" % accept).encode())
+        await self.w.drain()
+
+    async def serve_http(self, path):
+        """웹소켓이 아닌 보통 GET: 상태 확인(/) 과 업데이트 파일(/update/...)"""
+        path = path.split("?")[0]
+        if path.startswith("/update/"):
+            name = os.path.basename(path[len("/update/"):])
+            fp = os.path.join(UPDATE_DIR, name)
+            if name and (name == "latest.json" or name.startswith("WoorizipRadio")) and os.path.isfile(fp):
+                size = os.path.getsize(fp)
+                ctype = "application/json; charset=utf-8" if name.endswith(".json") else "application/octet-stream"
+                self.w.write(("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+                              "Cache-Control: no-cache\r\nConnection: close\r\n\r\n" % (ctype, size)).encode())
+                with open(fp, "rb") as f:
+                    while True:
+                        chunk = f.read(256 * 1024)
+                        if not chunk:
+                            break
+                        self.w.write(chunk)
+                        await self.w.drain()
+                return
+            self.w.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await self.w.drain()
+            return
+        self.w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                     b"Connection: close\r\n\r\nwoorizip-radio ok\n")
         await self.w.drain()
 
     async def _send(self, opcode, payload: bytes):
@@ -605,6 +642,121 @@ class Hub:
                 log("예약 처리 오류: %r", e)
 
 
+# ---------------------------------------------------------------- 자동 업데이트 (GitHub 릴리스 → updates/)
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None   # 직접 처리 (토큰 헤더를 파일 서버로 넘기지 않기 위해)
+
+
+def github_token():
+    if GITHUB_TOKEN:
+        return GITHUB_TOKEN
+    try:
+        with open(TOKEN_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _http_get(url, accept, stream_to=None, auth=True):
+    """GitHub API/파일 받기. 302는 토큰 없이 새 주소로 다시 요청. stream_to가 있으면 파일로 저장하고 (크기, sha256)"""
+    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "woorizip-radio", "X-GitHub-Api-Version": "2022-11-28"})
+    tok = github_token()
+    if tok and auth:
+        req.add_header("Authorization", "Bearer " + tok)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        resp = opener.open(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+            return _http_get(e.headers["Location"], accept, stream_to, auth=False)
+        raise
+    with resp:
+        if stream_to is None:
+            return resp.read()
+        h, n = hashlib.sha256(), 0
+        with open(stream_to, "wb") as f:
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                n += len(chunk)
+        return n, h.hexdigest()
+
+
+def read_latest_info():
+    try:
+        with open(os.path.join(UPDATE_DIR, "latest.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def fetch_latest_release():
+    """GitHub의 최신 릴리스를 확인해 새 버전이면 PC·폰 설치 파일을 받아 두고 latest.json을 씀. 새로 받았으면 태그 이름"""
+    os.makedirs(UPDATE_DIR, exist_ok=True)
+    data = json.loads(_http_get("https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO, "application/vnd.github+json"))
+    tag = str(data.get("tag_name") or "")
+    num = int(re.sub(r"\D", "", tag) or 0)
+    if num <= 0:
+        return None
+    cur = read_latest_info()
+    if cur.get("number") == num and all(os.path.isfile(os.path.join(UPDATE_DIR, cur[k]["file"])) for k in ("pc", "phone") if k in cur):
+        return None
+    info = {"version": tag, "number": num, "ts": int(time.time()), "notes": str(data.get("body") or "")[:2000]}
+    for key, suffix in (("pc", ".exe"), ("phone", ".apk")):
+        asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).endswith(suffix)), None)
+        if not asset:
+            continue
+        name = os.path.basename(asset["name"])
+        dest = os.path.join(UPDATE_DIR, name)
+        tmp = dest + ".part"
+        size, sha = _http_get(asset["url"], "application/octet-stream", stream_to=tmp)
+        if asset.get("size") and size != asset["size"]:
+            os.remove(tmp)
+            raise RuntimeError("%s 크기 불일치 (%d != %d)" % (name, size, asset["size"]))
+        os.replace(tmp, dest)
+        info[key] = {"file": name, "size": size, "sha256": sha}
+    if "pc" not in info and "phone" not in info:
+        return None
+    tmp = os.path.join(UPDATE_DIR, "latest.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, os.path.join(UPDATE_DIR, "latest.json"))
+    keep = {info[k]["file"] for k in ("pc", "phone") if k in info}
+    for fn in os.listdir(UPDATE_DIR):   # 옛 설치 파일 정리
+        if fn.startswith("WoorizipRadio") and fn not in keep:
+            try:
+                os.remove(os.path.join(UPDATE_DIR, fn))
+            except Exception:
+                pass
+    return tag
+
+
+async def update_poller():
+    if not GITHUB_REPO:
+        return
+    last_err = None
+    await asyncio.sleep(5)
+    while True:
+        try:
+            got = await asyncio.to_thread(fetch_latest_release)
+            if got:
+                log("새 버전 받아 둠: %s (가족 기기들이 다음 확인 때 가져감)", got)
+            last_err = None
+        except Exception as e:
+            msg = "%s" % e
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404 and not github_token():
+                msg = "저장소가 비공개인데 토큰이 없음 (%s에 토큰을 넣거나 저장소를 공개로)" % TOKEN_FILE
+            if msg != last_err:
+                log("업데이트 확인 실패: %s", msg[:300])
+                last_err = msg
+        await asyncio.sleep(UPDATE_CHECK_MIN * 60)
+
+
 async def main():
     if not FAMILY_KEY:
         raise SystemExit("FAMILY_KEY 환경 변수를 설정하세요.")
@@ -612,6 +764,7 @@ async def main():
     server = await asyncio.start_server(hub.handle, "0.0.0.0", PORT)
     log("우리집 무전기 서버 시작: 포트 %d, 가족 %s, 부모 %s", PORT, ", ".join(MEMBERS), ", ".join(sorted(PARENTS)))
     asyncio.create_task(hub.watchdog())
+    asyncio.create_task(update_poller())
     async with server:
         await server.serve_forever()
 

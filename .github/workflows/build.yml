@@ -52,13 +52,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { path: out }
       - run: |
-          mv out/pc/WoorizipRadio.exe "out/우리집무전기-PC설치파일.exe"
-          mv out/apk/app-release.apk "out/우리집무전기-폰앱.apk"
+          mv out/pc/WoorizipRadio.exe out/WoorizipRadio-PC.exe
+          mv out/apk/app-release.apk out/WoorizipRadio-Phone.apk
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
           name: 우리집 무전기 ${{ github.run_number }}번째 빌드
           body: |
-            - **PC(Windows)**: `우리집무전기-PC설치파일.exe` 를 내려받아 더블클릭
-            - **폰(안드로이드)**: `우리집무전기-폰앱.apk` 를 폰으로 보내서 설치
+            - **PC(Windows)**: `WoorizipRadio-PC.exe` 를 내려받아 더블클릭
+            - **폰(안드로이드)**: `WoorizipRadio-Phone.apk` 를 폰으로 보내서 설치
           files: out/*

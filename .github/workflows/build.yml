@@ -63,8 +63,15 @@ jobs:
           N=${{ github.run_number }}
           printf '%s\n' "- **PC(Windows)**: \`WoorizipRadio-PC-v$N.exe\` 를 내려받아 더블클릭 (실행 중인 옛 버전은 먼저 종료)" \
                          "- **폰(안드로이드)**: \`WoorizipRadio-Phone-v$N.apk\` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)" > notes.md
-          gh release create "v$N" out/*.exe out/*.apk --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest 2>&1 | tee release.log
-          test ${PIPESTATUS[0]} -eq 0
+          set +e
+          gh release create "v$N" out/*.exe out/*.apk --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest > release.log 2>&1
+          RC=$?
+          if [ $RC -ne 0 ]; then
+            echo "::error title=release::$(tr '\n' ' ' < release.log | cut -c1-900)"
+            echo "::error title=files::$(ls -R out | tr '\n' ' ' | cut -c1-500)"
+            echo "::error title=auth::$(gh api repos/$GITHUB_REPOSITORY --jq '.permissions' 2>&1 | tr '\n' ' ' | cut -c1-300)"
+          fi
+          exit $RC
       - name: 실패하면 이슈로 남김
         if: failure()
         env: { GH_TOKEN: "${{ github.token }}" }

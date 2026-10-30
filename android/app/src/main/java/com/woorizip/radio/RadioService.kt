@@ -95,34 +95,36 @@ class RadioService : Service() {
         return START_STICKY
     }
 
-    /** 마이크+미디어 재생 유형으로 포그라운드 시작. 백그라운드에서 재시작된 경우엔 재생 전용으로 시작 */
+    /**
+     * 포그라운드 시작. 앱 화면이 보일 때는 마이크+재생 유형으로,
+     * 재부팅 직후나 백그라운드 재시작이면 안드로이드가 허용하는 유형으로 '듣기 전용' 시작
+     */
     private fun goForeground(): Boolean {
         val notif = Notifs.standby(this)
         val withMic = if (Build.VERSION.SDK_INT >= 30)
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
         else ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-        return try {
-            ServiceCompat.startForeground(this, Notifs.ID_STANDBY, notif, withMic)
-            // 앱 화면이 보일 때 시작한 경우에만 마이크를 믿을 수 있음 (백그라운드 시작은 안드로이드가 마이크를 무음 처리)
-            Radio.micReady = Radio.uiVisible
-            true
-        } catch (_: Exception) {
+        val listenOnly = if (Build.VERSION.SDK_INT >= 34)
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE   // 부팅 직후에도 시작 허용되는 유형
+        else ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        val tryOrder = if (Radio.uiVisible) listOf(withMic, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK, listenOnly)
+                       else listOf(listenOnly, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        for (type in tryOrder) {
             try {
-                ServiceCompat.startForeground(
-                    this, Notifs.ID_STANDBY, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                )
-                Radio.micReady = false   // 듣기만 가능. 앱을 열면 다시 마이크 포함으로 올라감
-                true
+                ServiceCompat.startForeground(this, Notifs.ID_STANDBY, notif, type)
+                // 앱 화면이 보일 때 마이크 유형으로 시작한 경우에만 마이크를 믿을 수 있음
+                Radio.micReady = Radio.uiVisible && type == withMic
+                return true
             } catch (_: Exception) {
-                // 둘 다 실패하면 앱이 강제 종료되지 않도록 유형 없이 잠깐 올렸다가 바로 내림
-                try {
-                    startForeground(Notifs.ID_STANDBY, notif)
-                    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                } catch (_: Exception) {
-                }
-                false
             }
         }
+        // 모두 실패하면 앱이 강제 종료되지 않도록 유형 없이 잠깐 올렸다가 바로 내림
+        try {
+            startForeground(Notifs.ID_STANDBY, notif)
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {
+        }
+        return false
     }
 
     @Suppress("DEPRECATION")
@@ -170,12 +172,19 @@ class RadioService : Service() {
     }
 }
 
-/** 재부팅 후 수신 대기를 다시 켜 달라는 알림 (안드로이드 정책상 자동으로 마이크 서비스를 켤 수 없음) */
+/**
+ * 재부팅 후: 수신 대기를 '듣기 전용'으로 자동 시작.
+ * 마이크는 안드로이드 정책상 앱을 한 번 열어야 쓸 수 있어서, 알림에 그 안내가 표시됨
+ */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED && Prefs(context).standby) {
             Notifs.createChannels(context)
-            Notifs.showBootReminder(context)
+            try {
+                ContextCompat.startForegroundService(context, Intent(context, RadioService::class.java))
+            } catch (_: Exception) {
+                Notifs.showBootReminder(context)
+            }
         }
     }
 }

@@ -45,7 +45,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var memberRow2: LinearLayout
     private lateinit var talkButton: TextView
     private lateinit var standbySwitch: Switch
-    private lateinit var dndSwitch: Switch
     private lateinit var settingsBox: LinearLayout
     private lateinit var clipsBox: LinearLayout
     private lateinit var clipsList: LinearLayout
@@ -221,12 +220,7 @@ class MainActivity : ComponentActivity() {
                 h.postDelayed({ render() }, 300)
             }
         }
-        dndSwitch = Switch(this).apply {
-            text = "방해금지 (가족 말 받지 않기)"; setTextColor(textMain); textSize = 15f
-            setPadding(0, dp(8), 0, dp(8))
-            setOnCheckedChangeListener { _, c -> prefs.dnd = c }
-        }
-        switches.addView(standbySwitch); switches.addView(dndSwitch)
+        switches.addView(standbySwitch)
         root.addView(switches, lp(top = 20))
 
         val battery = Button(this).apply {
@@ -368,7 +362,6 @@ class MainActivity : ComponentActivity() {
         }
         noticeText.text = Radio.notice
         standbySwitch.isChecked = RadioService.running
-        dndSwitch.isChecked = prefs.dnd
     }
 
     private fun renderClips() {

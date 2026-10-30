@@ -60,9 +60,14 @@ class Config:
         self.data = dict(self.DEFAULTS)
         try:
             with open(os.path.join(data_dir(), "config.json"), encoding="utf-8") as f:
-                self.data.update(json.load(f))
+                saved = json.load(f)
+            # 예전 버전이 빈 값으로 저장해 둔 항목은 기본값을 씀
+            for k, v in saved.items():
+                if k in self.DEFAULTS and not (isinstance(v, str) and v == "" and self.DEFAULTS[k]):
+                    self.data[k] = v
         except Exception:
             pass
+        self.data["dnd"] = False  # 방해금지 기능 제거됨
 
     def __getattr__(self, k):
         if k in Config.DEFAULTS:
@@ -757,10 +762,6 @@ def run_ui(start_minimized):
     def quit_app(*_):
         events.put(("quit", None))
 
-    def toggle_dnd(*_):
-        cfg.set(dnd=not cfg.dnd)
-        events.put(("dnd", None))
-
     def start_tray():
         try:
             import pystray
@@ -768,7 +769,6 @@ def run_ui(start_minimized):
             return
         menu = pystray.Menu(
             pystray.MenuItem("열기", show_window, default=True),
-            pystray.MenuItem("방해금지", toggle_dnd, checked=lambda item: cfg.dnd),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("완전히 종료", quit_app),
         )
@@ -842,10 +842,6 @@ def run_ui(start_minimized):
 
     opts = tk.Frame(root, bg=CARD)
     opts.pack(fill="x", padx=20, pady=6, side="bottom")
-    dnd_var = tk.BooleanVar(value=cfg.dnd)
-    tk.Checkbutton(opts, text="방해금지 (가족 말 받지 않기)", variable=dnd_var, font=(F, 10),
-                   fg=TXT, bg=CARD, selectcolor=CARD, activebackground=CARD, activeforeground=TXT,
-                   command=lambda: cfg.set(dnd=dnd_var.get())).pack(anchor="w", padx=10, pady=(6, 0))
     hotkey_label = tk.Label(opts, text="", font=(F, 9), fg=SUB, bg=CARD)
     hotkey_label.pack(anchor="w", padx=10, pady=(0, 4))
     tk.Button(opts, text="설정", font=(F, 10), command=lambda: open_settings()).pack(pady=(0, 8))
@@ -855,14 +851,14 @@ def run_ui(start_minimized):
 
     def bind_hotkey():
         global keyboard
-        key = cfg.hotkey.strip().lower()
+        key = cfg.hotkey.strip().lower().replace(" ", "")
         if not key:
             if keyboard is not None:
                 try:
                     keyboard.unhook_all()
                 except Exception:
                     pass
-            hotkey_label.config(text="단축키 없음 (설정에서 F9 등을 넣으면 다른 창에서도 말하기 가능)")
+            hotkey_label.config(text="단축키 없음 (설정에서 정하면 다른 창에서도 말하기 가능)")
             return
         if keyboard is None:
             try:
@@ -885,9 +881,13 @@ def run_ui(start_minimized):
             hk["down"] = False
             radio.stop_talk()
         try:
-            keyboard.on_press_key(key, down)
-            keyboard.on_release_key(key, up)
-            hotkey_label.config(text="[%s] 키를 누르고 있는 동안 말하기 (다른 창에서도)" % key.upper())
+            main_key = key.split("+")[-1]
+            if "+" in key:
+                keyboard.add_hotkey(key, down)          # 조합키 (예: ctrl+alt+r)
+            else:
+                keyboard.on_press_key(main_key, down)   # 단일키 (예: f9)
+            keyboard.on_release_key(main_key, up)       # 마지막 키를 떼면 끝
+            hotkey_label.config(text="[%s] 누르고 있는 동안 말하기 (다른 창에서도)" % key.upper())
         except Exception:
             hotkey_label.config(text="단축키 [%s]를 등록할 수 없어요" % key)
 
@@ -910,13 +910,45 @@ def run_ui(start_minimized):
         rows = [("host", "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)"),
                 ("out_host", "밖 주소 — Tailscale(예: 100.101.102.103) 또는 DDNS. 비우면 집에서만"),
                 ("key", "가족 암호 (NAS 설정과 같게)"),
-                ("hotkey", "말하기 단축키 (비우면 없음. 예: f9, scroll lock)"),
+                ("hotkey", "말하기 단축키 (비우면 없음)"),
                 ("quick", "빠른 답장 문구 (쉼표로 구분)")]
         for k, label in rows:
             tk.Label(w, text=label, font=(F, 9), fg=SUB, bg=BG, wraplength=380, justify="left").pack(anchor="w", padx=16, pady=(10, 0))
-            e = tk.Entry(w, font=(F, 11), width=40, show="*" if k == "key" else "")
-            e.insert(0, str(getattr(cfg, k)))
-            e.pack(padx=16)
+            if k == "hotkey":
+                row = tk.Frame(w, bg=BG)
+                row.pack(anchor="w", padx=16, fill="x")
+                e = tk.Entry(row, font=(F, 11), width=26)
+                e.insert(0, str(getattr(cfg, k)))
+                e.pack(side="left")
+
+                def capture(entry=e):
+                    """키(조합 가능)를 직접 눌러서 지정"""
+                    global keyboard
+                    if keyboard is None:
+                        try:
+                            import keyboard as _kb
+                            keyboard = _kb
+                        except Exception:
+                            messagebox.showwarning("단축키", "단축키 기능을 쓸 수 없어요", parent=w)
+                            return
+                    entry.delete(0, "end")
+                    entry.insert(0, "키를 누르세요…")
+
+                    def worker():
+                        try:
+                            combo = keyboard.read_hotkey(suppress=False)
+                        except Exception:
+                            combo = ""
+                        events.put(("hotkey_captured", (entry, combo)))
+                    threading.Thread(target=worker, daemon=True).start()
+                tk.Button(row, text="키 눌러서 지정", font=(F, 9), command=capture).pack(side="left", padx=(6, 0))
+                tk.Button(row, text="없음", font=(F, 9), command=lambda entry=e: entry.delete(0, "end")).pack(side="left", padx=(4, 0))
+                tk.Label(w, text="예: F9, Scroll Lock, Ctrl+Alt+R. 게임·다른 프로그램과 겹치지 않는 키가 좋아요.",
+                         font=(F, 8), fg=SUB, bg=BG).pack(anchor="w", padx=16)
+            else:
+                e = tk.Entry(w, font=(F, 11), width=40, show="*" if k == "key" else "")
+                e.insert(0, str(getattr(cfg, k)))
+                e.pack(padx=16)
             fields[k] = e
         auto_var = tk.BooleanVar(value=cfg.autostart)
         tk.Checkbutton(w, text="Windows 시작 시 자동 실행 (트레이에 조용히 켜짐)", variable=auto_var, font=(F, 10),
@@ -980,8 +1012,13 @@ def run_ui(start_minimized):
                 toast("💬 " + radio.clip_title(info), info.get("text", ""))
             elif kind == "state":
                 set_tray(radio.connected, radio.where)
-            elif kind == "dnd":
-                dnd_var.set(cfg.dnd)
+            elif kind == "hotkey_captured":
+                entry, combo = info
+                try:
+                    entry.delete(0, "end")
+                    entry.insert(0, combo)
+                except Exception:
+                    pass
             elif kind == "show":
                 root.deiconify(); root.lift(); root.focus_force()
             elif kind == "quit":

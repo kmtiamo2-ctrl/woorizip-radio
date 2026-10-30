@@ -935,8 +935,9 @@ class Updater:
         if not self.radio.connected:
             return False
         import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 회사 PC의 프록시 설정을 타지 않게 (집 주소는 직접)
         base = self.base_url()
-        with urllib.request.urlopen(base + "/update/latest.json", timeout=15) as r:
+        with opener.open(base + "/update/latest.json", timeout=15) as r:
             info = json.loads(r.read().decode("utf-8"))
         pc = info.get("pc") or {}
         num = int(info.get("number") or 0)
@@ -949,7 +950,7 @@ class Updater:
         if not (os.path.exists(dest) and sha256_file(dest) == pc["sha256"]):
             tmp = dest + ".part"
             h = hashlib.sha256()
-            with urllib.request.urlopen(base + "/update/" + pc["file"], timeout=120) as r, open(tmp, "wb") as f:
+            with opener.open(base + "/update/" + pc["file"], timeout=120) as r, open(tmp, "wb") as f:
                 for chunk in iter(lambda: r.read(256 * 1024), b""):
                     f.write(chunk)
                     h.update(chunk)

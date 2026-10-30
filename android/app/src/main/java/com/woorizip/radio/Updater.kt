@@ -6,13 +6,16 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.net.Network
 import android.net.Uri
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
+import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.InetAddress
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
@@ -50,7 +53,7 @@ object Updater {
     }
 
     /** 서버에 연결될 때마다 부름. 6시간에 한 번만 실제로 확인 */
-    fun maybeCheck(ctx: Context, httpBase: String?, force: Boolean = false) {
+    fun maybeCheck(ctx: Context, httpBase: String?, network: Network? = null, force: Boolean = false) {
         if (httpBase.isNullOrBlank() || busy) return
         val now = System.currentTimeMillis()
         if (!force && now - lastCheck < CHECK_EVERY_MS) return
@@ -59,7 +62,7 @@ object Updater {
         val app = ctx.applicationContext
         thread(name = "updater", isDaemon = true) {
             try {
-                check(app, httpBase.trimEnd('/'))
+                check(app, httpBase.trimEnd('/'), network)
             } catch (e: Exception) {
                 Log.w(TAG, "업데이트 확인 실패: $e")
             } finally {
@@ -73,8 +76,13 @@ object Updater {
         if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode else @Suppress("DEPRECATION") pi.versionCode.toLong()
     } catch (_: Exception) { 0L }
 
-    private fun check(ctx: Context, base: String) {
-        val infoText = http.newCall(Request.Builder().url("$base/update/latest.json").build()).execute().use { r ->
+    private fun check(ctx: Context, base: String, network: Network?) {
+        // 집 주소는 Wi-Fi 망으로만 (폰이 모바일 데이터를 기본으로 쓰더라도)
+        val client = if (network == null) http else http.newBuilder()
+            .socketFactory(network.socketFactory)
+            .dns(object : Dns { override fun lookup(hostname: String): List<InetAddress> = network.getAllByName(hostname).toList() })
+            .build()
+        val infoText = client.newCall(Request.Builder().url("$base/update/latest.json").build()).execute().use { r ->
             if (!r.isSuccessful) return
             r.body?.string() ?: return
         }
@@ -90,7 +98,7 @@ object Updater {
         val apk = File(dir, name)
         if (!(apk.exists() && sha256(apk) == sha)) {
             val tmp = File(dir, "$name.part")
-            http.newCall(Request.Builder().url("$base/update/$name").build()).execute().use { r ->
+            client.newCall(Request.Builder().url("$base/update/$name").build()).execute().use { r ->
                 if (!r.isSuccessful) return
                 val body = r.body ?: return
                 tmp.outputStream().use { out -> body.byteStream().copyTo(out) }

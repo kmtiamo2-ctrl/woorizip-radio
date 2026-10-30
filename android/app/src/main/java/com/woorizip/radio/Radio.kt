@@ -170,7 +170,7 @@ object Radio : RadioClient.Listener {
                 msg.optJSONArray("parents")?.let { parents = it.toList().toSet() }
                 notice = ""
                 flushOutbox()
-                Updater.maybeCheck(app, client.httpBase)   // 6시간에 한 번 새 버전 확인
+                Updater.maybeCheck(app, client.httpBase, client.currentNetwork)   // 6시간에 한 번 새 버전 확인
             }
             "presence" -> {
                 online = msg.optJSONArray("online").toList()

@@ -44,6 +44,7 @@ class RadioClient(private val ctx: Context, private val listener: Listener) {
     @Volatile var connected = false; private set
     @Volatile var where: String? = null; private set   // "home" | "out" | null
     @Volatile var httpBase: String? = null; private set  // 지금 붙은 서버의 http 주소 (업데이트 파일 받기용)
+    @Volatile var currentNetwork: Network? = null; private set  // 집 주소로 붙었을 때 쓰는 Wi-Fi 망 (업데이트도 같은 망으로)
     private var backoff = 2000L
     private var lastError: String? = null
     private var skipHome = false
@@ -133,6 +134,7 @@ class RadioClient(private val ctx: Context, private val listener: Listener) {
         val targetWhere = if (useHome) "home" else "out"
         val url = if (useHome) Prefs.toWsUrl(p.host) else Prefs.toWsUrl(outAddr)
         httpBase = url.replaceFirst("ws", "http").trimEnd('/')
+        currentNetwork = if (useHome) net else null
         setState(false, null, if (useHome) "집 주소로 연결 중…" else "밖 주소로 연결 중…")
         lastError = null
         val builder = OkHttpClient.Builder()

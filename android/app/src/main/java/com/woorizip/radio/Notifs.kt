@@ -17,6 +17,8 @@ object Notifs {
     const val ID_STANDBY = 1
     const val ID_INCOMING = 2
     const val ID_BOOT = 3
+    const val ID_CLIP = 4
+    const val CH_CLIP = "clip"
 
     fun createChannels(ctx: Context) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
@@ -29,6 +31,13 @@ object Notifs {
         nm.createNotificationChannel(
             NotificationChannel(CH_INCOMING, "무음 모드 방송 알림", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "무음·진동 모드일 때 가족이 말하면 알려줌"
+            }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CH_CLIP, "받은 메시지", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "밖에 있을 때나 연결이 끊겼을 때 받은 가족의 말"
+                enableVibration(true)
+                setSound(null, null)   // 소리는 앱이 직접 처리 (아이는 진동만, 부모·집은 바로 재생)
             }
         )
     }
@@ -47,10 +56,12 @@ object Notifs {
     fun standby(ctx: Context): Notification {
         val target = Radio.target
         val who = if (target == "all") "전체" else target
+        val place = if (Radio.where == "out") " · 밖" else ""
         val title = when {
             Radio.talking -> "🎙 $who 에게 말하는 중"
+            Radio.playingClip != null -> "🔊 ${Radio.playingClip?.title} 재생 중"
             Radio.incomingFrom != null -> "🔊 ${Radio.incomingFrom}님이 말하는 중"
-            Radio.connected -> "우리집 무전기 · 수신 대기 중"
+            Radio.connected -> "우리집 무전기 · 수신 대기 중$place"
             else -> "우리집 무전기 · ${Radio.status}"
         }
         val text = when {
@@ -90,6 +101,29 @@ object Notifs {
 
     fun cancelSilentIncoming(ctx: Context) {
         ctx.getSystemService(NotificationManager::class.java).cancel(ID_INCOMING)
+    }
+
+    /** 보관 음성 도착 알림. autoPlayed면 이미 재생했으니 [다시 듣기], 아니면 [듣기] */
+    fun showClip(ctx: Context, clip: Clip, autoPlayed: Boolean) {
+        if (!canNotify(ctx)) return
+        val play = PendingIntent.getService(
+            ctx, 100 + clip.id,
+            Intent(ctx, RadioService::class.java).setAction(RadioService.ACTION_PLAY_CLIP).putExtra("id", clip.id),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val secs = clip.seconds.toInt().coerceAtLeast(1)
+        val n = NotificationCompat.Builder(ctx, CH_CLIP)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle(clip.title)
+            .setContentText(if (autoPlayed) "${secs}초 · 방금 재생했어요" else "${secs}초 · 눌러서 들어 보세요")
+            .setAutoCancel(true)
+            .setVibrate(longArrayOf(0, 250, 150, 250))
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setContentIntent(play)
+            .addAction(0, if (autoPlayed) "다시 듣기" else "듣기", play)
+            .addAction(0, "열기", openApp(ctx))
+            .build()
+        ctx.getSystemService(NotificationManager::class.java).notify(ID_CLIP, n)
     }
 
     /** 재부팅 후: 안드로이드 정책상 마이크 서비스를 자동으로 켤 수 없어서 한 번 눌러 달라고 안내 */

@@ -4,7 +4,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions: { contents: read, issues: write }
+permissions: { contents: write, issues: write }
 
 jobs:
   windows:
@@ -15,11 +15,11 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -r pc/requirements.txt pyinstaller
-      - run: pyinstaller --noconfirm --clean --onefile --windowed --name "우리집무전기" pc/radio_pc.py
+      - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --collect-all winotify --collect-all pystray pc/radio_pc.py
       - uses: actions/upload-artifact@v4
         with:
-          name: PC용-우리집무전기
-          path: dist/우리집무전기.exe
+          name: pc
+          path: dist/WoorizipRadio.exe
 
   android:
     name: 안드로이드 앱 (.apk)
@@ -41,5 +41,24 @@ jobs:
           gh issue create --title "안드로이드 빌드 실패 (${{ github.run_number }})" --body-file body.md
       - uses: actions/upload-artifact@v4
         with:
-          name: 폰용-우리집무전기
+          name: apk
           path: android/app/build/outputs/apk/release/app-release.apk
+
+  release:
+    name: 내려받기 페이지 만들기
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out }
+      - run: |
+          mv out/pc/WoorizipRadio.exe "out/우리집무전기-PC설치파일.exe"
+          mv out/apk/app-release.apk "out/우리집무전기-폰앱.apk"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: 우리집 무전기 ${{ github.run_number }}번째 빌드
+          body: |
+            - **PC(Windows)**: `우리집무전기-PC설치파일.exe` 를 내려받아 더블클릭
+            - **폰(안드로이드)**: `우리집무전기-폰앱.apk` 를 폰으로 보내서 설치
+          files: out/*

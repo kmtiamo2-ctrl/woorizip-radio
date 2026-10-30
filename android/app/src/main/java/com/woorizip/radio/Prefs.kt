@@ -6,14 +6,15 @@ import android.content.Context
 class Prefs(ctx: Context) {
     private val sp = ctx.applicationContext.getSharedPreferences("radio", Context.MODE_PRIVATE)
 
-    /** NAS 주소 (예: 192.168.0.10) */
+    /** 집 안에서 쓰는 NAS 주소 (예: 192.168.0.10 또는 192.168.0.10:8765) */
     var host: String
         get() = sp.getString("host", "") ?: ""
         set(v) = sp.edit().putString("host", v.trim()).apply()
 
-    var port: Int
-        get() = sp.getInt("port", 8765)
-        set(v) = sp.edit().putInt("port", v).apply()
+    /** 밖에서 쓰는 주소 (Tailscale 주소 100.x.x.x 또는 DDNS 주소 wss://xxx.synology.me). 비우면 집에서만 동작 */
+    var outHost: String
+        get() = sp.getString("outHost", "") ?: ""
+        set(v) = sp.edit().putString("outHost", v.trim()).apply()
 
     /** 내 이름 (서버의 MEMBERS 중 하나) */
     var name: String
@@ -46,4 +47,15 @@ class Prefs(ctx: Context) {
         set(v) = sp.edit().putString("target", v).apply()
 
     val isConfigured: Boolean get() = host.isNotBlank() && name.isNotBlank() && key.isNotBlank()
+
+    companion object {
+        /** "192.168.0.10", "192.168.0.10:8765", "wss://xxx.synology.me" 등을 WebSocket 주소로 */
+        fun toWsUrl(addr: String): String {
+            val a = addr.trim()
+            if (a.startsWith("ws://") || a.startsWith("wss://")) return a
+            if (a.startsWith("https://")) return "wss://" + a.removePrefix("https://")
+            if (a.startsWith("http://")) return "ws://" + a.removePrefix("http://")
+            return if (a.contains(":")) "ws://$a/" else "ws://$a:8765/"
+        }
+    }
 }

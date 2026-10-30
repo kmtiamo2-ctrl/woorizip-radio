@@ -4,13 +4,21 @@
 - 외부 라이브러리 없이 파이썬 표준 라이브러리만 사용 (Docker 이미지가 단순해짐)
 - 하나의 WebSocket 연결로 제어 메시지(JSON 텍스트)와 음성(바이너리)을 함께 주고받음
 - 집 안에서는 한 번에 한 사람만 말할 수 있음 (무전기 방식)
+- 집에 있는 기기와 밖에 있는 부모 기기에는 바로 소리로 전달하고,
+  밖에 있는 아이 기기와 접속이 끊긴 가족에게는 음성을 보관했다가 알림으로 전달함
 
 환경 변수
   FAMILY_KEY   가족 공용 암호 (필수, 앱 설정과 같아야 함)
   MEMBERS      가족 이름 목록, 쉼표로 구분 (기본: 엄마,아빠,첫째,둘째,셋째)
                한 사람이 폰·PC·노트북 여러 기기로 동시에 접속할 수 있음
+  PARENTS      밖에서도 바로 소리로 받는 가족 (기본: 엄마,아빠). 나머지는 밖에서 알림만 받음
   PORT         포트 (기본: 8765)
   MAX_TALK_SEC 한 번에 말할 수 있는 최대 시간(초) (기본: 60)
+  KEEP_HOURS   보관한 음성을 몇 시간까지 전달 시도할지 (기본: 24)
+
+서버 → 클라이언트 바이너리 프레임 형식
+  첫 바이트 1 = 실시간 음성 (뒤에 PCM 16kHz 모노 16비트)
+  첫 바이트 2 = 보관 음성 클립 (뒤에 4바이트 클립 번호, 그 뒤 PCM 전체)
 """
 import asyncio
 import base64
@@ -24,10 +32,14 @@ import time
 FAMILY_KEY = os.environ.get("FAMILY_KEY", "")
 MEMBERS = [m.strip() for m in os.environ.get("MEMBERS", "엄마,아빠,첫째,둘째,셋째").split(",") if m.strip()]
 PORT = int(os.environ.get("PORT", "8765"))
+PARENTS = {m.strip() for m in os.environ.get("PARENTS", "엄마,아빠").split(",") if m.strip()}
 MAX_TALK_SEC = float(os.environ.get("MAX_TALK_SEC", "60"))
+KEEP_HOURS = float(os.environ.get("KEEP_HOURS", "24"))
+MAX_QUEUE = 20
 PING_INTERVAL = 15
 IDLE_TIMEOUT = 45
 MAX_FRAME = 64 * 1024
+LIVE, CLIP = 1, 2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%m-%d %H:%M:%S")
 log = logging.info
@@ -141,80 +153,153 @@ class WS:
             pass
 
 
+def is_private(ip):
+    return ip.startswith(("192.168.", "10.", "127.")) or (
+        ip.startswith("172.") and ip.split(".")[1].isdigit() and 16 <= int(ip.split(".")[1]) <= 31)
+
+
 class Hub:
     """
-    가족 한 명(이름)이 폰·PC·노트북 여러 기기로 동시에 접속할 수 있음.
-    - 접속 표시는 이름 단위 (기기 하나라도 켜져 있으면 접속 중)
-    - 말하기는 집 전체에서 한 번에 한 기기만
-    - 누군가에게 말하면 그 사람의 모든 기기에서 들림. 말하는 사람 본인의 다른 기기에서는 안 들림
+    - 가족 한 명(이름)이 폰·PC·노트북 여러 기기로 동시에 접속할 수 있음
+    - 기기마다 집(home)/밖(out) 상태가 있음. 앱이 알려주고, 없으면 접속 IP로 판단
+    - 실시간으로 듣는 기기: 집에 있는 기기, 밖에 있는 부모 기기
+    - 알림으로 받는 기기: 밖에 있는 아이 기기 → 말이 끝나면 음성 클립을 통째로 전달
+    - 접속이 아예 없는 가족에게는 클립을 보관했다가 접속하면 전달
     """
 
     def __init__(self):
-        self.conns = {}         # 이름 -> {WS, ...}
-        self.speaker = None     # 지금 말하는 사람 이름
-        self.speaker_ws = None  # 지금 말하는 기기
-        self.targets = []       # 지금 듣는 사람 이름들
-        self.mode = None        # "all" | "direct"
+        self.conns = {}          # 이름 -> {WS, ...}
+        self.speaker = None
+        self.speaker_ws = None
+        self.targets = []        # 이름들
+        self.live = []           # 실시간으로 듣는 WS들
+        self.mode = None
         self.talk_started = 0.0
+        self.record = bytearray()
+        self.queue = {m: [] for m in MEMBERS}   # 이름 -> [클립...]
+        self.clip_seq = 0
+
+    # ---- 상태 ----
 
     def online(self):
         return [m for m in MEMBERS if self.conns.get(m)]
 
+    def where(self, name):
+        """가족 한 명의 위치: 기기 하나라도 집에 있으면 home"""
+        group = self.conns.get(name, ())
+        if not group:
+            return None
+        return "home" if any(w.where == "home" for w in group) else "out"
+
     def all_ws(self):
         return [ws for group in self.conns.values() for ws in list(group)]
+
+    def hears_live(self, ws):
+        return ws.where == "home" or ws.name in PARENTS
 
     async def send_to(self, name, msg):
         for ws in list(self.conns.get(name, ())):
             await ws.send_json(msg)
 
     async def broadcast_presence(self):
-        msg = {"type": "presence", "online": self.online(), "speaker": self.speaker}
+        msg = {"type": "presence", "online": self.online(), "speaker": self.speaker,
+               "where": {m: self.where(m) for m in self.online()}}
         for ws in self.all_ws():
             await ws.send_json(msg)
+
+    # ---- 말하기 ----
 
     async def start_talk(self, name, ws, to):
         if self.speaker and self.speaker_ws is not ws:
             await ws.send_json({"type": "talk_denied", "reason": "busy", "speaker": self.speaker})
             return
         if to == "all":
-            targets = [m for m in self.online() if m != name]
+            targets = [m for m in MEMBERS if m != name]
             mode = "all"
         else:
-            if to == name or not self.conns.get(to):
+            if to == name or to not in MEMBERS:
                 await ws.send_json({"type": "talk_denied", "reason": "offline", "to": to})
                 return
             targets = [to]
             mode = "direct"
-        self.speaker, self.speaker_ws, self.targets, self.mode = name, ws, targets, mode
+        live = [w for t in targets for w in self.conns.get(t, ()) if self.hears_live(w)]
+        self.speaker, self.speaker_ws, self.targets, self.live, self.mode = name, ws, targets, live, mode
         self.talk_started = time.monotonic()
-        log("송신 시작: %s -> %s", name, "전체" if mode == "all" else to)
-        await ws.send_json({"type": "talk_granted", "to": to, "listeners": targets})
-        for t in targets:
-            await self.send_to(t, {"type": "incoming", "from": name, "mode": mode})
+        self.record = bytearray()
+        log("송신 시작: %s -> %s (실시간 %d대)", name, "전체" if mode == "all" else to, len(live))
+        await ws.send_json({"type": "talk_granted", "to": to,
+                            "listeners": [m for m in targets if self.conns.get(m)]})
+        for w in live:
+            await w.send_json({"type": "incoming", "from": name, "mode": mode})
         await self.broadcast_presence()
 
     async def end_talk(self, ws, reason="done"):
         if self.speaker_ws is not ws:
             return
-        name, targets = self.speaker, self.targets
-        self.speaker, self.speaker_ws, self.targets, self.mode = None, None, [], None
-        log("송신 종료: %s (%s)", name, reason)
-        for t in targets:
-            await self.send_to(t, {"type": "incoming_end", "from": name})
+        name, targets, live, mode = self.speaker, self.targets, self.live, self.mode
+        pcm = bytes(self.record)
+        self.speaker = self.speaker_ws = None
+        self.targets, self.live, self.mode, self.record = [], [], None, bytearray()
+        log("송신 종료: %s (%s, %.1f초)", name, reason, len(pcm) / 32000)
+        for w in live:
+            await w.send_json({"type": "incoming_end", "from": name})
         if reason != "done" and not ws.closed:
             await ws.send_json({"type": "talk_stopped", "reason": reason})
+        if len(pcm) >= 16000:  # 0.5초 이상 말했을 때만 클립으로 보관
+            await self.deliver_clip(name, mode, targets, live, pcm)
         await self.broadcast_presence()
 
     async def relay_audio(self, ws, data):
         if self.speaker_ws is not ws:
             return
-        for t in self.targets:
-            for w in list(self.conns.get(t, ())):
-                await w.send_bytes(data)
+        if len(self.record) < int(MAX_TALK_SEC * 32000) + 64000:
+            self.record += data
+        frame = bytes([LIVE]) + data
+        for w in self.live:
+            await w.send_bytes(frame)
+
+    # ---- 보관 음성(클립) ----
+
+    async def deliver_clip(self, sender, mode, targets, live, pcm):
+        live_names = {w.name for w in live}
+        for t in targets:
+            if t in live_names:
+                continue  # 실시간으로 들은 사람은 클립 불필요
+            self.clip_seq += 1
+            clip = {"id": self.clip_seq, "from": sender, "mode": mode, "ts": time.time(), "pcm": pcm}
+            q = self.queue.setdefault(t, [])
+            q.append(clip)
+            del q[:-MAX_QUEUE]
+            await self.flush_queue(t)
+
+    async def flush_queue(self, name):
+        q = self.queue.get(name) or []
+        cutoff = time.time() - KEEP_HOURS * 3600
+        q[:] = [c for c in q if c["ts"] >= cutoff]
+        conns = list(self.conns.get(name, ()))
+        for c in q:
+            for w in conns:
+                if c["id"] in w.sent_clips:
+                    continue
+                w.sent_clips.add(c["id"])
+                await w.send_json({"type": "clip", "id": c["id"], "from": c["from"], "mode": c["mode"],
+                                   "ts": int(c["ts"]), "seconds": round(len(c["pcm"]) / 32000, 1)})
+                await w.send_bytes(bytes([CLIP]) + struct.pack("!I", c["id"]) + c["pcm"])
+
+    def ack_clip(self, name, clip_id):
+        q = self.queue.get(name) or []
+        q[:] = [c for c in q if c["id"] != clip_id]
+
+    # ---- 연결 처리 ----
 
     async def handle(self, reader, writer):
         ws = WS(reader, writer)
+        ws.name = None
+        ws.where = "home"
+        ws.device = ""
+        ws.sent_clips = set()
         name = None
+        peer = writer.get_extra_info("peername") or ("?", 0)
         try:
             await ws.handshake()
             is_text, raw = await asyncio.wait_for(ws.recv(), 10)
@@ -226,20 +311,28 @@ class Hub:
             if name not in MEMBERS:
                 await ws.send_json({"type": "error", "reason": "unknown_member", "members": MEMBERS})
                 return
+            ws.name = name
+            where = hello.get("where")
+            if where not in ("home", "out"):
+                where = "home" if is_private(str(peer[0])) else "out"
+            ws.where = where
             device = str(hello.get("device", ""))[:40]
             ws.device = device
-            if device:  # 같은 기기가 다시 접속하면 (Wi-Fi 끊김 후 재연결 등) 예전 연결은 정리
+            if device:  # 같은 기기가 다시 접속하면 예전 연결은 정리
                 for old in list(self.conns.get(name, ())):
-                    if getattr(old, "device", None) == device:
+                    if old.device == device:
                         if self.speaker_ws is old:
                             await self.end_talk(old, "reconnected")
                         self.conns[name].discard(old)
+                        self.live = [w for w in self.live if w is not old]
                         old.close()
             self.conns.setdefault(name, set()).add(ws)
-            log("접속: %s %s(%s) — 기기 %d대", name, device, writer.get_extra_info("peername"),
+            log("접속: %s [%s] %s(%s) — 기기 %d대", name, "집" if where == "home" else "밖", device, peer[0],
                 len(self.conns[name]))
-            await ws.send_json({"type": "welcome", "members": MEMBERS, "you": name})
+            await ws.send_json({"type": "welcome", "members": MEMBERS, "you": name, "where": where,
+                                "parents": sorted(PARENTS)})
             await self.broadcast_presence()
+            await self.flush_queue(name)
             while True:
                 is_text, data = await ws.recv()
                 if not is_text:
@@ -251,11 +344,19 @@ class Hub:
                     await self.start_talk(name, ws, msg.get("to", "all"))
                 elif t == "talk_end":
                     await self.end_talk(ws)
+                elif t == "clip_ack":
+                    self.ack_clip(name, int(msg.get("id", 0)))
+                elif t == "where":
+                    new = msg.get("where")
+                    if new in ("home", "out") and new != ws.where:
+                        ws.where = new
+                        log("위치 변경: %s -> %s", name, "집" if new == "home" else "밖")
+                        await self.broadcast_presence()
                 elif t == "ping":
                     await ws.send_json({"type": "pong"})
         except (Closed, asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
             pass
-        except Exception as e:  # 예상치 못한 오류도 서버 전체는 계속 동작
+        except Exception as e:
             log("오류(%s): %r", name, e)
         finally:
             ws.close()
@@ -264,6 +365,7 @@ class Hub:
                 group.discard(ws)
                 if not group:
                     del self.conns[name]
+                self.live = [w for w in self.live if w is not ws]
                 log("접속 종료: %s (남은 기기 %d대)", name, len(group))
                 if self.speaker_ws is ws:
                     await self.end_talk(ws, "disconnected")
@@ -276,7 +378,7 @@ class Hub:
             now = time.monotonic()
             for ws in self.all_ws():
                 if now - ws.last_seen > IDLE_TIMEOUT:
-                    log("응답 없음, 연결 정리")
+                    log("응답 없음, 연결 정리: %s", ws.name)
                     ws.close()
                 else:
                     await ws.ping()
@@ -289,7 +391,7 @@ async def main():
         raise SystemExit("FAMILY_KEY 환경 변수를 설정하세요.")
     hub = Hub()
     server = await asyncio.start_server(hub.handle, "0.0.0.0", PORT)
-    log("우리집 무전기 서버 시작: 포트 %d, 가족 %s", PORT, ", ".join(MEMBERS))
+    log("우리집 무전기 서버 시작: 포트 %d, 가족 %s, 부모 %s", PORT, ", ".join(MEMBERS), ", ".join(sorted(PARENTS)))
     asyncio.create_task(hub.watchdog())
     async with server:
         await server.serve_forever()

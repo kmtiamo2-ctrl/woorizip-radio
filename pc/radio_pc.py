@@ -1,31 +1,37 @@
 """
 우리집 무전기 - Windows PC 버전
-- NAS 중계 서버에 가족 한 명처럼 접속해서 말하고 듣기
-- 다른 프로그램을 쓰는 중에도 단축키(기본 F9)를 누르고 있는 동안 말하기
-- Windows 시작 시 자동 실행 (최소화 상태로 시작)
+- 오른쪽 아래 시계 옆(트레이)에 아이콘으로 상주. 창을 닫아도 계속 듣고 있음
+- 가족이 말하면 알림 풍선이 뜨고, Windows 기본 소리 장치(스피커/헤드셋)로 바로 들림
+- 창에서 상대를 고르고 큰 버튼을 누르는 동안 말하기. 원하면 단축키(F9)로도 가능
+- 집 주소로 안 되면 밖 주소(Tailscale/DDNS)로 자동 연결 (노트북을 밖에 가져갔을 때)
+- Windows 시작 시 자동 실행 (트레이에만 조용히 켜짐)
 
-필요한 패키지: sounddevice (마이크·스피커), keyboard (전역 단축키)
+필요한 패키지: sounddevice, pystray, Pillow, winotify, keyboard(선택)
 """
 import base64
 import json
 import math
 import os
 import socket
+import ssl
 import struct
 import sys
 import threading
 import time
 from array import array
 from collections import deque
+from urllib.parse import urlparse
 
 APP_NAME = "WoorizipRadio"
+APP_TITLE = "우리집 무전기"
 RATE = 16000
 FRAME_BYTES = 640  # 20ms, 16비트 모노
+LIVE, CLIP = 1, 2
 DEFAULT_MEMBERS = ["엄마", "아빠", "첫째", "둘째", "셋째"]
 
 try:
     import sounddevice as sd
-except Exception:  # 개발·테스트 환경용
+except Exception:
     sd = None
 try:
     import keyboard
@@ -35,21 +41,21 @@ except Exception:
 
 # ---------------------------------------------------------------- 설정
 
-def config_path():
+def data_dir():
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
     d = os.path.join(base, APP_NAME)
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "config.json")
+    return d
 
 
 class Config:
-    DEFAULTS = {"host": "", "port": 8765, "name": "", "key": "", "hotkey": "f9",
+    DEFAULTS = {"host": "", "out_host": "", "name": "", "key": "", "hotkey": "",
                 "target": "all", "dnd": False, "autostart": True}
 
     def __init__(self):
         self.data = dict(self.DEFAULTS)
         try:
-            with open(config_path(), encoding="utf-8") as f:
+            with open(os.path.join(data_dir(), "config.json"), encoding="utf-8") as f:
                 self.data.update(json.load(f))
         except Exception:
             pass
@@ -61,12 +67,27 @@ class Config:
 
     def set(self, **kw):
         self.data.update(kw)
-        with open(config_path(), "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        try:
+            with open(os.path.join(data_dir(), "config.json"), "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     @property
     def configured(self):
         return bool(self.host and self.name and self.key)
+
+
+def parse_addr(addr):
+    """'192.168.0.10', '192.168.0.10:8765', 'wss://xxx.synology.me' → (host, port, tls, path)"""
+    a = addr.strip()
+    if "://" not in a:
+        a = "ws://" + a
+    a = a.replace("https://", "wss://").replace("http://", "ws://")
+    u = urlparse(a)
+    tls = u.scheme == "wss"
+    port = u.port or (443 if tls else 8765)
+    return u.hostname, port, tls, (u.path or "/")
 
 
 # ---------------------------------------------------------------- Windows 자동 실행
@@ -75,7 +96,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def autostart_command():
-    if getattr(sys, "frozen", False):  # exe로 빌드된 경우
+    if getattr(sys, "frozen", False):
         return '"%s" --minimized' % sys.executable
     exe = sys.executable.replace("python.exe", "pythonw.exe")
     return '"%s" "%s" --minimized' % (exe, os.path.abspath(__file__))
@@ -106,7 +127,7 @@ def _mask(data, m):
 
 
 class WSClient:
-    """서버에 연결하고, 끊기면 자동으로 다시 연결"""
+    """집 주소 → 안 되면 밖 주소 순으로 연결하고, 끊기면 자동으로 다시 연결"""
 
     def __init__(self, cfg, on_text, on_bin, on_state):
         self.cfg = cfg
@@ -116,6 +137,7 @@ class WSClient:
         self.running = False
         self.kick = threading.Event()
         self.last_error = None
+        self.where = None
 
     def start(self):
         self.running = True
@@ -139,35 +161,47 @@ class WSClient:
             self.kick.clear()
             cfg = self.cfg
             if not cfg.configured:
-                self.on_state(False, "설정에서 NAS 주소·이름·암호를 입력하세요")
+                self.on_state(False, None, "설정에서 NAS 주소·이름·암호를 입력하세요")
                 self.kick.wait(5)
                 continue
-            self.on_state(False, "연결 중…")
+            attempts = [("home", cfg.host)]
+            if cfg.out_host.strip():
+                attempts.append(("out", cfg.out_host))
             err = "NAS 서버에 연결할 수 없어요"
-            self.last_error = None
-            try:
-                s = socket.create_connection((cfg.host, int(cfg.port)), timeout=5)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self._handshake(s, cfg.host, cfg.port)
-                s.settimeout(40)  # 서버가 15초마다 ping을 보내므로 40초 조용하면 끊긴 것
-                self.sock = s
-                self.send_json({"type": "hello", "name": cfg.name, "key": cfg.key,
-                                "device": "pc-" + socket.gethostname()})
-                backoff = 2
-                err = self._read_loop(s)
-            except Exception:
-                pass
-            self._close()
-            self.on_state(False, self.last_error or err)
+            for where, addr in attempts:
+                if not self.running:
+                    break
+                self.on_state(False, None, "집 주소로 연결 중…" if where == "home" else "밖 주소로 연결 중…")
+                self.last_error = None
+                try:
+                    s = self._open(addr)
+                    self.sock = s
+                    self.where = where
+                    self.send_json({"type": "hello", "name": cfg.name, "key": cfg.key,
+                                    "device": "pc-" + socket.gethostname(), "where": where})
+                    backoff = 2
+                    err = self._read_loop(s, where)
+                except Exception:
+                    pass
+                self._close()
+                if self.last_error or self.where == "connected":
+                    break
+            self.where = None
+            self.on_state(False, None, self.last_error or err)
             if self.kick.wait(backoff):
                 backoff = 2
             else:
-                backoff = min(backoff * 2, 15)
+                backoff = min(backoff * 2, 20)
 
-    def _handshake(self, s, host, port):
+    def _open(self, addr):
+        host, port, tls, path = parse_addr(addr)
+        s = socket.create_connection((host, port), timeout=5)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if tls:
+            s = ssl.create_default_context().wrap_socket(s, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
-        req = ("GET / HTTP/1.1\r\nHost: %s:%s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (host, port, key))
+        req = ("GET %s HTTP/1.1\r\nHost: %s:%s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % (path, host, port, key))
         s.sendall(req.encode())
         buf = b""
         while b"\r\n\r\n" not in buf:
@@ -177,18 +211,19 @@ class WSClient:
             buf += chunk
         if b" 101 " not in buf.split(b"\r\n", 1)[0]:
             raise ConnectionError()
+        s.settimeout(40)  # 서버가 15초마다 ping을 보내므로 40초 조용하면 끊긴 것
+        return s
 
     def _recv_exact(self, s, n):
         buf = b""
         while len(buf) < n:
-            chunk = s.recv(n - len(buf))
+            chunk = s.recv(min(n - len(buf), 65536))
             if not chunk:
                 raise ConnectionError()
             buf += chunk
         return buf
 
-    def _read_loop(self, s):
-        """연결이 끊길 때까지 메시지를 읽음. 끊긴 이유를 반환"""
+    def _read_loop(self, s, where):
         reason = "연결 끊김"
         msg_op, parts = None, []
         while self.running and self.sock is s:
@@ -214,11 +249,14 @@ class WSClient:
                 payload = b"".join(parts)
                 if msg_op == 1:
                     msg = json.loads(payload.decode("utf-8"))
-                    if msg.get("type") == "welcome":
-                        self.on_state(True, "연결됨")
-                    elif msg.get("type") == "error":
-                        reason = self.last_error = {"auth": "가족 암호가 서버와 달라요",
-                                  "unknown_member": "이름이 서버의 가족 목록에 없어요"}.get(msg.get("reason"), "서버 오류")
+                    t = msg.get("type")
+                    if t == "welcome":
+                        self.where = "connected"
+                        self.on_state(True, where, "집에서 연결됨" if where == "home" else "밖에서 연결됨")
+                    elif t == "error":
+                        reason = self.last_error = {
+                            "auth": "가족 암호가 서버와 달라요",
+                            "unknown_member": "이름이 서버의 가족 목록에 없어요"}.get(msg.get("reason"), "서버 오류")
                     self.on_text(msg)
                 else:
                     self.on_bin(payload)
@@ -259,13 +297,13 @@ def tone(freq, ms, vol=0.25):
     return a.tobytes()
 
 
-BEEP_IN = tone(880, 150)                              # 방송 들어옴
-BEEP_OK = tone(1200, 120)                             # 말하기 시작
-BEEP_NO = tone(300, 150) + bytes(1600) + tone(300, 150)  # 거절
+BEEP_IN = tone(880, 150)
+BEEP_OK = tone(1200, 120)
+BEEP_NO = tone(300, 150) + bytes(1600) + tone(300, 150)
 
 
 class Audio:
-    """스피커는 항상 열어 두고, 마이크는 말할 때만 엶"""
+    """스피커는 항상 열어 두고(Windows 기본 장치 = 헤드셋 꽂으면 헤드셋), 마이크는 말할 때만 엶"""
 
     def __init__(self, on_frame):
         self.on_frame = on_frame
@@ -287,7 +325,7 @@ class Audio:
 
     def _out_cb(self, outdata, frames, t, status):
         need = frames * 2
-        if self.waiting and len(self.q) < 3:   # 60ms 모아서 재생 시작 (끊김 방지)
+        if self.waiting and len(self.q) < 3:
             outdata[:] = bytes(need)
             return
         self.waiting = False
@@ -302,11 +340,21 @@ class Audio:
 
     def play(self, data):
         self.q.append(data)
-        while len(self.q) > 25:  # 0.5초 넘게 밀리면 오래된 소리 버림
+        while len(self.q) > 25:
             self.q.popleft()
 
+    def play_all(self, pcm):
+        """클립 전체 재생 (큐 제한 없이)"""
+        self.q.clear()
+        for i in range(0, len(pcm), FRAME_BYTES):
+            self.q.append(pcm[i:i + FRAME_BYTES])
+        self.waiting = False
+
+    def stop_playback(self):
+        self.q.clear()
+        self.rem = b""
+
     def effect(self, pcm):
-        """신호음: 바로 재생"""
         for i in range(0, len(pcm), FRAME_BYTES):
             self.q.append(pcm[i:i + FRAME_BYTES])
         self.waiting = False
@@ -341,19 +389,28 @@ class Radio:
         self.cfg = cfg
         self.lock = threading.RLock()
         self.connected = False
+        self.where = None
         self.status = "연결 준비 중"
         self.members = list(DEFAULT_MEMBERS)
+        self.parents = {"엄마", "아빠"}
         self.online = []
+        self.member_where = {}
         self.talking = False
         self.requesting = False
         self.incoming_from = None
         self.incoming_mode = None
         self.notice = ""
-        self.on_incoming = None   # 화면에서 창 깜빡임 등에 사용
+        self.clips = []          # 최근 받은 메시지 (새것이 앞): dict(id, from, mode, ts, seconds, pcm)
+        self.pending = {}
+        self.playing = None
+        self.on_event = None     # ("incoming"|"clip"|"state", 정보) → 화면 알림용
         self.client = WSClient(cfg, self._on_text, self._on_bin, self._on_state)
         self.audio = audio_factory(self.client.send_bytes)
         if self.audio.error:
             self.notice = self.audio.error
+        self.clip_dir = os.path.join(data_dir(), "clips")
+        os.makedirs(self.clip_dir, exist_ok=True)
+        self._load_clips()
 
     def start(self):
         self.client.start()
@@ -362,10 +419,24 @@ class Radio:
     def target(self):
         return self.cfg.target
 
+    @property
+    def is_parent(self):
+        return self.cfg.name in self.parents
+
     def set_target(self, t):
         with self.lock:
             if not self.talking:
                 self.cfg.set(target=t)
+
+    def _emit(self, kind, info=None):
+        cb = self.on_event
+        if cb:
+            try:
+                cb(kind, info)
+            except Exception:
+                pass
+
+    # ---- 말하기 ----
 
     def start_talk(self):
         with self.lock:
@@ -379,6 +450,7 @@ class Radio:
                 self.notice = "%s님이 말하는 중이에요" % self.incoming_from
                 self.audio.effect(BEEP_NO)
                 return
+            self.stop_clip()
             self.requesting = True
             if not self.client.send_json({"type": "talk_start", "to": self.target}):
                 self.requesting = False
@@ -395,14 +467,18 @@ class Radio:
             if active:
                 self.client.send_json({"type": "talk_end"})
 
+    # ---- 서버 메시지 ----
+
     def _on_text(self, msg):
         with self.lock:
             t = msg.get("type")
             if t == "welcome":
                 self.members = msg.get("members") or self.members
+                self.parents = set(msg.get("parents") or self.parents)
                 self.notice = ""
             elif t == "presence":
                 self.online = msg.get("online") or []
+                self.member_where = msg.get("where") or {}
             elif t == "talk_granted":
                 if not self.requesting:
                     return
@@ -429,22 +505,31 @@ class Radio:
                 self.notice = "1분이 지나 자동으로 끝났어요" if msg.get("reason") == "too_long" else "송신이 끝났어요"
             elif t == "incoming":
                 self.incoming_from, self.incoming_mode = msg.get("from"), msg.get("mode")
+                self.stop_clip()
                 if self.cfg.dnd:
                     self.notice = "방해금지 중 — %s님의 말을 받지 않았어요" % self.incoming_from
                 else:
                     self.audio.effect(BEEP_IN)
-                    if self.on_incoming:
-                        self.on_incoming()
+                    self._emit("incoming", msg)
             elif t == "incoming_end":
                 self.incoming_from = self.incoming_mode = None
+            elif t == "clip":
+                self.pending[int(msg.get("id", 0))] = msg
 
     def _on_bin(self, data):
-        if self.incoming_from and not self.cfg.dnd:
-            self.audio.play(data)
+        if not data:
+            return
+        kind = data[0]
+        if kind == LIVE:
+            if self.incoming_from and not self.cfg.dnd:
+                self.audio.play(data[1:])
+        elif kind == CLIP and len(data) > 5:
+            cid = struct.unpack("!I", data[1:5])[0]
+            self._on_clip(cid, data[5:])
 
-    def _on_state(self, connected, detail):
+    def _on_state(self, connected, where, detail):
         with self.lock:
-            self.connected, self.status = connected, detail
+            self.connected, self.where, self.status = connected, where, detail
             if not connected:
                 if self.talking:
                     self.talking = False
@@ -452,6 +537,112 @@ class Radio:
                 self.requesting = False
                 self.incoming_from = self.incoming_mode = None
                 self.online = []
+                self.member_where = {}
+        self._emit("state")
+
+    # ---- 보관 음성(클립) ----
+
+    def _load_clips(self):
+        items = []
+        for fn in os.listdir(self.clip_dir):
+            p = fn[:-4].split("_") if fn.endswith(".pcm") else []
+            if len(p) < 5:
+                continue
+            try:
+                with open(os.path.join(self.clip_dir, fn), "rb") as f:
+                    pcm = f.read()
+                items.append({"id": int(p[0]), "from": p[1], "mode": p[2], "ts": int(p[3]),
+                              "seconds": float(p[4]), "pcm": pcm, "file": os.path.join(self.clip_dir, fn)})
+            except Exception:
+                pass
+        items.sort(key=lambda c: -c["ts"])
+        self.clips = items[:30]
+
+    def _on_clip(self, cid, pcm):
+        with self.lock:
+            meta = self.pending.pop(cid, None)
+            if not meta:
+                return
+            self.client.send_json({"type": "clip_ack", "id": cid})
+            ts = int(meta.get("ts") or time.time())
+            sender, mode = meta.get("from"), meta.get("mode")
+            if any(c["from"] == sender and c["ts"] == ts for c in self.clips):
+                return
+            seconds = float(meta.get("seconds") or len(pcm) / 32000)
+            path = os.path.join(self.clip_dir, "%d_%s_%s_%d_%.1f.pcm" % (cid, sender, mode, ts, seconds))
+            try:
+                with open(path, "wb") as f:
+                    f.write(pcm)
+            except Exception:
+                pass
+            clip = {"id": cid, "from": sender, "mode": mode, "ts": ts, "seconds": seconds, "pcm": pcm, "file": path}
+            self.clips.insert(0, clip)
+            for old in self.clips[30:]:
+                try:
+                    os.remove(old["file"])
+                except Exception:
+                    pass
+            del self.clips[30:]
+            if self.cfg.dnd:
+                return
+            auto = self.where == "home" or self.is_parent
+            if auto:
+                self.play_clip(clip)
+            self._emit("clip", {"clip": clip, "auto": auto})
+
+    def clip_title(self, c):
+        return "%s님 전체 방송" % c["from"] if c["mode"] == "all" else "%s님이 나에게" % c["from"]
+
+    def play_clip(self, clip):
+        with self.lock:
+            if self.incoming_from or self.talking:
+                return
+            self.playing = clip
+            self.audio.effect(BEEP_IN)
+            self.audio.play_all(clip["pcm"])
+            threading.Timer(clip["seconds"] + 0.6, self._clip_done, [clip]).start()
+
+    def _clip_done(self, clip):
+        with self.lock:
+            if self.playing is clip:
+                self.playing = None
+        self._emit("state")
+
+    def stop_clip(self):
+        if self.playing:
+            self.playing = None
+            self.audio.stop_playback()
+
+    def delete_clip(self, clip):
+        with self.lock:
+            if self.playing is clip:
+                self.stop_clip()
+            self.clips = [c for c in self.clips if c is not clip]
+            try:
+                os.remove(clip["file"])
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- 알림 풍선 / 트레이
+
+def toast(title, text):
+    try:
+        from winotify import Notification
+        Notification(app_id=APP_TITLE, title=title, msg=text, duration="short").show()
+    except Exception:
+        pass
+
+
+def make_icon(color):
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((8, 4, 56, 60), radius=14, fill=color)
+    d.rounded_rectangle((22, 14, 42, 38), radius=10, fill=(255, 255, 255, 255))   # 마이크
+    d.rectangle((30, 40, 34, 50), fill=(255, 255, 255, 255))
+    d.rectangle((22, 50, 42, 54), fill=(255, 255, 255, 255))
+    return img
 
 
 # ---------------------------------------------------------------- 화면
@@ -468,10 +659,59 @@ def run_ui(start_minimized):
     F = "Malgun Gothic"
 
     root = tk.Tk()
-    root.title("우리집 무전기")
+    root.title(APP_TITLE)
     root.configure(bg=BG)
-    root.geometry("420x640")
-    root.minsize(380, 560)
+    root.geometry("440x720")
+    root.minsize(400, 600)
+
+    # ---- 트레이 아이콘 ----
+    tray = {"icon": None}
+
+    def show_window(*_):
+        root.after(0, lambda: (root.deiconify(), root.lift(), root.focus_force()))
+
+    def hide_window():
+        root.withdraw()
+
+    def quit_app(*_):
+        def _q():
+            radio.stop_talk()
+            if tray["icon"]:
+                try:
+                    tray["icon"].stop()
+                except Exception:
+                    pass
+            root.destroy()
+        root.after(0, _q)
+
+    def toggle_dnd(*_):
+        cfg.set(dnd=not cfg.dnd)
+        root.after(0, lambda: dnd_var.set(cfg.dnd))
+
+    def start_tray():
+        try:
+            import pystray
+        except Exception:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem("열기", show_window, default=True),
+            pystray.MenuItem("방해금지", toggle_dnd, checked=lambda item: cfg.dnd),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("완전히 종료", quit_app),
+        )
+        icon = pystray.Icon(APP_NAME, make_icon((37, 99, 235, 255)), APP_TITLE, menu)
+        tray["icon"] = icon
+        threading.Thread(target=icon.run, daemon=True).start()
+
+    def set_tray(connected, where):
+        icon = tray["icon"]
+        if not icon:
+            return
+        try:
+            icon.icon = make_icon((34, 197, 94, 255) if connected else (100, 116, 139, 255))
+            icon.title = "%s · %s" % (APP_TITLE, ("집" if where == "home" else "밖") if connected else "연결 안 됨")
+        except Exception:
+            pass
 
     def flash():
         if os.name == "nt":
@@ -480,9 +720,9 @@ def run_ui(start_minimized):
                 ctypes.windll.user32.FlashWindow(int(root.wm_frame(), 16), True)
             except Exception:
                 pass
-    radio.on_incoming = lambda: root.after(0, flash)
 
-    tk.Label(root, text="우리집 무전기", font=(F, 20, "bold"), fg=TXT, bg=BG).pack(anchor="w", padx=20, pady=(18, 0))
+    # ---- 화면 요소 ----
+    tk.Label(root, text=APP_TITLE, font=(F, 20, "bold"), fg=TXT, bg=BG).pack(anchor="w", padx=20, pady=(18, 0))
     status = tk.Label(root, text="", font=(F, 10), fg=SUB, bg=BG)
     status.pack(anchor="w", padx=20)
     incoming = tk.Label(root, text="", font=(F, 13, "bold"), fg="black", bg=ACCENT, pady=8)
@@ -491,41 +731,46 @@ def run_ui(start_minimized):
     grid = tk.Frame(root, bg=BG)
     grid.pack(fill="x", padx=16)
 
-    talk = tk.Label(root, text="", font=(F, 18, "bold"), fg="white", bg=BLUE, height=5, cursor="hand2")
+    talk = tk.Label(root, text="", font=(F, 18, "bold"), fg="white", bg=BLUE, height=4, cursor="hand2")
     talk.pack(fill="x", padx=20, pady=(14, 6))
     talk.bind("<ButtonPress-1>", lambda e: radio.start_talk())
     talk.bind("<ButtonRelease-1>", lambda e: radio.stop_talk())
-    notice = tk.Label(root, text="", font=(F, 11), fg=ACCENT, bg=BG, wraplength=380)
+    notice = tk.Label(root, text="", font=(F, 11), fg=ACCENT, bg=BG, wraplength=400)
     notice.pack(pady=(0, 6))
 
+    clips_box = tk.Frame(root, bg=CARD)
+    tk.Label(clips_box, text="받은 메시지", font=(F, 10), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(8, 2))
+    clips_list = tk.Frame(clips_box, bg=CARD)
+    clips_list.pack(fill="x", padx=6, pady=(0, 8))
+
     opts = tk.Frame(root, bg=CARD)
-    opts.pack(fill="x", padx=20, pady=6)
+    opts.pack(fill="x", padx=20, pady=6, side="bottom")
     dnd_var = tk.BooleanVar(value=cfg.dnd)
     tk.Checkbutton(opts, text="방해금지 (가족 말 받지 않기)", variable=dnd_var, font=(F, 10),
                    fg=TXT, bg=CARD, selectcolor=CARD, activebackground=CARD, activeforeground=TXT,
-                   command=lambda: cfg.set(dnd=dnd_var.get())).pack(anchor="w", padx=10, pady=6)
-    hotkey_label = tk.Label(opts, text="", font=(F, 10), fg=SUB, bg=CARD)
-    hotkey_label.pack(anchor="w", padx=10, pady=(0, 8))
+                   command=lambda: cfg.set(dnd=dnd_var.get())).pack(anchor="w", padx=10, pady=(6, 0))
+    hotkey_label = tk.Label(opts, text="", font=(F, 9), fg=SUB, bg=CARD)
+    hotkey_label.pack(anchor="w", padx=10, pady=(0, 4))
+    tk.Button(opts, text="설정", font=(F, 10), command=lambda: open_settings()).pack(pady=(0, 8))
 
-    tk.Button(root, text="설정", font=(F, 10), command=lambda: open_settings()).pack(pady=6)
-
-    # ---- 전역 단축키 (다른 프로그램을 쓰는 중에도 동작) ----
-    hk = {"key": None, "down": False}
+    # ---- 단축키 (선택) ----
+    hk = {"down": False}
 
     def bind_hotkey():
         if keyboard is None:
-            hotkey_label.config(text="단축키 사용 불가 (keyboard 패키지 없음)")
+            hotkey_label.config(text="")
             return
-        if hk["key"]:
-            try:
-                keyboard.unhook_all()
-            except Exception:
-                pass
-        key = cfg.hotkey.strip().lower() or "f9"
-        hk["key"] = key
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        key = cfg.hotkey.strip().lower()
+        if not key:
+            hotkey_label.config(text="단축키 없음 (설정에서 F9 등을 넣으면 다른 창에서도 말하기 가능)")
+            return
 
         def down(_):
-            if not hk["down"]:        # 누르고 있을 때 반복 입력 무시
+            if not hk["down"]:
                 hk["down"] = True
                 radio.start_talk()
 
@@ -535,40 +780,38 @@ def run_ui(start_minimized):
         try:
             keyboard.on_press_key(key, down)
             keyboard.on_release_key(key, up)
-            hotkey_label.config(text="[%s] 키를 누르고 있는 동안 말하기 (다른 창에서도 동작)" % key.upper())
+            hotkey_label.config(text="[%s] 키를 누르고 있는 동안 말하기 (다른 창에서도)" % key.upper())
         except Exception:
-            hotkey_label.config(text="단축키 [%s]를 등록할 수 없어요. 설정에서 바꿔 주세요." % key)
+            hotkey_label.config(text="단축키 [%s]를 등록할 수 없어요" % key)
 
     # ---- 설정 창 ----
     def open_settings():
+        show_window()
         w = tk.Toplevel(root)
         w.title("설정")
         w.configure(bg=BG)
         w.resizable(False, False)
         fields = {}
-        rows = [("host", "NAS 주소 (예: 192.168.0.10)"), ("port", "포트"),
-                ("name", "이 PC를 주로 쓰는 가족 (엄마·아빠·첫째·둘째·셋째)"), ("key", "가족 암호"),
-                ("hotkey", "말하기 단축키 (예: f9, f8, scroll lock)")]
+        rows = [("host", "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)"),
+                ("out_host", "밖 주소 — Tailscale(예: 100.101.102.103) 또는 DDNS. 비우면 집에서만"),
+                ("name", "이 PC를 주로 쓰는 가족 (엄마·아빠·첫째·둘째·셋째)"),
+                ("key", "가족 암호 (NAS 설정과 같게)"),
+                ("hotkey", "말하기 단축키 (비우면 없음. 예: f9, scroll lock)")]
         for k, label in rows:
-            tk.Label(w, text=label, font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(10, 0))
-            e = tk.Entry(w, font=(F, 11), width=34, show="*" if k == "key" else "")
+            tk.Label(w, text=label, font=(F, 9), fg=SUB, bg=BG, wraplength=380, justify="left").pack(anchor="w", padx=16, pady=(10, 0))
+            e = tk.Entry(w, font=(F, 11), width=40, show="*" if k == "key" else "")
             e.insert(0, str(getattr(cfg, k)))
             e.pack(padx=16)
             fields[k] = e
         auto_var = tk.BooleanVar(value=cfg.autostart)
-        tk.Checkbutton(w, text="Windows 시작 시 자동 실행", variable=auto_var, font=(F, 10),
+        tk.Checkbutton(w, text="Windows 시작 시 자동 실행 (트레이에 조용히 켜짐)", variable=auto_var, font=(F, 10),
                        fg=TXT, bg=BG, selectcolor=BG, activebackground=BG, activeforeground=TXT
                        ).pack(anchor="w", padx=12, pady=(12, 0))
 
         def save():
             v = {k: e.get().strip() for k, e in fields.items()}
-            try:
-                v["port"] = int(v["port"] or 8765)
-            except ValueError:
-                messagebox.showerror("설정", "포트는 숫자로 입력하세요", parent=w)
-                return
             if not (v["host"] and v["name"] and v["key"]):
-                messagebox.showerror("설정", "주소·이름·암호를 모두 입력하세요", parent=w)
+                messagebox.showerror("설정", "집 주소·이름·암호를 모두 입력하세요", parent=w)
                 return
             v["autostart"] = auto_var.get()
             cfg.set(**v)
@@ -583,8 +826,27 @@ def run_ui(start_minimized):
         w.transient(root)
         w.grab_set()
 
-    # ---- 화면 갱신 (0.15초마다) ----
-    last_buttons = {"sig": None}
+    # ---- 이벤트 (다른 스레드에서 옴) ----
+    def on_event(kind, info):
+        def ui():
+            if kind == "incoming":
+                flash()
+                who = info.get("from")
+                toast("%s님이 말해요" % who, "전체 방송" if info.get("mode") == "all" else "나에게")
+            elif kind == "clip":
+                c = info["clip"]
+                flash()
+                toast(radio.clip_title(c), "%d초 · %s" % (max(1, int(c["seconds"])),
+                                                        "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"))
+                if not info["auto"]:
+                    show_window()
+            elif kind == "state":
+                set_tray(radio.connected, radio.where)
+        root.after(0, ui)
+    radio.on_event = on_event
+
+    # ---- 화면 갱신 ----
+    cache = {"buttons": None, "clips": None}
 
     def refresh():
         with radio.lock:
@@ -592,25 +854,27 @@ def run_ui(start_minimized):
             others = [m for m in radio.members if m != me]
             if radio.target != "all" and radio.target not in others:
                 cfg.set(target="all")
-            sig = (tuple(others), tuple(radio.online), radio.target)
-            if sig != last_buttons["sig"]:
-                last_buttons["sig"] = sig
+            sig = (tuple(others), tuple(radio.online), radio.target, tuple(sorted(radio.member_where.items())))
+            if sig != cache["buttons"]:
+                cache["buttons"] = sig
                 for c in grid.winfo_children():
                     c.destroy()
                 items = [("전체", "all", True)] + [(m, m, m in radio.online) for m in others]
                 for i, (label, value, on) in enumerate(items):
                     sel = radio.target == value
-                    text = label if value == "all" else ("● " if on else "○ ") + label
-                    b = tk.Label(grid, text=text, font=(F, 11, "bold"), pady=8,
-                                 fg="black" if sel else (TXT if on else SUB), bg=ACCENT if sel else CARD,
-                                 cursor="hand2")
+                    place = ""
+                    if value != "all" and on:
+                        place = "\n" + ("밖" if radio.member_where.get(value) == "out" else "집")
+                    text = label if value == "all" else ("● " if on else "○ ") + label + place
+                    b = tk.Label(grid, text=text, font=(F, 11, "bold"), pady=6,
+                                 fg="black" if sel else (TXT if on else SUB), bg=ACCENT if sel else CARD, cursor="hand2")
                     b.grid(row=i // 3, column=i % 3, sticky="nsew", padx=4, pady=4)
                     b.bind("<Button-1>", lambda e, v=value: radio.set_target(v))
                 for c in range(3):
                     grid.columnconfigure(c, weight=1)
 
             if radio.connected:
-                status.config(text="● 연결됨 · %s · 집에 %d명 접속" % (me, len(radio.online)), fg=GREEN)
+                status.config(text="● %s · 지금 %s · 가족 %d명 접속 중" % (me, "집" if radio.where == "home" else "밖", len(radio.online)), fg=GREEN)
             else:
                 status.config(text=radio.status, fg=SUB)
 
@@ -632,38 +896,62 @@ def run_ui(start_minimized):
             else:
                 talk.config(text="누르고 말하기\n(%s)" % who, bg=BLUE)
             notice.config(text=radio.notice)
+
+            csig = tuple((id(c), radio.playing is c) for c in radio.clips[:8])
+            if csig != cache["clips"]:
+                cache["clips"] = csig
+                for c in clips_list.winfo_children():
+                    c.destroy()
+                if radio.clips:
+                    if not clips_box.winfo_ismapped():
+                        clips_box.pack(fill="x", padx=20, pady=6, after=notice)
+                    for c in radio.clips[:8]:
+                        row = tk.Frame(clips_list, bg=CARD)
+                        row.pack(fill="x", pady=2)
+                        playing = radio.playing is c
+                        tk.Label(row, text="%s%s\n%s · %d초" % ("🔊 " if playing else "", radio.clip_title(c),
+                                                                time.strftime("%m/%d %H:%M", time.localtime(c["ts"])),
+                                                                max(1, int(c["seconds"]))),
+                                 font=(F, 9), fg=TXT, bg=CARD, justify="left").pack(side="left", padx=4)
+                        tk.Button(row, text="삭제", font=(F, 9), command=lambda c=c: radio.delete_clip(c)).pack(side="right", padx=2)
+                        tk.Button(row, text="정지" if playing else "듣기", font=(F, 9),
+                                  command=(lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c))).pack(side="right", padx=2)
+                elif clips_box.winfo_ismapped():
+                    clips_box.pack_forget()
         root.after(150, refresh)
 
+    # 창 닫기 = 트레이로 (계속 듣기). 완전 종료는 트레이 메뉴에서
     def on_close():
-        # 창을 닫으면 작업 표시줄로 내려가고 계속 수신 (완전 종료는 확인 후)
-        if messagebox.askyesno("우리집 무전기", "무전기를 완전히 끌까요?\n'아니요'를 누르면 최소화해서 계속 들어요."):
-            root.destroy()
+        if tray["icon"]:
+            hide_window()
+            if not cache.get("tray_tip"):
+                cache["tray_tip"] = True
+                toast(APP_TITLE, "오른쪽 아래 시계 옆 아이콘에서 계속 듣고 있어요. 완전히 끄려면 아이콘 → 완전히 종료")
         else:
-            root.iconify()
+            quit_app()
     root.protocol("WM_DELETE_WINDOW", on_close)
 
-    # 처음 실행이면 자동 실행 등록 + 설정 창
     try:
         set_autostart(cfg.autostart)
     except Exception:
         pass
+    start_tray()
     bind_hotkey()
     radio.start()
     refresh()
-    if start_minimized and cfg.configured:
-        root.iconify()
+    if start_minimized and cfg.configured and tray["icon"]:
+        root.withdraw()
     elif not cfg.configured:
         root.after(300, open_settings)
     root.mainloop()
 
 
 def single_instance():
-    """이미 실행 중이면 False (같은 이름으로 두 번 접속하면 서로 끊기므로 하나만 실행)"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", 47651))
         s.listen(1)
-        return s  # 프로그램이 끝날 때까지 잡아 둠
+        return s
     except OSError:
         return None
 
@@ -672,9 +960,6 @@ if __name__ == "__main__":
     _guard = single_instance()
     if _guard is None:
         if "--minimized" not in sys.argv:
-            import tkinter as tk
-            from tkinter import messagebox
-            r = tk.Tk(); r.withdraw()
-            messagebox.showinfo("우리집 무전기", "이미 실행 중이에요. 작업 표시줄에서 찾아 주세요.")
+            toast(APP_TITLE, "이미 실행 중이에요. 오른쪽 아래 시계 옆 아이콘을 눌러 주세요.")
         sys.exit(0)
     run_ui("--minimized" in sys.argv)

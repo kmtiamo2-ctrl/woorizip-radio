@@ -8,6 +8,8 @@ services:
     environment:
       FAMILY_KEY: "여기에-가족-암호-입력"
       MEMBERS: "엄마,아빠,첫째,둘째,셋째"
+      # 밖에서도 바로 소리로 받는 가족. 나머지(아이들)는 밖에서 진동+알림만 받음
+      PARENTS: "엄마,아빠"
       PORT: "8765"
       MAX_TALK_SEC: "60"
       TZ: "Asia/Seoul"

@@ -47,6 +47,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var standbySwitch: Switch
     private lateinit var dndSwitch: Switch
     private lateinit var settingsBox: LinearLayout
+    private lateinit var clipsBox: LinearLayout
+    private lateinit var clipsList: LinearLayout
     private val refresh: () -> Unit = { render() }
     private val h = Handler(Looper.getMainLooper())
 
@@ -147,6 +149,16 @@ class MainActivity : ComponentActivity() {
         noticeText = label("", 15f, accent).apply { gravity = Gravity.CENTER }
         root.addView(noticeText, lp(top = 10))
 
+        // 받은 메시지 (밖에 있을 때 / 연결이 끊겼을 때 온 말)
+        clipsBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; background = rounded(card)
+            setPadding(dp(16), dp(12), dp(16), dp(12)); visibility = View.GONE
+        }
+        clipsBox.addView(label("받은 메시지", 15f, textSub))
+        clipsList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        clipsBox.addView(clipsList, lp(top = 6))
+        root.addView(clipsBox, lp(top = 16))
+
         // 스위치들
         val switches = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; background = rounded(card)
@@ -208,8 +220,8 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL; background = rounded(card)
             setPadding(dp(16), dp(8), dp(16), dp(16))
         }
-        val host = field(box, "NAS 주소 (예: 192.168.0.10)", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        val port = field(box, "포트", prefs.port.toString(), InputType.TYPE_CLASS_NUMBER)
+        val host = field(box, "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val outHost = field(box, "밖 주소 — Tailscale 주소(예: 100.101.102.103) 또는 DDNS 주소. 비우면 집에서만", prefs.outHost, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         val name = field(box, "내 이름 (엄마·아빠·첫째·둘째·셋째 중 하나)", prefs.name, InputType.TYPE_CLASS_TEXT)
         val key = field(box, "가족 암호 (NAS 설정과 같게)", prefs.key, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
 
@@ -226,7 +238,7 @@ class MainActivity : ComponentActivity() {
             text = "저장하고 연결"
             setOnClickListener {
                 prefs.host = host.text.toString()
-                prefs.port = port.text.toString().toIntOrNull() ?: 8765
+                prefs.outHost = outHost.text.toString()
                 prefs.name = name.text.toString()
                 prefs.key = key.text.toString()
                 prefs.keyMode = if (modes.checkedRadioButtonId == dbl.id) "double" else "hold"
@@ -241,9 +253,15 @@ class MainActivity : ComponentActivity() {
 
     private fun memberButton(text: String, value: String, isOnline: Boolean): TextView {
         val selected = Radio.target == value
+        val place = when {
+            value == "all" || !isOnline -> ""
+            Radio.memberWhere[value] == "out" -> "\n밖"
+            else -> "\n집"
+        }
         return TextView(this).apply {
-            this.text = if (value == "all") text else "${if (isOnline) "●" else "○"} $text"
-            gravity = Gravity.CENTER; textSize = 17f; typeface = Typeface.DEFAULT_BOLD
+            this.text = if (value == "all") text else "${if (isOnline) "●" else "○"} $text$place"
+            gravity = Gravity.CENTER; textSize = 16f; typeface = Typeface.DEFAULT_BOLD
+            setLineSpacing(0f, 0.9f)
             setTextColor(if (selected) Color.BLACK else if (isOnline) textMain else textSub)
             background = rounded(if (selected) accent else card, 12)
             setPadding(0, dp(14), 0, dp(14))
@@ -267,8 +285,10 @@ class MainActivity : ComponentActivity() {
         if (Radio.target != "all" && Radio.target !in others) Radio.target = "all"
 
         val online = Radio.online.size
-        statusText.text = if (Radio.connected) "● 연결됨 · ${if (me.isBlank()) "" else "$me · "}집에 ${online}명 접속" else Radio.status
+        val place = if (Radio.atHome) "집" else "밖"
+        statusText.text = if (Radio.connected) "● $me · 지금 $place · 가족 ${online}명 접속 중" else Radio.status
         statusText.setTextColor(if (Radio.connected) green else textSub)
+        renderClips()
 
         val from = Radio.incomingFrom
         if (from != null) {
@@ -286,6 +306,26 @@ class MainActivity : ComponentActivity() {
         noticeText.text = Radio.notice
         standbySwitch.isChecked = RadioService.running
         dndSwitch.isChecked = prefs.dnd
+    }
+
+    private fun renderClips() {
+        val clips = Radio.clips
+        clipsBox.visibility = if (clips.isEmpty()) View.GONE else View.VISIBLE
+        clipsList.removeAllViews()
+        val fmt = java.text.SimpleDateFormat("M/d HH:mm", java.util.Locale.KOREA)
+        clips.take(10).forEach { c ->
+            val playing = Radio.playingClip === c
+            val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+            val info = label("${if (playing) "🔊 " else ""}${c.title}\n${fmt.format(java.util.Date(c.ts * 1000))} · ${c.seconds.toInt().coerceAtLeast(1)}초", 14f, textMain)
+            info.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            val play = Button(this).apply {
+                text = if (playing) "정지" else "듣기"
+                setOnClickListener { if (playing) Radio.stopClip() else Radio.playClip(c) }
+            }
+            val del = Button(this).apply { text = "삭제"; setOnClickListener { Radio.deleteClip(c) } }
+            row.addView(info); row.addView(play); row.addView(del)
+            clipsList.addView(row, lp(top = 4))
+        }
     }
 
     // ---------- 볼륨 버튼 (앱이 화면에 보일 때) ----------

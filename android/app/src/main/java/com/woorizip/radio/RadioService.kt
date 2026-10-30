@@ -26,6 +26,7 @@ class RadioService : Service() {
     companion object {
         const val ACTION_TOGGLE = "com.woorizip.radio.TOGGLE"
         const val ACTION_STOP = "com.woorizip.radio.STOP"
+        const val ACTION_PLAY_CLIP = "com.woorizip.radio.PLAY_CLIP"
         @Volatile var running = false; private set
 
         /** 반드시 앱 화면이 보이는 상태에서 호출 (마이크 사용 권한 때문) */
@@ -62,6 +63,10 @@ class RadioService : Service() {
             ACTION_TOGGLE -> if (running) {
                 Radio.toggleTalk()
                 return START_STICKY
+            }
+            ACTION_PLAY_CLIP -> {
+                Radio.clipById(intent.getIntExtra("id", -1))?.let { Radio.playClip(it) }
+                if (running) return START_STICKY
             }
         }
         if (!goForeground()) {

@@ -276,6 +276,7 @@ class Hub:
             return
         targets, mode = self.resolve_targets(name, to)
         if targets is None:
+            log("문자 실패: %s -> %r (받을 사람이 없음)", name, to)
             await ws.send_json({"type": "text_failed", "to": to})
             return
         self.clip_seq += 1

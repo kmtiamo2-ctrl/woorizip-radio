@@ -41,6 +41,19 @@ except Exception:
 keyboard = None  # 단축키를 설정한 경우에만 로드 (메모리 절약)
 
 
+# ---------------------------------------------------------------- 기록 (문제 생겼을 때 보내 주시면 원인 파악용)
+
+def log(msg):
+    try:
+        path = os.path.join(data_dir(), "log.txt")
+        if os.path.exists(path) and os.path.getsize(path) > 500_000:
+            os.replace(path, path + ".old")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 설정
 
 def data_dir():
@@ -576,7 +589,9 @@ class Radio:
                                 "text": msg.get("text", ""), "mine": True})
                 self.notice = "보냈어요"
             elif t == "text_failed":
-                self.notice = "보낼 수 없어요"
+                self.notice = "받을 사람이 없어요 (상대를 다시 골라 주세요)"
+                log("문자 실패(서버): 받을 사람 없음 to=%r" % msg.get("to"))
+                self.cfg.set(target="all")
 
     def _on_bin(self, data):
         if not data:
@@ -590,6 +605,7 @@ class Radio:
             self._on_clip(cid, data[5:])
 
     def _on_state(self, connected, where, detail):
+        log("연결 상태: %s %s %s" % ("연결됨" if connected else "끊김", where or "", detail))
         with self.lock:
             self.connected, self.where, self.status = connected, where, detail
             if not connected:
@@ -651,9 +667,15 @@ class Radio:
         if not text:
             return False
         if not self.connected:
-            self.notice = "NAS에 연결되어 있지 않아요"
+            self.notice = "NAS에 연결되어 있지 않아요 (상태: %s)" % self.status
+            log("문자 보내기 실패: 연결 안 됨 (%s)" % self.status)
             return False
-        return self.client.send_json({"type": "text", "to": to if to else self.target_json(), "text": text})
+        target = to if to else self.target_json()
+        ok = self.client.send_json({"type": "text", "to": target, "text": text})
+        log("문자 보내기 -> %r: %s (%s)" % (target, text, "전송" if ok else "소켓 오류"))
+        if not ok:
+            self.notice = "보내는 중 연결이 끊겼어요. 잠시 후 다시 시도하세요"
+        return ok
 
     def _on_text_msg(self, msg):
         cid = int(msg.get("id", 0))
@@ -965,6 +987,7 @@ def run_ui(start_minimized):
                     set_autostart(cfg.autostart)
                 except Exception:
                     pass
+                make_desktop_shortcut()
                 radio.client.reconnect()
                 w.destroy()
             tk.Button(w, text="시작", font=(F, 11), width=12, command=start).pack(pady=16)
@@ -1213,6 +1236,12 @@ def run_ui(start_minimized):
 
     def refresh():
         pump_events()
+        try:
+            while True:
+                show_requests.get_nowait()
+                events.put(("show", None))
+        except queue.Empty:
+            pass
         with radio.lock:
             me = cfg.name
             others = [m for m in radio.members if m != me]
@@ -1309,6 +1338,8 @@ def run_ui(start_minimized):
         set_autostart(cfg.autostart)
     except Exception:
         pass
+    if cfg.name:
+        make_desktop_shortcut()
     start_tray()
     bind_hotkey()
     radio.start()
@@ -1320,20 +1351,63 @@ def run_ui(start_minimized):
     root.mainloop()
 
 
+GUARD_PORT = 47651
+show_requests = queue.Queue()   # 두 번째 실행이 "창 열어 줘"라고 보낸 요청
+
+
 def single_instance():
+    """이미 실행 중이면 그 프로그램에 '창 열어 줘'를 보내고 None을 돌려줌"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        s.bind(("127.0.0.1", 47651))
-        s.listen(1)
-        return s
+        s.bind(("127.0.0.1", GUARD_PORT))
+        s.listen(2)
     except OSError:
+        try:
+            c = socket.create_connection(("127.0.0.1", GUARD_PORT), timeout=1)
+            c.sendall(b"show")
+            c.close()
+        except Exception:
+            pass
         return None
+
+    def accept_loop():
+        while True:
+            try:
+                conn, _ = s.accept()
+                conn.settimeout(1)
+                data = conn.recv(16)
+                conn.close()
+                if data.startswith(b"show"):
+                    show_requests.put(True)
+            except Exception:
+                pass
+    threading.Thread(target=accept_loop, daemon=True).start()
+    return s
+
+
+def make_desktop_shortcut():
+    """바탕화면에 '우리집 무전기' 바로가기 (exe로 실행 중일 때만, 한 번만)"""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    flag = os.path.join(data_dir(), "shortcut_made")
+    if os.path.exists(flag):
+        return
+    try:
+        import subprocess
+        ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\\우리집 무전기.lnk');"
+              "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.Description='우리집 무전기';$s.Save()"
+              % (sys.executable.replace("'", "''"), os.path.dirname(sys.executable).replace("'", "''")))
+        subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                       creationflags=0x08000000, timeout=20)
+        open(flag, "w").close()
+    except Exception as e:
+        log("바로가기 만들기 실패: %s" % e)
 
 
 if __name__ == "__main__":
     _guard = single_instance()
     if _guard is None:
-        if "--minimized" not in sys.argv:
-            toast(APP_TITLE, "이미 실행 중이에요. 오른쪽 아래 시계 옆 아이콘을 눌러 주세요.")
-        sys.exit(0)
+        sys.exit(0)   # 이미 실행 중 → 그쪽 창이 열림
+    log("시작 %s %s" % (APP_TITLE, sys.argv[1:]))
     run_ui("--minimized" in sys.argv)

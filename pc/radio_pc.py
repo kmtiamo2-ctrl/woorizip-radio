@@ -194,6 +194,10 @@ class WSClient:
         s, self.sock = self.sock, None
         if s:
             try:
+                s.shutdown(socket.SHUT_RDWR)   # 읽는 중인 스레드를 바로 깨움
+            except Exception:
+                pass
+            try:
                 s.close()
             except Exception:
                 pass
@@ -766,7 +770,7 @@ class Radio:
         cid = int(msg.get("id", 0))
         self.client.send_json({"type": "clip_ack", "id": cid})
         sender, ts, text = msg.get("from"), int(msg.get("ts") or time.time()), msg.get("text", "")
-        if any(c["from"] == sender and c["ts"] == ts and c.get("text") == text for c in self.clips):
+        if any(c.get("kind") == "text" and c["from"] == sender and c["ts"] == ts and c.get("text") == text for c in self.clips):
             return
         clip = {"kind": "text", "id": cid, "mid": int(msg.get("mid", 0)), "from": sender, "mode": msg.get("mode"), "ts": ts, "text": text}
         self._add_clip(clip)
@@ -782,7 +786,7 @@ class Radio:
             self.client.send_json({"type": "clip_ack", "id": cid})
             ts = int(meta.get("ts") or time.time())
             sender, mode = meta.get("from"), meta.get("mode")
-            if any(c["from"] == sender and c["ts"] == ts for c in self.clips):
+            if any(c.get("kind") == "clip" and c["from"] == sender and c["ts"] == ts for c in self.clips):
                 return
             seconds = float(meta.get("seconds") or len(pcm) / 32000)
             path = os.path.join(self.clip_dir, "%d_%s_%s_%d_%.1f.pcm" % (cid, sender, mode, ts, seconds))
@@ -902,7 +906,7 @@ def make_icon(color, size=64):
 
 # ---------------------------------------------------------------- 화면 (customtkinter: 둥근 카드, 어두운 남색 + 앰버 포인트)
 
-def run_ui(start_minimized):
+def run_ui(start_minimized, selftest=False):
     import tkinter as tk
     from tkinter import messagebox
     import customtkinter as ctk
@@ -924,6 +928,13 @@ def run_ui(start_minimized):
     root.title(APP_TITLE)
     root.geometry("480x900")
     root.minsize(440, 720)
+    try:
+        # customtkinter는 0.2초 뒤 제목줄 아이콘을 자기 로고로 바꿈 → iconbitmap을 먼저 불러 두면 안 바꿈
+        ico_path = os.path.join(data_dir(), "icon.ico")
+        make_icon((37, 99, 235, 255), 64).save(ico_path, format="ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64)])
+        root.iconbitmap(ico_path)
+    except Exception:
+        pass
     try:
         _win_icon = ImageTk.PhotoImage(make_icon((37, 99, 235, 255), 64))
         root.iconphoto(True, _win_icon)
@@ -1108,12 +1119,12 @@ def run_ui(start_minimized):
         except Exception:
             pass
 
-        def down(_):
+        def down(*_):   # add_hotkey는 인자 없이, on_press_key는 이벤트를 넘겨 부름
             if not hk["down"]:
                 hk["down"] = True
                 radio.start_talk()
 
-        def up(_):
+        def up(*_):
             hk["down"] = False
             radio.stop_talk()
         try:
@@ -1627,6 +1638,11 @@ def run_ui(start_minimized):
         root.withdraw()
     elif not cfg.configured:
         root.after(300, open_settings)
+    if selftest:
+        _selftest_ctx.update(root=root, ctk=ctk, cfg=cfg, radio=radio, events=events, popup=popup, sched=sched, entry=entry,
+                             grid=grid, msg_list=msg_list, incoming=incoming, tray=tray, messagebox=messagebox,
+                             open_settings=open_settings, open_schedule=open_schedule, handle_event=handle_event, on_close=on_close)
+        root.after(800, _selftest_start, _selftest_ctx)
     root.mainloop()
 
 
@@ -1776,11 +1792,270 @@ def ensure_installed():
     return True
 
 
+# ---------------------------------------------------------------- 자가 점검 (GitHub 자동 빌드의 Windows 컴퓨터에서 실제로 띄워 봄)
+# python radio_pc.py --selftest : 같은 컴퓨터의 서버(127.0.0.1)에 붙어 설정창·문자·확인 표시·팝업·예약창까지 눌러 보고 결과를 출력
+
+_selftest_ctx = {}
+
+
+class _Helper:
+    """자가 점검용 가상 가족: 같은 서버에 다른 이름으로 붙어 문자를 받고 보냄"""
+
+    def __init__(self, cfg, name):
+        class C:
+            pass
+        c = C()
+        c.host, c.out_host, c.name, c.key, c.configured = cfg.host, "", name, cfg.key, True
+        self.name, self.msgs, self.connected = name, [], False
+        self.client = WSClient(c, self._on_text, lambda b: None, self._on_state)
+        self.client.start()
+
+    def _on_state(self, connected, where, detail):
+        self.connected = connected
+
+    def _on_text(self, msg):
+        self.msgs.append(msg)
+        if msg.get("type") == "text":
+            self.client.send_json({"type": "clip_ack", "id": msg.get("id", 0)})
+
+    def find(self, type_, **match):
+        return [m for m in self.msgs if m.get("type") == type_ and all(m.get(k) == v for k, v in match.items())]
+
+    def send(self, obj):
+        return self.client.send_json(obj)
+
+
+def _selftest_start(ctx):
+    import traceback
+    root, ctk, radio, cfg = ctx["root"], ctx["ctk"], ctx["radio"], ctx["cfg"]
+    results, dialogs = [], []
+    mb = ctx["messagebox"]
+    for fn in ("showerror", "showwarning", "showinfo"):
+        setattr(mb, fn, lambda *a, _f=fn, **k: dialogs.append((_f,) + tuple(a)) or True)   # 대화상자는 가로채서 기록만
+    helper = _Helper(cfg, "엄마")
+
+    def txt(x):
+        try:
+            return x.cget("text")
+        except Exception:
+            return None
+
+    def widgets(w, cls=None, text=None):
+        out, stack = [], [w]
+        while stack:
+            x = stack.pop()
+            try:
+                stack.extend(x.winfo_children())
+            except Exception:
+                pass
+            if (cls is None or isinstance(x, cls)) and (text is None or txt(x) == text):
+                out.append(x)
+        return out
+
+    def button(text, under=None):
+        hits = [b for b in widgets(under or root, ctk.CTkButton) if (txt(b) or "") == text or (text.endswith("…") and (txt(b) or "").startswith(text[:-1]))]
+        if not hits:
+            raise AssertionError("버튼 '%s' 없음" % text)
+        return hits[0]
+
+    def tops():   # 열려 있는 창들 (오른쪽 아래 팝업은 제외)
+        return [w for w in root.winfo_children() if isinstance(w, ctk.CTkToplevel) and w.winfo_exists() and w is not ctx["popup"]["win"]]
+
+    def labels_with(s, under=None):
+        return [l for l in widgets(under or root, ctk.CTkLabel) if s in (txt(l) or "")]
+
+    steps = []
+
+    def step(name, do=None, until=None, timeout=12, soft=False):
+        steps.append((name, do, until, timeout, soft))
+
+    # 1. 첫 실행: 누구 것인지 고르기
+    step("첫 실행 설정창", until=lambda: any(txt(b) == "시작" for b in widgets(root, ctk.CTkButton)))
+
+    def pick_me():
+        [s for t in tops() for s in widgets(t, ctk.CTkSegmentedButton)][0].set("아빠")
+        button("시작").invoke()
+    step("'아빠' 고르고 시작", pick_me, until=lambda: cfg.name == "아빠" and not tops())
+    step("서버 연결", until=lambda: radio.connected, timeout=20)
+    step("가상 가족(엄마) 접속", until=lambda: helper.connected and "엄마" in radio.online, timeout=20)
+    step("가족 버튼 표시", until=lambda: any("엄마" in (txt(b) or "") for b in widgets(ctx["grid"], ctk.CTkButton)))
+    step("엄마 고르기 (버튼 색 바뀜)", lambda: radio.toggle_target("엄마"),
+         until=lambda: radio.target_list == ["엄마"] and any((txt(b) or "").startswith("● 엄마") and b.cget("fg_color") == "#F5B301"
+                                                            for b in widgets(ctx["grid"], ctk.CTkButton)))
+    step("다시 전체로", lambda: radio.toggle_target("엄마"), until=lambda: radio.target == "all")
+
+    # 2. 문자 보내기 / 받음·봄 표시
+    def type_and_send():
+        e = ctx["entry"]
+        e.delete(0, "end")
+        e.insert(0, "네")
+        button("보내기", e.master).invoke()
+    step("문자 보내기", type_and_send, until=lambda: any(c.get("mine") and c.get("text") == "네" for c in radio.clips) and ctx["entry"].get() == "")
+    step("엄마가 문자 받음", until=lambda: helper.find("text", text="네"))
+    step("받음 표시 ✓", until=lambda: any(radio.receipt_text(c).startswith("엄마✓ ") for c in radio.clips if c.get("mine")))
+    step("봄 표시 ✓✓", lambda: helper.send({"type": "seen", "mid": helper.find("text", text="네")[0]["mid"]}),
+         until=lambda: labels_with("엄마✓✓", ctx["msg_list"]))
+
+    # 3. 문자 받기 → 오른쪽 아래 팝업 → 클릭 → 빠른 답장
+    step("엄마가 문자 보냄 → 팝업", lambda: helper.send({"type": "text", "to": "아빠", "text": "지금 갈게요"}),
+         until=lambda: ctx["popup"]["win"] is not None and labels_with("지금 갈게요", ctx["popup"]["win"]))
+    step("팝업 클릭 → 답장칸", lambda: ctx["popup"]["win"].event_generate("<Button-1>"), until=lambda: widgets(ctx["popup"]["win"], ctk.CTkEntry))
+    step("빠른 답장 '알겠어요'", lambda: button("알겠어요", ctx["popup"]["win"]).invoke(), until=lambda: helper.find("text", text="알겠어요", mode="direct"))
+    step("엄마 쪽에 '봄' 확인 도착", until=lambda: any((m.get("status") or {}).get("아빠") == "seen" for m in helper.find("receipt")))
+
+    # 4. 실시간 말하기 수신 배너
+    step("엄마 말하기 → 배너", lambda: helper.send({"type": "talk_start", "to": "all"}),
+         until=lambda: radio.incoming_from == "엄마" and ctx["incoming"].winfo_ismapped())
+
+    def mom_audio_end():
+        for _ in range(40):
+            helper.client.send_bytes(bytes(640))   # 0.8초 무음
+        helper.send({"type": "talk_end"})
+    step("엄마 말 끝 → 배너 사라짐", mom_audio_end, until=lambda: radio.incoming_from is None and not ctx["incoming"].winfo_ismapped())
+    step("엄마 쪽 talk_sent(들음 확인)", until=lambda: helper.find("talk_sent"))
+    step("내가 말하기 시도", lambda: radio.start_talk(), until=lambda: not radio.requesting)
+    step("말하기 끝", lambda: radio.stop_talk(), until=lambda: not radio.talking)
+
+    # 5. 음성 클립 받기 (서버를 거치지 않고 직접 넣어 봄)
+    def inject_clip():
+        radio._on_text({"type": "clip", "id": 9001, "mid": 9001, "from": "엄마", "mode": "direct", "ts": int(time.time()), "seconds": 1.0})
+        radio._on_bin(bytes([CLIP]) + struct.pack("!I", 9001) + bytes(32000))
+    step("음성 클립 받기 → 목록·팝업", inject_clip,
+         until=lambda: any(c.get("kind") == "clip" and c.get("id") == 9001 for c in radio.clips)
+         and any(txt(b) in ("듣기", "정지") for b in widgets(ctx["msg_list"], ctk.CTkButton)))
+
+    # 6. 설정창: 관리 항목(암호) · 바로가기 · 저장
+    step("설정창 열기", ctx["open_settings"], until=lambda: any(txt(b) == "저장" for b in widgets(root, ctk.CTkButton)))
+    step("사용자·주소 변경 → 암호창", lambda: button("사용자·주소 변경…").invoke(), until=lambda: labels_with("가족 암호를 입력하세요"))
+
+    def enter_pw():
+        d = [t for t in tops() if labels_with("가족 암호를 입력하세요", t)][0]
+        widgets(d, ctk.CTkEntry)[0].insert(0, cfg.key)
+        button("확인", d).invoke()
+    step("암호 입력 → 관리 항목", enter_pw, until=lambda: any(txt(b) == "변경 저장하고 다시 연결" for b in widgets(root, ctk.CTkButton)))
+
+    def save_admin():
+        ctx["old_sock"] = radio.client.sock
+        button("변경 저장하고 다시 연결").invoke()
+    step("관리 저장(다시 연결)", save_admin, until=lambda: not tops())
+    step("새 연결로 다시 붙음", until=lambda: radio.connected and radio.client.sock is not None and radio.client.sock is not ctx["old_sock"], timeout=20)
+    step("설정창 다시 열기", ctx["open_settings"], until=lambda: any(txt(b) == "저장" for b in widgets(root, ctk.CTkButton)))
+    step("바탕화면 바로가기 버튼", lambda: button("바탕화면에 바로가기 만들기").invoke(),
+         until=lambda: dialogs and dialogs[-1][1] == "바로가기" and dialogs[-1][0] == "showinfo", timeout=30, soft=True)
+    step("설정 저장", lambda: button("저장").invoke(), until=lambda: not tops())
+
+    # 7. 예약 메시지
+    def open_sched():
+        ctx["entry"].delete(0, "end")
+        ctx["entry"].insert(0, "밥 먹자")
+        ctx["open_schedule"]()
+    step("예약창 열기", open_sched, until=lambda: any(txt(b) == "예약 추가" for b in widgets(root, ctk.CTkButton)))
+
+    def add_sched():
+        w = ctx["sched"]["w"]
+        [s for s in widgets(w, ctk.CTkSegmentedButton) if "내일" in s.cget("values")][0].set("내일")
+        button("예약 추가", w).invoke()
+    step("예약 추가 → 목록", add_sched, until=lambda: radio.schedules and labels_with("밥 먹자", ctx["sched"]["list"]))
+    step("예약 삭제", lambda: button("삭제", ctx["sched"]["list"]).invoke(),
+         until=lambda: not radio.schedules and labels_with("예약이 없어요", ctx["sched"]["list"]))
+    step("예약창 닫기", lambda: ctx["sched"]["w"].destroy(), until=lambda: not tops())
+
+    # 8. 트레이로 숨기기 / 다시 열기 / 자동 실행 등록
+    step("창 닫기 → 트레이로 숨김", lambda: ctx["on_close"]() if ctx["tray"]["icon"] else None,
+         until=lambda: root.state() == "withdrawn" if ctx["tray"]["icon"] else True, soft=True)
+    step("트레이 → 창 열기", lambda: ctx["events"].put(("show", None)), until=lambda: root.state() == "normal")
+    step("자동 실행 등록·해제", lambda: (set_autostart(True), set_autostart(False)))
+
+    def finish():
+        bad = [r for r in results if not r[1] and not r[3]]
+        lines = ["[자가 점검] customtkinter %s · python %s · %s" % (getattr(ctk, "__version__", "?"), sys.version.split()[0], "모두 통과" if not bad else "%d개 실패" % len(bad))]
+        for name, ok, memo, soft in results:
+            lines.append("  %s %s%s%s" % ("OK  " if ok else "FAIL", name, " (참고용)" if soft and not ok else "",
+                                          ("\n        " + memo.strip().replace("\n", "\n        ")) if memo else ""))
+        lines.append("  대화상자: %s" % [d[1:3] for d in dialogs])
+        lines.append("  엄마 쪽 수신: %s" % sorted({m.get("type") for m in helper.msgs}))
+        ctx["result"] = (not bad, "\n".join(lines))
+        try:
+            ctx["handle_event"]("quit", None)
+        except Exception:
+            pass
+
+    def run(i=0, started=None):
+        if i >= len(steps):
+            finish()
+            return
+        name, do, until, timeout, soft = steps[i]
+        try:
+            if started is None:
+                started = time.monotonic()
+                if do:
+                    do()
+            ok = True if until is None else bool(until())
+        except Exception:
+            results.append((name, False, traceback.format_exc(limit=4), soft))
+            root.after(200, run, i + 1)
+            return
+        if ok:
+            results.append((name, True, "", soft))
+            root.after(200, run, i + 1)
+        elif time.monotonic() - started > timeout:
+            results.append((name, False, "시간 초과 %ds" % timeout, soft))
+            root.after(200, run, i + 1)
+        else:
+            root.after(100, run, i, started)
+    run()
+
+
+def _selftest_main():
+    import tempfile
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    # 진짜 설정을 건드리지 않도록 임시 폴더를 씀. 서버는 같은 컴퓨터(127.0.0.1)에서 미리 띄워 둘 것
+    os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "WoorizipSelftest-%d" % os.getpid())
+    os.environ["LOCALAPPDATA"] = os.environ["APPDATA"]
+    with open(os.path.join(data_dir(), "config.json"), "w", encoding="utf-8") as f:
+        json.dump({"host": os.environ.get("WOORIZIP_TEST_HOST", "127.0.0.1"), "out_host": "", "name": "",
+                   "key": os.environ.get("FAMILY_KEY", "105403")}, f)
+    log("자가 점검 시작")
+    run_ui(False, selftest=True)
+    ok, report = _selftest_ctx.get("result", (False, "[자가 점검] 결과 없음 (창이 먼저 닫혔거나 점검이 시작되지 못함)"))
+    print(report)
+    try:
+        with open(os.path.join(data_dir(), "log.txt"), encoding="utf-8") as f:
+            print("--- 기록 파일 ---\n" + f.read()[-6000:])
+    except Exception:
+        pass
+    return 0 if ok else 1
+
+
+def _report_crash():
+    import traceback
+    tb = traceback.format_exc()
+    log("프로그램 멈춤:\n" + tb)
+    try:
+        import tkinter
+        from tkinter import messagebox as _mb
+        r = tkinter.Tk()
+        r.withdraw()
+        _mb.showerror(APP_TITLE, "프로그램에 문제가 생겨 멈췄어요.\n\n%s\n\n기록 파일: %s" % (tb.strip().splitlines()[-1][:300], os.path.join(data_dir(), "log.txt")))
+        r.destroy()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest_main())
     if ensure_installed():
         sys.exit(0)
     _guard = single_instance()
     if _guard is None:
         sys.exit(0)   # 이미 실행 중 → 그쪽 창이 열림
     log("시작 %s %s" % (APP_TITLE, sys.argv[1:]))
-    run_ui("--minimized" in sys.argv)
+    try:
+        run_ui("--minimized" in sys.argv)
+    except Exception:
+        _report_crash()
+        sys.exit(1)

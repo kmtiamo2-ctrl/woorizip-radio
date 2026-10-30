@@ -16,11 +16,33 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -r pc/requirements.txt pyinstaller
       - run: echo '__version__ = "v${{ github.run_number }}"' > pc/version.py
+      - name: 실제로 띄워서 점검 (같은 컴퓨터에 서버를 켜고 PC 프로그램의 창·문자·확인 표시·예약을 눌러 봄)
+        shell: bash
+        env: { PYTHONIOENCODING: utf-8, PYTHONUTF8: "1", FAMILY_KEY: "105403" }
+        run: |
+          mkdir -p pcout
+          DATA_DIR="$RUNNER_TEMP" python -u server/server.py > pcout/server.out 2> pcout/server.log &
+          SRV=$!
+          sleep 3
+          python pc/radio_pc.py --selftest 2>&1 | tee pcout/selftest.log
+          RC=${PIPESTATUS[0]}
+          kill $SRV 2>/dev/null || true
+          echo "--- 서버 기록 ---"; cat pcout/server.log 2>/dev/null || true
+          if [ "$RC" != "0" ]; then echo "::error title=PC 자가 점검 실패::$(grep FAIL pcout/selftest.log | tr '\n' ' ' | cut -c1-800)"; fi
+          exit $RC
+      - name: 점검에 실패하면 내용을 이슈로 남김
+        if: failure()
+        shell: bash
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          { echo '```'; cat pcout/selftest.log 2>/dev/null | tail -150; echo; echo "--- 서버 기록 ---"; tail -40 pcout/server.log 2>/dev/null; echo '```'; } > body.md
+          gh issue create --title "PC 자가 점검 실패 (${{ github.run_number }})" --body-file body.md
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray --collect-all customtkinter pc/radio_pc.py
+      - run: Copy-Item dist/WoorizipRadio.exe pcout/
       - uses: actions/upload-artifact@v4
         with:
           name: pc
-          path: dist/WoorizipRadio.exe
+          path: pcout/
 
   android:
     name: 안드로이드 앱 (.apk)
@@ -61,8 +83,11 @@ jobs:
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           N=${{ github.run_number }}
-          printf '%s\n' "- **PC(Windows)**: \`WoorizipRadio-PC-v$N.exe\` 를 내려받아 더블클릭 (실행 중인 옛 버전은 먼저 종료)" \
-                         "- **폰(안드로이드)**: \`WoorizipRadio-Phone-v$N.apk\` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)" > notes.md
+          printf '%s\n' "- **PC(Windows)**: \`WoorizipRadio-PC-v$N.exe\` 를 내려받아 더블클릭. 스스로 사용자 폴더에 설치되므로 내려받은 파일은 지워도 돼요" \
+                         "- **폰(안드로이드)**: \`WoorizipRadio-Phone-v$N.apk\` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)" \
+                         "" "<details><summary>PC 프로그램 자동 점검 결과</summary>" "" '```' > notes.md
+          cat out/pc/selftest.log >> notes.md 2>/dev/null || echo "(점검 기록 없음)" >> notes.md
+          printf '%s\n' '```' "</details>" >> notes.md
           set +e
           gh release create "v$N" out/*.exe out/*.apk --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest > release.log 2>&1
           RC=$?

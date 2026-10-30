@@ -136,7 +136,8 @@ class RadioClient(private val ctx: Context, private val listener: Listener) {
         val builder = OkHttpClient.Builder()
             .connectTimeout(if (useHome) 4 else 8, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(15, TimeUnit.SECONDS)
+            // 연결 유지 신호: 집(Wi-Fi)은 30초, 밖(데이터)은 2분 — 밖에서 배터리 아끼기
+            .pingInterval(if (useHome) 30 else 120, TimeUnit.SECONDS)
         if (useHome && net != null) {
             // 집 주소는 반드시 Wi-Fi로만 (폰이 모바일 데이터를 기본으로 써도 집 안 통신 유지)
             builder.socketFactory(net.socketFactory)

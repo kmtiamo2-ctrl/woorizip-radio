@@ -161,10 +161,28 @@ class WSClient:
         self.last_error = None
         self.where = None
         self.next_probe = 0.0
+        self.last_rx = 0.0
+        self.last_ping = 0.0
 
     def start(self):
         self.running = True
         threading.Thread(target=self._loop, daemon=True).start()
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _heartbeat(self):
+        """20초마다 서버에 신호를 보내고, 60초 동안 아무 응답이 없으면 죽은 연결로 보고 다시 붙음"""
+        while self.running:
+            time.sleep(5)
+            s = self.sock
+            if not s or self.where != "connected":
+                continue
+            now = time.monotonic()
+            if now - self.last_rx > 120:
+                log("연결 응답 없음 2분 → 다시 연결")
+                self.reconnect()
+            elif now - self.last_ping > 30:
+                self.last_ping = now
+                self._send(0x9, b"")
 
     def reconnect(self):
         self._close()
@@ -234,7 +252,7 @@ class WSClient:
             buf += chunk
         if b" 101 " not in buf.split(b"\r\n", 1)[0]:
             raise ConnectionError()
-        s.settimeout(40)  # 서버가 15초마다 ping을 보내므로 40초 조용하면 끊긴 것
+        s.settimeout(150)  # 우리가 30초마다 ping을 보내고 서버가 pong으로 답함. 이만큼 조용하면 끊긴 것
         return s
 
     def _recv_exact(self, s, n):
@@ -261,6 +279,7 @@ class WSClient:
             elif n == 127:
                 n = struct.unpack("!Q", self._recv_exact(s, 8))[0]
             data = self._recv_exact(s, n) if n else b""
+            self.last_rx = time.monotonic()
             if op == 0x8:
                 return reason
             if op == 0x9:
@@ -279,6 +298,7 @@ class WSClient:
                     t = msg.get("type")
                     if t == "welcome":
                         self.where = "connected"
+                        self.last_rx = self.last_ping = time.monotonic()
                         self.on_state(True, where, "집에서 연결됨" if where == "home" else "밖에서 연결됨")
                     elif t == "error":
                         reason = self.last_error = {
@@ -438,6 +458,8 @@ class Radio:
         self.incoming_mode = None
         self.notice = ""
         self.clips = []          # 최근 메시지 (새것이 앞): 음성 dict(kind=clip, file) 또는 문자 dict(kind=text, text)
+        self.outbox = []         # 연결이 끊겨 있을 때 보낸 문자: 연결되면 자동 전송
+        self._load_outbox()
         self.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
         self.pending = {}
         self.playing = None
@@ -540,6 +562,7 @@ class Radio:
                 self.members = msg.get("members") or self.members
                 self.parents = set(msg.get("parents") or self.parents)
                 self.notice = ""
+                self._flush_outbox()
             elif t == "presence":
                 self.online = msg.get("online") or []
                 self.member_where = msg.get("where") or {}
@@ -662,20 +685,59 @@ class Radio:
 
     # ---- 문자 메시지 (말할 수 없을 때) ----
 
+    # ---- 보낼 문자 보관함: 연결이 없으면 들고 있다가 연결되는 즉시 보냄 ----
+
+    def _outbox_path(self):
+        return os.path.join(data_dir(), "outbox.json")
+
+    def _load_outbox(self):
+        try:
+            with open(self._outbox_path(), encoding="utf-8") as f:
+                self.outbox = json.load(f)[:50]
+        except Exception:
+            self.outbox = []
+
+    def _save_outbox(self):
+        try:
+            with open(self._outbox_path(), "w", encoding="utf-8") as f:
+                json.dump(self.outbox, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _flush_outbox(self):
+        """연결된 직후 호출: 밀린 문자를 순서대로 보냄"""
+        if not self.outbox:
+            return
+        pending, self.outbox = self.outbox, []
+        sent = 0
+        for item in pending:
+            if time.time() - item.get("ts", 0) > 24 * 3600 or item.get("from") not in (None, self.cfg.name):
+                continue   # 하루 넘은 것, 다른 사용자 것은 버림
+            if self.client.send_json({"type": "text", "to": item["to"], "text": item["text"]}):
+                sent += 1
+            else:
+                self.outbox.append(item)
+        self._save_outbox()
+        log("밀린 문자 전송: %d개 (남음 %d개)" % (sent, len(self.outbox)))
+        if sent:
+            self.notice = "연결돼서 밀린 문자 %d개를 보냈어요" % sent
+
     def send_text(self, text, to=None):
         text = text.strip()
         if not text:
             return False
-        if not self.connected:
-            self.notice = "NAS에 연결되어 있지 않아요 (상태: %s)" % self.status
-            log("문자 보내기 실패: 연결 안 됨 (%s)" % self.status)
-            return False
         target = to if to else self.target_json()
-        ok = self.client.send_json({"type": "text", "to": target, "text": text})
-        log("문자 보내기 -> %r: %s (%s)" % (target, text, "전송" if ok else "소켓 오류"))
-        if not ok:
-            self.notice = "보내는 중 연결이 끊겼어요. 잠시 후 다시 시도하세요"
-        return ok
+        if self.connected and self.client.send_json({"type": "text", "to": target, "text": text}):
+            log("문자 보내기 -> %r: %s" % (target, text))
+            return True
+        # 연결이 없거나 보내는 중 끊김 → 보관했다가 연결되면 자동 전송
+        self.outbox.append({"to": target, "text": text, "ts": time.time(), "from": self.cfg.name})
+        del self.outbox[:-50]
+        self._save_outbox()
+        self.notice = "지금 연결이 없어서 보관했어요. 연결되면 자동으로 보내요 (%d개 대기)" % len(self.outbox)
+        log("문자 보관(연결 없음, %s) -> %r: %s" % (self.status, target, text))
+        self.client.reconnect()   # 혹시 죽은 연결이면 바로 다시 붙도록
+        return True
 
     def _on_text_msg(self, msg):
         cid = int(msg.get("id", 0))

@@ -49,6 +49,7 @@ object Radio : RadioClient.Listener {
     private val listeners = CopyOnWriteArraySet<() -> Unit>()
     private var focus: AudioFocusRequest? = null
     private val pendingClips = HashMap<Int, JSONObject>()   // 헤더는 왔는데 음성은 아직
+    private val outbox = ArrayList<JSONObject>()             // 연결이 없을 때 보낸 문자: 연결되면 자동 전송
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     val quickReplies: List<String> get() = Prefs(app).quickReplies
@@ -101,6 +102,7 @@ object Radio : RadioClient.Listener {
         client = RadioClient(app, this)
         me = Prefs(app).name
         loadClips()
+        loadOutbox()
         tts = TextToSpeech(app) { status ->
             ttsReady = status == TextToSpeech.SUCCESS && tts?.setLanguage(Locale.KOREAN) != TextToSpeech.LANG_NOT_SUPPORTED
         }
@@ -158,6 +160,7 @@ object Radio : RadioClient.Listener {
                 members = msg.optJSONArray("members").toList().ifEmpty { members }
                 msg.optJSONArray("parents")?.let { parents = it.toList().toSet() }
                 notice = ""
+                flushOutbox()
             }
             "presence" -> {
                 online = msg.optJSONArray("online").toList()
@@ -210,13 +213,48 @@ object Radio : RadioClient.Listener {
 
     // ---- 문자 메시지 (말할 수 없을 때) ----
 
-    /** to: "all" 또는 이름. 비우면 지금 고른 상대 */
+    /** to: "all" 또는 이름. 비우면 지금 고른 상대. 연결이 없으면 보관했다가 연결되면 자동 전송 */
     fun sendText(text: String, to: String? = null): Boolean {
         val t = text.trim()
         if (t.isEmpty()) return false
-        if (!connected) { notice = "NAS에 연결되어 있지 않아요"; changed(); return false }
         val toJson: Any = if (to != null) to else targetJson()
-        return client.sendJson(JSONObject().put("type", "text").put("to", toJson).put("text", t))
+        val payload = JSONObject().put("type", "text").put("to", toJson).put("text", t)
+        if (connected && client.sendJson(payload)) return true
+        outbox.add(payload.put("ts", System.currentTimeMillis() / 1000))
+        while (outbox.size > 50) outbox.removeAt(0)
+        saveOutbox()
+        notice = "지금 연결이 없어서 보관했어요. 연결되면 자동으로 보내요 (${outbox.size}개 대기)"
+        client.reconnectNow()
+        changed()
+        return true
+    }
+
+    private fun outboxFile() = File(app.filesDir, "outbox.json")
+
+    private fun loadOutbox() {
+        try {
+            val arr = JSONArray(outboxFile().readText())
+            for (i in 0 until arr.length()) outbox.add(arr.getJSONObject(i))
+        } catch (_: Exception) {}
+    }
+
+    private fun saveOutbox() {
+        try { outboxFile().writeText(JSONArray(outbox).toString()) } catch (_: Exception) {}
+    }
+
+    /** 연결된 직후: 밀린 문자를 순서대로 보냄 (하루 넘은 건 버림) */
+    private fun flushOutbox() {
+        if (outbox.isEmpty()) return
+        val pending = ArrayList(outbox)
+        outbox.clear()
+        var sent = 0
+        val now = System.currentTimeMillis() / 1000
+        for (p in pending) {
+            if (now - p.optLong("ts", now) > 24 * 3600) continue
+            if (client.sendJson(p)) sent++ else outbox.add(p)
+        }
+        saveOutbox()
+        if (sent > 0) notice = "연결돼서 밀린 문자 ${sent}개를 보냈어요"
     }
 
     private fun onTextArrived(msg: JSONObject) {

@@ -40,8 +40,9 @@ PARENTS = {m.strip() for m in os.environ.get("PARENTS", "엄마,아빠").split("
 MAX_TALK_SEC = float(os.environ.get("MAX_TALK_SEC", "60"))
 KEEP_HOURS = float(os.environ.get("KEEP_HOURS", "24"))
 MAX_QUEUE = 20
-PING_INTERVAL = 15
-IDLE_TIMEOUT = 45
+PING_INTERVAL = 30      # 감시 주기
+QUIET_BEFORE_PING = 150 # 이만큼 조용한 연결에만 서버가 ping (평소엔 폰·PC가 스스로 신호를 보냄 → 배터리 절약)
+IDLE_TIMEOUT = 330      # 이만큼 아무 신호가 없으면 끊긴 것으로 정리
 MAX_FRAME = 64 * 1024
 LIVE, CLIP = 1, 2
 
@@ -417,7 +418,7 @@ class Hub:
                 if now - ws.last_seen > IDLE_TIMEOUT:
                     log("응답 없음, 연결 정리: %s", ws.name)
                     ws.close()
-                else:
+                elif now - ws.last_seen > QUIET_BEFORE_PING:
                     await ws.ping()
             if self.speaker_ws and now - self.talk_started > MAX_TALK_SEC:
                 await self.end_talk(self.speaker_ws, "too_long")

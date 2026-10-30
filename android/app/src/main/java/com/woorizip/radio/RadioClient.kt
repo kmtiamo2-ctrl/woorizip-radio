@@ -114,7 +114,7 @@ class RadioClient(private val ctx: Context, private val listener: Listener) {
         lastError = null
         val http = OkHttpClient.Builder()
             .socketFactory(net.socketFactory)        // 집 Wi-Fi로만 통신
-            .dns { h -> net.getAllByName(h).toList() }
+            .dns(okhttp3.Dns { h -> net.getAllByName(h).toList() })
             .connectTimeout(5, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(15, TimeUnit.SECONDS)

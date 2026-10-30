@@ -232,7 +232,14 @@ class MainActivity : ComponentActivity() {
         val toggleSettings = Button(this).apply {
             text = "설정"
             setOnClickListener {
-                settingsBox.visibility = if (settingsBox.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                if (settingsBox.visibility == View.VISIBLE) {
+                    settingsBox.visibility = View.GONE
+                } else {
+                    val idx = root.indexOfChild(settingsBox)
+                    root.removeView(settingsBox)
+                    settingsBox = buildSettings()
+                    root.addView(settingsBox, idx, lp(top = 8))
+                }
             }
         }
         root.addView(toggleSettings, lp(top = 4))
@@ -258,53 +265,107 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun whoPicker(parent: LinearLayout, title: String): Pair<RadioGroup, List<RadioButton>> {
+        parent.addView(label(title, 14f, textSub), lp(top = 10))
+        val group = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        val names = Radio.members.ifEmpty { listOf("엄마", "아빠", "첫째", "둘째", "셋째") }
+        val buttons = names.map { n ->
+            RadioButton(this).apply { text = n; setTextColor(textMain); id = View.generateViewId(); textSize = 16f }
+        }
+        buttons.forEach { group.addView(it) }
+        buttons.firstOrNull { it.text == prefs.name }?.let { group.check(it.id) }
+        parent.addView(group)
+        return group to buttons
+    }
+
     private fun buildSettings(): LinearLayout {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; background = rounded(card)
             setPadding(dp(16), dp(8), dp(16), dp(16))
         }
-        val host = field(box, "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        val outHost = field(box, "밖 주소 — Tailscale 주소(예: 100.101.102.103) 또는 DDNS 주소. 비우면 집에서만", prefs.outHost, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        // 누구의 기기인지: 타이핑 대신 버튼으로 고름
-        box.addView(label("이 폰은 누구 것인가요? (고르고 아래 '저장하고 연결'만 누르면 돼요)", 13f, textSub), lp(top = 14))
-        val whoGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        val names = Radio.members.ifEmpty { listOf("엄마", "아빠", "첫째", "둘째", "셋째") }
-        val whoButtons = names.map { n ->
-            RadioButton(this).apply { text = n; setTextColor(textMain); id = View.generateViewId(); textSize = 15f }
-        }
-        whoButtons.forEach { whoGroup.addView(it) }
-        whoButtons.firstOrNull { it.text == prefs.name }?.let { whoGroup.check(it.id) }
-        box.addView(whoGroup)
-        val key = field(box, "가족 암호 (NAS 설정과 같게)", prefs.key, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
-        val quick = field(box, "빠른 답장 문구 (쉼표로 구분)", prefs.quickReplies.joinToString(", "), InputType.TYPE_CLASS_TEXT)
 
-        box.addView(label("화면 꺼짐 상태 볼륨 버튼", 13f, textSub), lp(top = 14))
+        // ---- 처음 실행: 누구 것인지만 고르면 끝 ----
+        val firstRun = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val (whoGroup0, whoButtons0) = whoPicker(firstRun, "이 폰은 누구 것인가요?")
+        firstRun.addView(Button(this).apply {
+            text = "시작"
+            setOnClickListener {
+                val n = whoButtons0.firstOrNull { it.id == whoGroup0.checkedRadioButtonId }?.text?.toString() ?: ""
+                if (n.isBlank()) { toast("누구 것인지 골라 주세요"); return@setOnClickListener }
+                prefs.name = n
+                settingsBox.visibility = View.GONE
+                ensurePermissionsThenStart()
+                render()
+            }
+        }, lp(top = 10))
+        box.addView(firstRun)
+
+        // ---- 평소 설정: 누구나 바꿔도 되는 것만 ----
+        val normal = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        normal.addView(label("이 폰: ${prefs.name}", 15f, textMain, true))
+        val quick = field(normal, "빠른 답장 문구 (쉼표로 구분)", prefs.quickReplies.joinToString(", "), InputType.TYPE_CLASS_TEXT)
+        normal.addView(label("화면 꺼짐 상태 볼륨 버튼", 13f, textSub), lp(top = 14))
         val modes = RadioGroup(this)
         val hold = RadioButton(this).apply { text = "길게 누르는 동안 말하기"; setTextColor(textMain); id = View.generateViewId() }
         val dbl = RadioButton(this).apply { text = "두 번 눌러 켜기 / 두 번 눌러 끄기"; setTextColor(textMain); id = View.generateViewId() }
         modes.addView(hold); modes.addView(dbl)
         modes.check(if (prefs.keyMode == "double") dbl.id else hold.id)
-        box.addView(modes)
-        box.addView(label("길게 누르기가 화면 꺼진 상태에서 잘 안 되는 기종이면 두 번 누르기로 바꿔 주세요.", 12f, textSub))
-
-        box.addView(Button(this).apply {
-            text = "저장하고 연결"
+        normal.addView(modes)
+        normal.addView(label("길게 누르기가 화면 꺼진 상태에서 잘 안 되는 기종이면 두 번 누르기로 바꿔 주세요.", 12f, textSub))
+        normal.addView(Button(this).apply {
+            text = "저장"
             setOnClickListener {
-                prefs.host = host.text.toString()
-                prefs.outHost = outHost.text.toString()
-                prefs.name = whoButtons.firstOrNull { it.id == whoGroup.checkedRadioButtonId }?.text?.toString() ?: ""
-                if (prefs.name.isBlank()) { toast("이 폰이 누구 것인지 골라 주세요"); return@setOnClickListener }
-                prefs.key = key.text.toString()
                 prefs.quickReplies = quick.text.toString().split(",").map { it.trim() }.filter { it.isNotEmpty() }
                     .ifEmpty { Prefs.DEFAULT_QUICK.split(",") }
-                renderChips()
                 prefs.keyMode = if (modes.checkedRadioButtonId == dbl.id) "double" else "hold"
-                if (!prefs.isConfigured) { toast("집 주소와 가족 암호를 입력하세요"); return@setOnClickListener }
+                renderChips()
+                settingsBox.visibility = View.GONE
+                toast("저장했어요")
+            }
+        }, lp(top = 12))
+
+        // ---- 관리자 설정: 가족 암호를 알아야 열림 ----
+        val admin = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        val (whoGroup, whoButtons) = whoPicker(admin, "이 폰은 누구 것인가요? (바꾸면 바로 적용)")
+        val host = field(admin, "집 주소", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val outHost = field(admin, "밖 주소 (Tailscale)", prefs.outHost, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val key = field(admin, "가족 암호", prefs.key, InputType.TYPE_CLASS_TEXT)
+        admin.addView(Button(this).apply {
+            text = "변경 저장하고 다시 연결"
+            setOnClickListener {
+                val n = whoButtons.firstOrNull { it.id == whoGroup.checkedRadioButtonId }?.text?.toString() ?: ""
+                if (n.isBlank() || host.text.isBlank() || key.text.isBlank()) { toast("사용자·집 주소·암호는 비울 수 없어요"); return@setOnClickListener }
+                prefs.name = n; prefs.host = host.text.toString(); prefs.outHost = outHost.text.toString(); prefs.key = key.text.toString()
+                admin.visibility = View.GONE
                 settingsBox.visibility = View.GONE
                 if (RadioService.running) Radio.reconnect() else ensurePermissionsThenStart()
                 render()
             }
         }, lp(top = 12))
+        normal.addView(Button(this).apply {
+            text = "사용자·주소 변경 (가족 암호 필요)"
+            setOnClickListener {
+                val input = EditText(this@MainActivity).apply {
+                    inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                    hint = "가족 암호"
+                }
+                android.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle("가족 암호를 입력하세요")
+                    .setView(input)
+                    .setPositiveButton("확인") { _, _ ->
+                        if (input.text.toString() == prefs.key) admin.visibility = View.VISIBLE
+                        else toast("암호가 달라요")
+                    }
+                    .setNegativeButton("취소", null)
+                    .show()
+            }
+        }, lp(top = 16))
+        normal.addView(admin)
+        box.addView(normal)
+
+        // 어느 쪽을 보여줄지
+        firstRun.visibility = if (prefs.name.isBlank()) View.VISIBLE else View.GONE
+        normal.visibility = if (prefs.name.isBlank()) View.GONE else View.VISIBLE
         return box
     }
 

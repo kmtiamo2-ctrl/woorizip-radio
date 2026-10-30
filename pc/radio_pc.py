@@ -898,74 +898,90 @@ def run_ui(start_minimized):
         w.title("설정")
         w.configure(bg=BG)
         w.resizable(False, False)
+        w.transient(root)
+        w.grab_set()
+        members = radio.members or DEFAULT_MEMBERS
+
+        def who_picker(parent, title):
+            tk.Label(parent, text=title, font=(F, 10), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(12, 0))
+            var = tk.StringVar(value=cfg.name)
+            row = tk.Frame(parent, bg=BG)
+            row.pack(anchor="w", padx=12)
+            for n in members:
+                tk.Radiobutton(row, text=n, value=n, variable=var, font=(F, 12), fg=TXT, bg=BG,
+                               selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left", padx=6)
+            return var
+
+        # ---- 처음 실행: 누구 것인지만 고르면 끝 ----
+        if not cfg.name:
+            var = who_picker(w, "이 PC는 누구 것인가요?")
+
+            def start():
+                if not var.get():
+                    messagebox.showerror("설정", "누구 것인지 골라 주세요", parent=w)
+                    return
+                cfg.set(name=var.get())
+                try:
+                    set_autostart(cfg.autostart)
+                except Exception:
+                    pass
+                radio.client.reconnect()
+                w.destroy()
+            tk.Button(w, text="시작", font=(F, 11), width=12, command=start).pack(pady=16)
+            return
+
+        # ---- 평소 설정 ----
+        tk.Label(w, text="이 PC: %s" % cfg.name, font=(F, 12, "bold"), fg=TXT, bg=BG).pack(anchor="w", padx=16, pady=(12, 0))
         fields = {}
-        # 누구의 PC인지: 타이핑 대신 버튼으로 고름
-        tk.Label(w, text="이 PC는 누구 것인가요?", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(12, 0))
-        who_var = tk.StringVar(value=cfg.name)
-        who_row = tk.Frame(w, bg=BG)
-        who_row.pack(anchor="w", padx=12)
-        for n in (radio.members or DEFAULT_MEMBERS):
-            tk.Radiobutton(who_row, text=n, value=n, variable=who_var, font=(F, 11), fg=TXT, bg=BG,
-                           selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left", padx=4)
-        rows = [("host", "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)"),
-                ("out_host", "밖 주소 — Tailscale(예: 100.101.102.103) 또는 DDNS. 비우면 집에서만"),
-                ("key", "가족 암호 (NAS 설정과 같게)"),
-                ("hotkey", "말하기 단축키 (비우면 없음)"),
-                ("quick", "빠른 답장 문구 (쉼표로 구분)")]
-        for k, label in rows:
-            tk.Label(w, text=label, font=(F, 9), fg=SUB, bg=BG, wraplength=380, justify="left").pack(anchor="w", padx=16, pady=(10, 0))
-            if k == "hotkey":
-                row = tk.Frame(w, bg=BG)
-                row.pack(anchor="w", padx=16, fill="x")
-                e = tk.Entry(row, font=(F, 11), width=26)
-                e.insert(0, str(getattr(cfg, k)))
-                e.pack(side="left")
+        tk.Label(w, text="말하기 단축키 (비우면 없음)", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(10, 0))
+        row = tk.Frame(w, bg=BG)
+        row.pack(anchor="w", padx=16, fill="x")
+        hk_entry = tk.Entry(row, font=(F, 11), width=26)
+        hk_entry.insert(0, cfg.hotkey)
+        hk_entry.pack(side="left")
 
-                def capture(entry=e):
-                    """키(조합 가능)를 직접 눌러서 지정"""
-                    global keyboard
-                    if keyboard is None:
-                        try:
-                            import keyboard as _kb
-                            keyboard = _kb
-                        except Exception:
-                            messagebox.showwarning("단축키", "단축키 기능을 쓸 수 없어요", parent=w)
-                            return
-                    entry.delete(0, "end")
-                    entry.insert(0, "키를 누르세요…")
+        def capture():
+            """키(조합 가능)를 직접 눌러서 지정"""
+            global keyboard
+            if keyboard is None:
+                try:
+                    import keyboard as _kb
+                    keyboard = _kb
+                except Exception:
+                    messagebox.showwarning("단축키", "단축키 기능을 쓸 수 없어요", parent=w)
+                    return
+            hk_entry.delete(0, "end")
+            hk_entry.insert(0, "키를 누르세요…")
 
-                    def worker():
-                        try:
-                            combo = keyboard.read_hotkey(suppress=False)
-                        except Exception:
-                            combo = ""
-                        events.put(("hotkey_captured", (entry, combo)))
-                    threading.Thread(target=worker, daemon=True).start()
-                tk.Button(row, text="키 눌러서 지정", font=(F, 9), command=capture).pack(side="left", padx=(6, 0))
-                tk.Button(row, text="없음", font=(F, 9), command=lambda entry=e: entry.delete(0, "end")).pack(side="left", padx=(4, 0))
-                tk.Label(w, text="예: F9, Scroll Lock, Ctrl+Alt+R. 게임·다른 프로그램과 겹치지 않는 키가 좋아요.",
-                         font=(F, 8), fg=SUB, bg=BG).pack(anchor="w", padx=16)
-            else:
-                e = tk.Entry(w, font=(F, 11), width=40, show="*" if k == "key" else "")
-                e.insert(0, str(getattr(cfg, k)))
-                e.pack(padx=16)
-            fields[k] = e
+            def worker():
+                try:
+                    combo = keyboard.read_hotkey(suppress=False)
+                except Exception:
+                    combo = ""
+                events.put(("hotkey_captured", (hk_entry, combo)))
+            threading.Thread(target=worker, daemon=True).start()
+        tk.Button(row, text="키 눌러서 지정", font=(F, 9), command=capture).pack(side="left", padx=(6, 0))
+        tk.Button(row, text="없음", font=(F, 9), command=lambda: hk_entry.delete(0, "end")).pack(side="left", padx=(4, 0))
+        tk.Label(w, text="예: F9, Scroll Lock, Ctrl+Alt+R. 게임·다른 프로그램과 겹치지 않는 키가 좋아요.",
+                 font=(F, 8), fg=SUB, bg=BG).pack(anchor="w", padx=16)
+        fields["hotkey"] = hk_entry
+
+        tk.Label(w, text="빠른 답장 문구 (쉼표로 구분)", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(10, 0))
+        q_entry = tk.Entry(w, font=(F, 11), width=44)
+        q_entry.insert(0, cfg.quick)
+        q_entry.pack(padx=16)
+        fields["quick"] = q_entry
+
         auto_var = tk.BooleanVar(value=cfg.autostart)
         tk.Checkbutton(w, text="Windows 시작 시 자동 실행 (트레이에 조용히 켜짐)", variable=auto_var, font=(F, 10),
                        fg=TXT, bg=BG, selectcolor=BG, activebackground=BG, activeforeground=TXT
                        ).pack(anchor="w", padx=12, pady=(12, 0))
 
         def save():
-            v = {k: e.get().strip() for k, e in fields.items()}
-            v["name"] = who_var.get().strip()
-            if not v["name"]:
-                messagebox.showerror("설정", "이 PC가 누구 것인지 골라 주세요", parent=w)
-                return
-            if not (v["host"] and v["key"]):
-                messagebox.showerror("설정", "집 주소와 가족 암호를 입력하세요", parent=w)
-                return
-            v["autostart"] = auto_var.get()
-            cfg.set(**v)
+            hk = hk_entry.get().strip()
+            if hk.startswith("키를"):
+                hk = cfg.hotkey
+            cfg.set(hotkey=hk, quick=q_entry.get().strip() or Config.DEFAULTS["quick"], autostart=auto_var.get())
             try:
                 set_autostart(cfg.autostart)
             except Exception as e:
@@ -973,11 +989,44 @@ def run_ui(start_minimized):
             bind_hotkey()
             radio.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
             render_chips()
-            radio.client.reconnect()
             w.destroy()
-        tk.Button(w, text="저장하고 연결", font=(F, 10), command=save).pack(pady=14)
-        w.transient(root)
-        w.grab_set()
+        tk.Button(w, text="저장", font=(F, 10), width=12, command=save).pack(pady=(14, 6))
+
+        # ---- 관리자 설정: 가족 암호를 알아야 열림 ----
+        admin = tk.Frame(w, bg=BG)
+
+        def open_admin():
+            from tkinter import simpledialog
+            pw = simpledialog.askstring("가족 암호", "가족 암호를 입력하세요", show="*", parent=w)
+            if pw is None:
+                return
+            if pw != cfg.key:
+                messagebox.showerror("설정", "암호가 달라요", parent=w)
+                return
+            admin_btn.pack_forget()
+            admin.pack(fill="x", pady=(4, 10))
+            a_var = who_picker(admin, "이 PC는 누구 것인가요? (바꾸면 바로 적용)")
+            a_fields = {}
+            for k, label in [("host", "집 주소"), ("out_host", "밖 주소 (Tailscale)"), ("key", "가족 암호")]:
+                tk.Label(admin, text=label, font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(8, 0))
+                e = tk.Entry(admin, font=(F, 11), width=44)
+                e.insert(0, str(getattr(cfg, k)))
+                e.pack(padx=16)
+                a_fields[k] = e
+
+            def save_admin():
+                v = {k: e.get().strip() for k, e in a_fields.items()}
+                v["name"] = a_var.get()
+                if not (v["name"] and v["host"] and v["key"]):
+                    messagebox.showerror("설정", "사용자·집 주소·암호는 비울 수 없어요", parent=w)
+                    return
+                cfg.set(**v)
+                radio.client.reconnect()
+                w.destroy()
+            tk.Button(admin, text="변경 저장하고 다시 연결", font=(F, 10), command=save_admin).pack(pady=10)
+        admin_btn = tk.Button(w, text="사용자·주소 변경 (가족 암호 필요)", font=(F, 9), command=open_admin)
+        admin_btn.pack(pady=(0, 12))
+
 
     # ---- 이벤트 (다른 스레드에서 옴 → 큐에 넣고 화면 스레드에서 처리. 다른 스레드에서 tkinter를 건드리면 멈출 수 있음) ----
     events = queue.Queue()

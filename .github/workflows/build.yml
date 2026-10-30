@@ -15,6 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -r pc/requirements.txt pyinstaller
+      - run: echo '__version__ = "v${{ github.run_number }}"' > pc/version.py
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --collect-all winotify --collect-all pystray pc/radio_pc.py
       - uses: actions/upload-artifact@v4
         with:
@@ -31,7 +32,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: 빌드
         id: build
-        run: chmod +x gradlew && (./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log; exit ${PIPESTATUS[0]})
+        run: chmod +x gradlew && (./gradlew assembleRelease --no-daemon --stacktrace -PappVersion=v${{ github.run_number }} -PappVersionCode=${{ github.run_number }} 2>&1 | tee build.log; exit ${PIPESTATUS[0]})
         working-directory: android
       - name: 실패하면 오류 내용을 이슈로 남김
         if: failure()
@@ -52,13 +53,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { path: out }
       - run: |
-          mv out/pc/WoorizipRadio.exe out/WoorizipRadio-PC.exe
-          mv out/apk/app-release.apk out/WoorizipRadio-Phone.apk
+          mv out/pc/WoorizipRadio.exe out/WoorizipRadio-PC-v${{ github.run_number }}.exe
+          mv out/apk/app-release.apk out/WoorizipRadio-Phone-v${{ github.run_number }}.apk
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
           name: 우리집 무전기 ${{ github.run_number }}번째 빌드
           body: |
-            - **PC(Windows)**: `WoorizipRadio-PC.exe` 를 내려받아 더블클릭
-            - **폰(안드로이드)**: `WoorizipRadio-Phone.apk` 를 폰으로 보내서 설치
+            - **PC(Windows)**: `WoorizipRadio-PC-v${{ github.run_number }}.exe` 를 내려받아 더블클릭 (실행 중인 옛 버전은 먼저 종료)
+            - **폰(안드로이드)**: `WoorizipRadio-Phone-v${{ github.run_number }}.apk` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)
           files: out/*

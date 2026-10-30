@@ -11,8 +11,8 @@ android {
         applicationId = "com.woorizip.radio"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = (project.findProperty("appVersionCode") as String?)?.toIntOrNull() ?: 1
+        versionName = (project.findProperty("appVersion") as String?) ?: "dev"
     }
 
     buildTypes {

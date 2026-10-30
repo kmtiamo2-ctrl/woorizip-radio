@@ -121,7 +121,8 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(28), dp(20), dp(28))
         }
-        root.addView(label("우리집 무전기", 26f, textMain, true))
+        val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "" }
+        root.addView(label("우리집 무전기  $ver", 26f, textMain, true))
         statusText = label("", 14f, textSub).also { root.addView(it, lp(top = 4)) }
 
         incomingText = label("", 17f, Color.BLACK, true).apply {

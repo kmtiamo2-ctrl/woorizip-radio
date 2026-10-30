@@ -24,7 +24,11 @@ from collections import deque
 from urllib.parse import urlparse
 
 APP_NAME = "WoorizipRadio"
-APP_TITLE = "우리집 무전기"
+try:
+    from version import __version__
+except Exception:
+    __version__ = "dev"
+APP_TITLE = "우리집 무전기 " + __version__
 RATE = 16000
 FRAME_BYTES = 640  # 20ms, 16비트 모노
 LIVE, CLIP = 1, 2
@@ -790,7 +794,7 @@ def run_ui(start_minimized):
                 pass
 
     # ---- 화면 요소 ----
-    tk.Label(root, text=APP_TITLE, font=(F, 20, "bold"), fg=TXT, bg=BG).pack(anchor="w", padx=20, pady=(18, 0))
+    tk.Label(root, text=APP_TITLE, font=(F, 20, "bold"), fg=TXT, bg=BG).pack(anchor="w", padx=20, pady=(18, 0))  # 제목에 버전 표시
     status = tk.Label(root, text="", font=(F, 10), fg=SUB, bg=BG)
     status.pack(anchor="w", padx=20)
     incoming = tk.Label(root, text="", font=(F, 13, "bold"), fg="black", bg=ACCENT, pady=8)

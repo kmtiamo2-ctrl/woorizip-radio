@@ -52,12 +52,13 @@ jobs:
           Start-Process (Join-Path $env:RUNNER_TEMP 'dl2.exe') -ArgumentList '--minimized','--updated'
           Start-Sleep 25
           $p2 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
-          $log += "2) 새 파일로 교체 실행 → 실행 중: $($p2.Count)개 / 경로: $(($p2 | ForEach-Object { $_.Path }) -join ' , ')"
+          $paths2 = @($p2 | ForEach-Object { [string]$_.Path })   # 프로세스가 끝난 뒤에는 경로를 못 읽으므로 지금 문자열로 떠 둠
+          $log += "2) 새 파일로 교체 실행 → 실행 중: $($p2.Count)개 / 경로: $($paths2 -join ' , ')"
           python -c "import socket; s=socket.create_connection(('127.0.0.1',47651),timeout=3); s.sendall(b'quit'); s.close()"
           Start-Sleep 8
           $p3 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
           $log += "3) 종료 요청 → 실행 중: $($p3.Count)개"
-          $bad = @($p2 | Where-Object { -not [string]::Equals([string]$_.Path, [string]$inst, 'OrdinalIgnoreCase') })
+          $bad = @($paths2 | Where-Object { -not [string]::Equals($_, [string]$inst, 'OrdinalIgnoreCase') })
           $c1 = [bool](Test-Path $inst); $c2 = ($p1.Count -ge 1); $c3 = ($p2.Count -ge 1); $c4 = ($bad.Count -eq 0); $c5 = ($p3.Count -eq 0)
           $pass = $c1 -and $c2 -and $c3 -and $c4 -and $c5
           $log += "조건: 설치본=$c1 실행=$c2 교체후실행=$c3 경로일치=$c4(다른경로 $($bad.Count)개) 종료=$c5"

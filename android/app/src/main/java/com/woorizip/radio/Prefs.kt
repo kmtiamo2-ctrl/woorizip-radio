@@ -39,10 +39,12 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("standby", false)
         set(v) = sp.edit().putBoolean("standby", v).apply()
 
-    /** 마지막으로 고른 대화 상대: "all" 또는 가족 이름 */
+    /** 마지막으로 고른 대화 상대: "all" 또는 가족 이름들 (쉼표 구분, 1~4명) */
     var target: String
         get() = sp.getString("target", "all") ?: "all"
         set(v) = sp.edit().putString("target", v).apply()
+
+    val targetList: List<String> get() = if (target == "all") emptyList() else target.split(",").filter { it.isNotBlank() }
 
     /** 빠른 답장 문구 (쉼표로 구분). 각자 설정에서 바꿀 수 있음 */
     var quickReplies: List<String>

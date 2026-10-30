@@ -26,6 +26,7 @@ data class Clip(
     val title get() = when {
         mine -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"}"
         mode == "all" -> "${from}님 전체 방송"
+        mode == "group" -> "${from}님이 몇 명에게"
         else -> "${from}님이 나에게"
     }
 }
@@ -78,6 +79,22 @@ object Radio : RadioClient.Listener {
         get() = Prefs(app).target
         set(v) { Prefs(app).target = v; changed() }
 
+    /** 서버에 보낼 대상: "all" 또는 이름 배열 */
+    private fun targetJson(t: String = target): Any =
+        if (t == "all") "all" else JSONArray().also { arr -> t.split(",").filter { it.isNotBlank() }.forEach { arr.put(it) } }
+
+    /** 화면 표시용: "전체" 또는 "엄마, 아빠" */
+    fun targetLabel(t: String = target): String = if (t == "all") "전체" else t.split(",").filter { it.isNotBlank() }.joinToString(", ")
+
+    /** 가족 버튼 눌렀을 때: 선택/해제 토글 (여러 명 가능) */
+    fun toggleTarget(name: String) {
+        if (talking) return
+        if (name == "all") { target = "all"; return }
+        val cur = Prefs(app).targetList.toMutableList()
+        if (name in cur) cur.remove(name) else cur.add(name)
+        target = if (cur.isEmpty()) "all" else cur.joinToString(",")
+    }
+
     fun init(ctx: Context) {
         if (::app.isInitialized) return
         app = ctx.applicationContext
@@ -108,7 +125,7 @@ object Radio : RadioClient.Listener {
         }
         stopClip()
         requesting = true
-        if (!client.sendJson(JSONObject().put("type", "talk_start").put("to", target))) {
+        if (!client.sendJson(JSONObject().put("type", "talk_start").put("to", targetJson()))) {
             requesting = false
             notice = "NAS에 연결되어 있지 않아요"
             Feedback.denied(app)
@@ -156,8 +173,7 @@ object Radio : RadioClient.Listener {
                     notice = "마이크를 사용할 수 없어요"
                     stopTalk()
                 } else {
-                    val to = msg.optString("to")
-                    notice = if (to == "all") "전체 방송 중" else "${to}님에게 말하는 중"
+                    notice = if (msg.opt("to") == "all") "전체 방송 중" else "${targetLabel()}에게 말하는 중"
                 }
             }
             "talk_denied" -> {
@@ -181,8 +197,9 @@ object Radio : RadioClient.Listener {
             "clip" -> pendingClips[msg.optInt("id")] = msg
             "text" -> onTextArrived(msg)
             "text_sent" -> {
-                val to = msg.optString("to")
-                addClip(Clip(msg.optInt("id"), if (to == "all") me else to, if (to == "all") "all" else "direct",
+                val toAll = msg.opt("to") == "all"
+                val names = msg.optJSONArray("to")?.toList() ?: listOfNotNull(msg.optString("to").takeIf { it.isNotBlank() && it != "all" })
+                addClip(Clip(msg.optInt("id"), if (toAll) me else names.joinToString(", "), if (toAll) "all" else "direct",
                     msg.optLong("ts", System.currentTimeMillis() / 1000), 0.0, null, msg.optString("text"), mine = true))
                 notice = "보냈어요"
             }
@@ -198,7 +215,8 @@ object Radio : RadioClient.Listener {
         val t = text.trim()
         if (t.isEmpty()) return false
         if (!connected) { notice = "NAS에 연결되어 있지 않아요"; changed(); return false }
-        return client.sendJson(JSONObject().put("type", "text").put("to", to ?: target).put("text", t))
+        val toJson: Any = if (to != null) to else targetJson()
+        return client.sendJson(JSONObject().put("type", "text").put("to", toJson).put("text", t))
     }
 
     private fun onTextArrived(msg: JSONObject) {

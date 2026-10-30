@@ -148,7 +148,7 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(incomingText, lp(top = 16))
 
-        root.addView(label("누구에게 말할까요?", 15f, textSub), lp(top = 20))
+        root.addView(label("누구에게 말할까요? (여러 명 고를 수 있어요)", 15f, textSub), lp(top = 20))
         memberRow1 = LinearLayout(this).also { root.addView(it, lp(top = 8)) }
         memberRow2 = LinearLayout(this).also { root.addView(it, lp(top = 8)) }
 
@@ -370,7 +370,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun memberButton(text: String, value: String, isOnline: Boolean): TextView {
-        val selected = Radio.target == value
+        val selected = if (value == "all") Radio.target == "all" else value in prefs.targetList
         val place = when {
             value == "all" || !isOnline -> ""
             Radio.memberWhere[value] == "out" -> "\n밖"
@@ -383,7 +383,7 @@ class MainActivity : ComponentActivity() {
             setTextColor(if (selected) Color.BLACK else if (isOnline) textMain else textSub)
             background = rounded(if (selected) accent else card, 12)
             setPadding(0, dp(14), 0, dp(14))
-            setOnClickListener { if (!Radio.talking) Radio.target = value }
+            setOnClickListener { Radio.toggleTarget(value) }
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginStart = dp(4); marginEnd = dp(4)
             }
@@ -399,8 +399,11 @@ class MainActivity : ComponentActivity() {
             others.map { memberButton(it, it, Radio.online.contains(it)) }
         memberRow1.removeAllViews(); memberRow2.removeAllViews()
         buttons.forEachIndexed { i, b -> (if (i < 3) memberRow1 else memberRow2).addView(b) }
-        // 선택했던 사람이 목록에 없으면 전체로
-        if (Radio.target != "all" && Radio.target !in others) Radio.target = "all"
+        // 선택했던 사람이 목록에 없으면 빼고, 아무도 없으면 전체로
+        if (Radio.target != "all") {
+            val kept = prefs.targetList.filter { it in others }
+            if (kept.size != prefs.targetList.size) prefs.target = if (kept.isEmpty()) "all" else kept.joinToString(",")
+        }
 
         val online = Radio.online.size
         val place = if (Radio.atHome) "집" else "밖"
@@ -414,7 +417,7 @@ class MainActivity : ComponentActivity() {
             incomingText.text = if (Radio.incomingMode == "all") "🔊 ${from}님 전체 방송 중" else "🔊 ${from}님이 나에게 말하는 중"
         } else incomingText.visibility = View.GONE
 
-        val who = if (Radio.target == "all") "전체" else Radio.target
+        val who = Radio.targetLabel()
         when {
             Radio.talking -> { talkButton.text = "🎙 말하는 중…\n손을 떼면 끝"; talkButton.background = rounded(red, 24) }
             Radio.requesting -> { talkButton.text = "잠깐만요…"; talkButton.background = rounded(Color.parseColor("#B45309"), 24) }
@@ -445,7 +448,7 @@ class MainActivity : ComponentActivity() {
             })
             if (!c.mine) row.addView(Button(this).apply {
                 text = "답장"
-                setOnClickListener { Radio.target = c.from; input.requestFocus(); toast("${c.from}님에게 보내기로 바뀌었어요") }
+                setOnClickListener { Radio.target = c.from; input.requestFocus(); toast("${c.from}님에게 보내기로 바뀌었어요") }  // 답장은 그 사람 한 명에게
             })
             row.addView(Button(this).apply { text = "삭제"; setOnClickListener { Radio.deleteClip(c) } })
             clipsList.addView(row, lp(top = 4))

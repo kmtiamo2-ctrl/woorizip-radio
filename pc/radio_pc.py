@@ -448,10 +448,36 @@ class Radio:
     def is_parent(self):
         return self.cfg.name in self.parents
 
+    @property
+    def target_list(self):
+        return [] if self.target == "all" else [t for t in self.target.split(",") if t]
+
+    def target_json(self):
+        return "all" if self.target == "all" else self.target_list
+
+    def target_label(self):
+        return "전체" if self.target == "all" else ", ".join(self.target_list)
+
     def set_target(self, t):
+        """한 명으로 지정 (답장 등)"""
         with self.lock:
             if not self.talking:
                 self.cfg.set(target=t)
+
+    def toggle_target(self, name):
+        """가족 버튼: 선택/해제 토글 (여러 명 가능). '전체'를 누르면 모두 해제"""
+        with self.lock:
+            if self.talking:
+                return
+            if name == "all":
+                self.cfg.set(target="all")
+                return
+            cur = self.target_list
+            if name in cur:
+                cur.remove(name)
+            else:
+                cur.append(name)
+            self.cfg.set(target=",".join(cur) if cur else "all")
 
     def _emit(self, kind, info=None):
         cb = self.on_event
@@ -477,7 +503,7 @@ class Radio:
                 return
             self.stop_clip()
             self.requesting = True
-            if not self.client.send_json({"type": "talk_start", "to": self.target}):
+            if not self.client.send_json({"type": "talk_start", "to": self.target_json()}):
                 self.requesting = False
                 self.notice = "NAS에 연결되어 있지 않아요"
                 self.audio.effect(BEEP_NO)
@@ -514,8 +540,7 @@ class Radio:
                     self.notice = "마이크를 사용할 수 없어요"
                     self.stop_talk()
                 else:
-                    to = msg.get("to")
-                    self.notice = "전체 방송 중" if to == "all" else "%s님에게 말하는 중" % to
+                    self.notice = "전체 방송 중" if msg.get("to") == "all" else "%s에게 말하는 중" % self.target_label()
             elif t == "talk_denied":
                 self.requesting = False
                 self.audio.effect(BEEP_NO)
@@ -544,6 +569,8 @@ class Radio:
                 self._on_text_msg(msg)
             elif t == "text_sent":
                 to = msg.get("to")
+                if isinstance(to, list):
+                    to = ", ".join(to)
                 self._add_clip({"kind": "text", "id": int(msg.get("id", 0)), "from": self.cfg.name if to == "all" else to,
                                 "mode": "all" if to == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
                                 "text": msg.get("text", ""), "mine": True})
@@ -626,7 +653,7 @@ class Radio:
         if not self.connected:
             self.notice = "NAS에 연결되어 있지 않아요"
             return False
-        return self.client.send_json({"type": "text", "to": to or self.target, "text": text})
+        return self.client.send_json({"type": "text", "to": to if to else self.target_json(), "text": text})
 
     def _on_text_msg(self, msg):
         cid = int(msg.get("id", 0))
@@ -670,7 +697,11 @@ class Radio:
     def clip_title(self, c):
         if c.get("mine"):
             return "내가 %s" % ("모두에게" if c["mode"] == "all" else "%s님에게" % c["from"])
-        return "%s님 전체 방송" % c["from"] if c["mode"] == "all" else "%s님이 나에게" % c["from"]
+        if c["mode"] == "all":
+            return "%s님 전체 방송" % c["from"]
+        if c["mode"] == "group":
+            return "%s님이 몇 명에게" % c["from"]
+        return "%s님이 나에게" % c["from"]
 
     def play_clip(self, clip):
         with self.lock:
@@ -800,7 +831,7 @@ def run_ui(start_minimized):
     status.pack(anchor="w", padx=20)
     incoming = tk.Label(root, text="", font=(F, 13, "bold"), fg="black", bg=ACCENT, pady=8)
 
-    tk.Label(root, text="누구에게 말할까요?", font=(F, 10), fg=SUB, bg=BG).pack(anchor="w", padx=20, pady=(14, 4))
+    tk.Label(root, text="누구에게 말할까요? (여러 명 고를 수 있어요)", font=(F, 10), fg=SUB, bg=BG).pack(anchor="w", padx=20, pady=(14, 4))
     grid = tk.Frame(root, bg=BG)
     grid.pack(fill="x", padx=16)
 
@@ -1028,6 +1059,95 @@ def run_ui(start_minimized):
         admin_btn.pack(pady=(0, 12))
 
 
+    # ---- 오른쪽 아래 작은 팝업 (5초 뒤 사라짐, 마우스를 올리거나 누르면 유지 + 바로 답장) ----
+    popup = {"win": None, "timer": None}
+
+    def close_popup():
+        if popup["timer"]:
+            try:
+                root.after_cancel(popup["timer"])
+            except Exception:
+                pass
+            popup["timer"] = None
+        if popup["win"]:
+            try:
+                popup["win"].destroy()
+            except Exception:
+                pass
+            popup["win"] = None
+
+    def show_popup(title, text, reply_to=None, seconds=5):
+        close_popup()
+        pw = tk.Toplevel(root)
+        pw.overrideredirect(True)
+        pw.attributes("-topmost", True)
+        try:
+            pw.attributes("-alpha", 0.96)
+        except Exception:
+            pass
+        pw.configure(bg=ACCENT)
+        inner = tk.Frame(pw, bg=CARD)
+        inner.pack(padx=2, pady=2, fill="both", expand=True)
+        head = tk.Frame(inner, bg=CARD)
+        head.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(head, text=title, font=(F, 11, "bold"), fg=TXT, bg=CARD, anchor="w").pack(side="left")
+        tk.Button(head, text="✕", font=(F, 9), bd=0, fg=SUB, bg=CARD, activebackground=CARD, command=close_popup).pack(side="right")
+        if text:
+            tk.Label(inner, text=text, font=(F, 11), fg=TXT, bg=CARD, wraplength=300, justify="left", anchor="w").pack(fill="x", padx=12, pady=(4, 0))
+        reply_box = tk.Frame(inner, bg=CARD)
+
+        def send_reply(t):
+            t = t.strip()
+            if t and reply_to and radio.send_text(t, to=reply_to):
+                close_popup()
+                show_popup("보냈어요", "%s님에게: %s" % (reply_to, t), seconds=2)
+
+        def show_reply(*_):
+            keep()
+            if reply_box.winfo_ismapped() or not reply_to:
+                return
+            reply_box.pack(fill="x", padx=10, pady=(8, 10))
+            chips = tk.Frame(reply_box, bg=CARD)
+            chips.pack(fill="x")
+            for q in radio.quick_replies[:6]:
+                tk.Button(chips, text=q, font=(F, 9), command=lambda q=q: send_reply(q)).pack(side="left", padx=2, pady=2)
+            erow = tk.Frame(reply_box, bg=CARD)
+            erow.pack(fill="x", pady=(4, 0))
+            ent = tk.Entry(erow, font=(F, 10))
+            ent.pack(side="left", fill="x", expand=True)
+            ent.bind("<Return>", lambda e: send_reply(ent.get()))
+            tk.Button(erow, text="보내기", font=(F, 9), command=lambda: send_reply(ent.get())).pack(side="left", padx=(4, 0))
+            ent.focus_set()
+            place()
+
+        def keep(*_):
+            if popup["timer"]:
+                try:
+                    root.after_cancel(popup["timer"])
+                except Exception:
+                    pass
+                popup["timer"] = None
+
+        if reply_to:
+            tk.Label(inner, text="클릭하면 바로 답장", font=(F, 8), fg=SUB, bg=CARD, anchor="w").pack(fill="x", padx=12, pady=(2, 8))
+        else:
+            tk.Frame(inner, bg=CARD, height=8).pack()
+        for wdg in (pw, inner, head):
+            wdg.bind("<Enter>", keep)
+            wdg.bind("<Button-1>", show_reply)
+        for child in inner.winfo_children():
+            child.bind("<Button-1>", show_reply)
+            child.bind("<Enter>", keep)
+
+        def place():
+            pw.update_idletasks()
+            w_, h_ = max(pw.winfo_reqwidth(), 320), pw.winfo_reqheight()
+            sw, sh = pw.winfo_screenwidth(), pw.winfo_screenheight()
+            pw.geometry("%dx%d+%d+%d" % (w_, h_, sw - w_ - 16, sh - h_ - 60))
+        place()
+        popup["win"] = pw
+        popup["timer"] = root.after(int(seconds * 1000), close_popup)
+
     # ---- 이벤트 (다른 스레드에서 옴 → 큐에 넣고 화면 스레드에서 처리. 다른 스레드에서 tkinter를 건드리면 멈출 수 있음) ----
     events = queue.Queue()
     radio.on_event = lambda kind, info: events.put((kind, info))
@@ -1048,17 +1168,17 @@ def run_ui(start_minimized):
             if kind == "incoming":
                 flash()
                 who = info.get("from")
-                toast("%s님이 말해요" % who, "전체 방송" if info.get("mode") == "all" else "나에게")
+                show_popup("🔊 %s님이 말해요" % who, "전체 방송" if info.get("mode") == "all" else "나에게", reply_to=who, seconds=8)
             elif kind == "clip":
                 c = info["clip"]
                 flash()
-                toast(radio.clip_title(c), "%d초 · %s" % (max(1, int(c["seconds"])),
-                                                        "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"))
+                show_popup("🔊 " + radio.clip_title(c), "%d초 · %s" % (max(1, int(c["seconds"])),
+                           "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"), reply_to=c["from"])
                 if not info["auto"]:
                     events.put(("show", None))
             elif kind == "text":
                 flash()
-                toast("💬 " + radio.clip_title(info), info.get("text", ""))
+                show_popup("💬 " + radio.clip_title(info), info.get("text", ""), reply_to=info["from"])
             elif kind == "state":
                 set_tray(radio.connected, radio.where)
             elif kind == "hotkey_captured":
@@ -1087,8 +1207,10 @@ def run_ui(start_minimized):
         with radio.lock:
             me = cfg.name
             others = [m for m in radio.members if m != me]
-            if radio.target != "all" and radio.target not in others:
-                cfg.set(target="all")
+            if radio.target != "all":
+                kept = [t for t in radio.target_list if t in others]
+                if len(kept) != len(radio.target_list):
+                    cfg.set(target=",".join(kept) if kept else "all")
             sig = (tuple(others), tuple(radio.online), radio.target, tuple(sorted(radio.member_where.items())))
             if sig != cache["buttons"]:
                 cache["buttons"] = sig
@@ -1096,7 +1218,7 @@ def run_ui(start_minimized):
                     c.destroy()
                 items = [("전체", "all", True)] + [(m, m, m in radio.online) for m in others]
                 for i, (label, value, on) in enumerate(items):
-                    sel = radio.target == value
+                    sel = (radio.target == "all") if value == "all" else (value in radio.target_list)
                     place = ""
                     if value != "all" and on:
                         place = "\n" + ("밖" if radio.member_where.get(value) == "out" else "집")
@@ -1104,7 +1226,7 @@ def run_ui(start_minimized):
                     b = tk.Label(grid, text=text, font=(F, 11, "bold"), pady=6,
                                  fg="black" if sel else (TXT if on else SUB), bg=ACCENT if sel else CARD, cursor="hand2")
                     b.grid(row=i // 3, column=i % 3, sticky="nsew", padx=4, pady=4)
-                    b.bind("<Button-1>", lambda e, v=value: radio.set_target(v))
+                    b.bind("<Button-1>", lambda e, v=value: radio.toggle_target(v))
                 for c in range(3):
                     grid.columnconfigure(c, weight=1)
 
@@ -1121,7 +1243,7 @@ def run_ui(start_minimized):
             elif incoming.winfo_ismapped():
                 incoming.pack_forget()
 
-            who = "전체" if radio.target == "all" else radio.target
+            who = radio.target_label()
             if radio.talking:
                 talk.config(text="🎙 말하는 중…\n떼면 끝", bg=RED)
             elif radio.requesting:

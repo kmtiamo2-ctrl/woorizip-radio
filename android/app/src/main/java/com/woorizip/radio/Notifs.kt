@@ -55,8 +55,7 @@ object Notifs {
 
     /** 상단에 계속 떠 있는 수신 대기 알림 (말하기 시작/끝 버튼 포함) */
     fun standby(ctx: Context): Notification {
-        val target = Radio.target
-        val who = if (target == "all") "전체" else target
+        val who = Radio.targetLabel()
         val place = if (Radio.where == "out") " · 밖" else ""
         val title = when {
             Radio.talking -> "🎙 $who 에게 말하는 중"

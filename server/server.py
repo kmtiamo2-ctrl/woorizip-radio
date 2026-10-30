@@ -211,26 +211,32 @@ class Hub:
         for ws in self.all_ws():
             await ws.send_json(msg)
 
+    def resolve_targets(self, name, to):
+        """to: "all" | 이름 | [이름, ...] → (대상 목록, 모드) / 잘못되면 (None, None)"""
+        if to == "all":
+            return [m for m in MEMBERS if m != name], "all"
+        names = to if isinstance(to, list) else [to]
+        names = [n for n in names if isinstance(n, str) and n in MEMBERS and n != name]
+        names = list(dict.fromkeys(names))
+        if not names:
+            return None, None
+        return names, ("direct" if len(names) == 1 else "group")
+
     # ---- 말하기 ----
 
     async def start_talk(self, name, ws, to):
         if self.speaker and self.speaker_ws is not ws:
             await ws.send_json({"type": "talk_denied", "reason": "busy", "speaker": self.speaker})
             return
-        if to == "all":
-            targets = [m for m in MEMBERS if m != name]
-            mode = "all"
-        else:
-            if to == name or to not in MEMBERS:
-                await ws.send_json({"type": "talk_denied", "reason": "offline", "to": to})
-                return
-            targets = [to]
-            mode = "direct"
+        targets, mode = self.resolve_targets(name, to)
+        if targets is None:
+            await ws.send_json({"type": "talk_denied", "reason": "offline", "to": to})
+            return
         live = [w for t in targets for w in self.conns.get(t, ()) if self.hears_live(w)]
         self.speaker, self.speaker_ws, self.targets, self.live, self.mode = name, ws, targets, live, mode
         self.talk_started = time.monotonic()
         self.record = bytearray()
-        log("송신 시작: %s -> %s (실시간 %d대)", name, "전체" if mode == "all" else to, len(live))
+        log("송신 시작: %s -> %s (실시간 %d대)", name, "전체" if mode == "all" else ",".join(targets), len(live))
         await ws.send_json({"type": "talk_granted", "to": to,
                             "listeners": [m for m in targets if self.conns.get(m)]})
         for w in live:
@@ -268,18 +274,13 @@ class Hub:
         text = str(text).strip()[:200]
         if not text:
             return
-        if to == "all":
-            targets = [m for m in MEMBERS if m != name]
-            mode = "all"
-        elif to in MEMBERS and to != name:
-            targets = [to]
-            mode = "direct"
-        else:
+        targets, mode = self.resolve_targets(name, to)
+        if targets is None:
             await ws.send_json({"type": "text_failed", "to": to})
             return
         self.clip_seq += 1
         item = {"kind": "text", "id": self.clip_seq, "from": name, "mode": mode, "ts": time.time(), "text": text}
-        log("문자: %s -> %s: %s", name, "전체" if mode == "all" else to, text)
+        log("문자: %s -> %s: %s", name, "전체" if mode == "all" else ",".join(targets), text)
         for t in targets:
             q = self.queue.setdefault(t, [])
             q.append(item)

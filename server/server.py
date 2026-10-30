@@ -15,6 +15,17 @@
   PORT         포트 (기본: 8765)
   MAX_TALK_SEC 한 번에 말할 수 있는 최대 시간(초) (기본: 60)
   KEEP_HOURS   보관한 음성·문자를 몇 시간까지 전달 시도할지 (기본: 24)
+  DATA_DIR     예약 메시지 저장 폴더 (기본: /app — 컨테이너를 다시 만들어도 남도록 NAS 폴더에 저장)
+
+읽음·들음 확인
+  보낸 메시지마다 mid(메시지 번호)가 있고, 받는 사람별 상태가 sent → received → seen 으로 바뀜
+  클라이언트 → {"type":"seen","mid":N}   (문자를 봤거나 음성을 들었을 때)
+  서버 → 보낸 사람 {"type":"receipt","mid":N,"status":{"엄마":"seen","첫째":"received"}}
+
+예약 메시지 (서버가 시간 되면 보낸 사람 이름으로 문자를 보냄)
+  클라이언트 → {"type":"schedule_add","to":..,"text":..,"at":epoch초,"repeat":"once|daily|weekdays|weekends"}
+             → {"type":"schedule_list"} / {"type":"schedule_delete","sid":N}
+  서버 → {"type":"schedules","items":[{"sid","to","text","at","repeat"}]}
 
 문자 메시지: 마이크를 쓸 수 없을 때 짧은 글로 보냄. 음성 클립과 같은 방식으로 보관·전달됨
   클라이언트 → {"type":"text","to":"all"|이름,"text":"..."}
@@ -39,8 +50,11 @@ PORT = int(os.environ.get("PORT", "8765"))
 PARENTS = {m.strip() for m in os.environ.get("PARENTS", "엄마,아빠").split(",") if m.strip()}
 MAX_TALK_SEC = float(os.environ.get("MAX_TALK_SEC", "60"))
 KEEP_HOURS = float(os.environ.get("KEEP_HOURS", "24"))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+SCHEDULE_FILE = os.path.join(DATA_DIR, "schedules.json")
+RECEIPT_KEEP = 300
 MAX_QUEUE = 20
-PING_INTERVAL = 30      # 감시 주기
+PING_INTERVAL = 20      # 감시 주기 (예약 메시지도 이 주기로 확인)
 QUIET_BEFORE_PING = 150 # 이만큼 조용한 연결에만 서버가 ping (평소엔 폰·PC가 스스로 신호를 보냄 → 배터리 절약)
 IDLE_TIMEOUT = 330      # 이만큼 아무 신호가 없으면 끊긴 것으로 정리
 MAX_FRAME = 64 * 1024
@@ -183,6 +197,10 @@ class Hub:
         self.record = bytearray()
         self.queue = {m: [] for m in MEMBERS}   # 이름 -> [클립...]
         self.clip_seq = 0
+        self.receipts = {}       # mid -> {"from","kind","ts","status":{이름: sent|received|seen}}
+        self.schedules = []      # 예약 메시지 목록 (파일에 저장)
+        self.sched_seq = 0
+        self.load_schedules()
 
     # ---- 상태 ----
 
@@ -256,8 +274,15 @@ class Hub:
             await w.send_json({"type": "incoming_end", "from": name})
         if reason != "done" and not ws.closed:
             await ws.send_json({"type": "talk_stopped", "reason": reason})
-        if len(pcm) >= 16000:  # 0.5초 이상 말했을 때만 클립으로 보관
-            await self.deliver_clip(name, mode, targets, live, pcm)
+        if len(pcm) >= 16000:  # 0.5초 이상 말했을 때만 보관·확인 대상
+            mid = self.new_receipt(name, "voice", targets)
+            for w in live:   # 실시간으로 들은 사람은 바로 '들음'
+                self.receipts[mid]["status"][w.name] = "seen"
+            await self.deliver_clip(name, mode, targets, live, pcm, mid)
+            if not ws.closed:
+                await ws.send_json({"type": "talk_sent", "mid": mid, "to": targets, "mode": mode,
+                                    "seconds": round(len(pcm) / 32000, 1), "ts": int(time.time())})
+            await self.push_receipt(mid)
         await self.broadcast_presence()
 
     async def relay_audio(self, ws, data):
@@ -281,24 +306,162 @@ class Hub:
             await ws.send_json({"type": "text_failed", "to": to})
             return
         self.clip_seq += 1
-        item = {"kind": "text", "id": self.clip_seq, "from": name, "mode": mode, "ts": time.time(), "text": text}
+        mid = self.new_receipt(name, "text", targets)
+        item = {"kind": "text", "id": self.clip_seq, "mid": mid, "from": name, "mode": mode, "ts": time.time(), "text": text}
         log("문자: %s -> %s: %s", name, "전체" if mode == "all" else ",".join(targets), text)
         for t in targets:
             q = self.queue.setdefault(t, [])
             q.append(item)
             del q[:-MAX_QUEUE]
             await self.flush_queue(t)
-        await ws.send_json({"type": "text_sent", "id": item["id"], "to": to, "text": text, "ts": int(item["ts"])})
+        if ws is not None and not ws.closed:
+            await ws.send_json({"type": "text_sent", "id": item["id"], "mid": mid, "to": to, "text": text, "ts": int(item["ts"])})
+        await self.push_receipt(mid)
+        return mid
+
+    # ---- 읽음·들음 확인 ----
+
+    def new_receipt(self, sender, kind, targets):
+        self.clip_seq += 1
+        mid = self.clip_seq
+        self.receipts[mid] = {"from": sender, "kind": kind, "ts": time.time(), "status": {t: "sent" for t in targets}}
+        if len(self.receipts) > RECEIPT_KEEP:
+            for old in sorted(self.receipts)[:len(self.receipts) - RECEIPT_KEEP]:
+                del self.receipts[old]
+        return mid
+
+    async def mark(self, mid, who, state):
+        """받는 사람의 상태를 올림 (sent < received < seen). 바뀌면 보낸 사람에게 알림"""
+        r = self.receipts.get(mid)
+        if not r or who not in r["status"]:
+            return
+        order = {"sent": 0, "received": 1, "seen": 2}
+        if order.get(state, 0) <= order.get(r["status"][who], 0):
+            return
+        r["status"][who] = state
+        await self.push_receipt(mid)
+
+    async def push_receipt(self, mid):
+        r = self.receipts.get(mid)
+        if r:
+            await self.send_to(r["from"], {"type": "receipt", "mid": mid, "kind": r["kind"], "status": r["status"]})
+
+    async def send_my_receipts(self, ws):
+        """접속 직후: 내가 최근에 보낸 메시지들의 확인 상태를 한 번에"""
+        mine = [{"mid": mid, "kind": r["kind"], "status": r["status"]}
+                for mid, r in self.receipts.items() if r["from"] == ws.name]
+        if mine:
+            await ws.send_json({"type": "receipts", "items": mine[-60:]})
+
+    # ---- 예약 메시지 ----
+
+    def load_schedules(self):
+        try:
+            with open(SCHEDULE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.schedules = data.get("items", [])
+            self.sched_seq = data.get("seq", 0)
+        except Exception:
+            self.schedules, self.sched_seq = [], 0
+
+    def save_schedules(self):
+        try:
+            with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"items": self.schedules, "seq": self.sched_seq}, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            log("예약 저장 실패: %r", e)
+
+    @staticmethod
+    def next_time(at, repeat):
+        """반복 예약의 다음 시각 (같은 시:분, 날짜만 넘김)"""
+        day = 86400
+        nxt = at + day
+        if repeat == "daily":
+            return nxt
+        for _ in range(8):
+            wd = time.localtime(nxt).tm_wday   # 0=월 … 6=일
+            if repeat == "weekdays" and wd < 5:
+                return nxt
+            if repeat == "weekends" and wd >= 5:
+                return nxt
+            nxt += day
+        return nxt
+
+    async def schedule_add(self, name, ws, msg):
+        text = str(msg.get("text", "")).strip()[:200]
+        try:
+            at = float(msg.get("at", 0))
+        except (TypeError, ValueError):
+            at = 0
+        repeat = msg.get("repeat", "once")
+        if repeat not in ("once", "daily", "weekdays", "weekends"):
+            repeat = "once"
+        to = msg.get("to", "all")
+        targets, _ = self.resolve_targets(name, to)
+        if not text or at <= 0 or targets is None:
+            await ws.send_json({"type": "schedule_failed", "reason": "내용·시간·받는 사람을 확인하세요"})
+            return
+        now = time.time()
+        if repeat != "once":
+            while at <= now:            # 반복이면 다음 해당 시각으로
+                at = self.next_time(at, repeat)
+        elif at <= now - 60:
+            await ws.send_json({"type": "schedule_failed", "reason": "이미 지난 시간이에요"})
+            return
+        self.sched_seq += 1
+        item = {"sid": self.sched_seq, "owner": name, "to": to if to == "all" else targets,
+                "text": text, "at": int(at), "repeat": repeat}
+        self.schedules.append(item)
+        if len([x for x in self.schedules if x["owner"] == name]) > 30:
+            await ws.send_json({"type": "schedule_failed", "reason": "예약은 30개까지예요"})
+            self.schedules.remove(item)
+            return
+        self.save_schedules()
+        log("예약 추가: %s %s %s '%s' (%s)", name, time.strftime("%m-%d %H:%M", time.localtime(at)), item["to"], text, repeat)
+        await self.send_schedules(name)
+
+    async def schedule_delete(self, name, sid):
+        before = len(self.schedules)
+        self.schedules = [x for x in self.schedules if not (x["sid"] == sid and x["owner"] == name)]
+        if len(self.schedules) != before:
+            self.save_schedules()
+        await self.send_schedules(name)
+
+    async def send_schedules(self, name):
+        mine = [{"sid": x["sid"], "to": x["to"], "text": x["text"], "at": x["at"], "repeat": x["repeat"]}
+                for x in self.schedules if x["owner"] == name]
+        mine.sort(key=lambda x: x["at"])
+        await self.send_to(name, {"type": "schedules", "items": mine})
+
+    async def run_due_schedules(self):
+        now = time.time()
+        due = [x for x in self.schedules if x["at"] <= now]
+        if not due:
+            return
+        owners = set()
+        for x in due:
+            log("예약 실행: %s -> %s '%s'", x["owner"], x["to"], x["text"])
+            await self.send_text(x["owner"], None, x["to"], "⏰ " + x["text"])
+            owners.add(x["owner"])
+            if x["repeat"] == "once":
+                self.schedules.remove(x)
+            else:
+                x["at"] = self.next_time(x["at"], x["repeat"])
+                while x["at"] <= now:
+                    x["at"] = self.next_time(x["at"], x["repeat"])
+        self.save_schedules()
+        for o in owners:
+            await self.send_schedules(o)
 
     # ---- 보관 음성(클립) ----
 
-    async def deliver_clip(self, sender, mode, targets, live, pcm):
+    async def deliver_clip(self, sender, mode, targets, live, pcm, mid=0):
         live_names = {w.name for w in live}
         for t in targets:
             if t in live_names:
                 continue  # 실시간으로 들은 사람은 클립 불필요
             self.clip_seq += 1
-            clip = {"kind": "clip", "id": self.clip_seq, "from": sender, "mode": mode, "ts": time.time(), "pcm": pcm}
+            clip = {"kind": "clip", "id": self.clip_seq, "mid": mid, "from": sender, "mode": mode, "ts": time.time(), "pcm": pcm}
             q = self.queue.setdefault(t, [])
             q.append(clip)
             del q[:-MAX_QUEUE]
@@ -315,16 +478,20 @@ class Hub:
                     continue
                 w.sent_clips.add(c["id"])
                 if c.get("kind") == "text":
-                    await w.send_json({"type": "text", "id": c["id"], "from": c["from"], "mode": c["mode"],
+                    await w.send_json({"type": "text", "id": c["id"], "mid": c.get("mid", 0), "from": c["from"], "mode": c["mode"],
                                        "ts": int(c["ts"]), "text": c["text"]})
                     continue
-                await w.send_json({"type": "clip", "id": c["id"], "from": c["from"], "mode": c["mode"],
+                await w.send_json({"type": "clip", "id": c["id"], "mid": c.get("mid", 0), "from": c["from"], "mode": c["mode"],
                                    "ts": int(c["ts"]), "seconds": round(len(c["pcm"]) / 32000, 1)})
                 await w.send_bytes(bytes([CLIP]) + struct.pack("!I", c["id"]) + c["pcm"])
 
-    def ack_clip(self, name, clip_id):
+    async def ack_clip(self, name, clip_id):
         q = self.queue.get(name) or []
+        hit = [c for c in q if c["id"] == clip_id]
         q[:] = [c for c in q if c["id"] != clip_id]
+        for c in hit:
+            if c.get("mid"):
+                await self.mark(c["mid"], name, "received")
 
     # ---- 연결 처리 ----
 
@@ -369,6 +536,8 @@ class Hub:
                                 "parents": sorted(PARENTS)})
             await self.broadcast_presence()
             await self.flush_queue(name)
+            await self.send_my_receipts(ws)
+            await self.send_schedules(name)
             while True:
                 is_text, data = await ws.recv()
                 if not is_text:
@@ -383,7 +552,15 @@ class Hub:
                 elif t == "text":
                     await self.send_text(name, ws, msg.get("to", "all"), msg.get("text", ""))
                 elif t == "clip_ack":
-                    self.ack_clip(name, int(msg.get("id", 0)))
+                    await self.ack_clip(name, int(msg.get("id", 0)))
+                elif t == "seen":
+                    await self.mark(int(msg.get("mid", 0)), name, "seen")
+                elif t == "schedule_add":
+                    await self.schedule_add(name, ws, msg)
+                elif t == "schedule_list":
+                    await self.send_schedules(name)
+                elif t == "schedule_delete":
+                    await self.schedule_delete(name, int(msg.get("sid", 0)))
                 elif t == "where":
                     new = msg.get("where")
                     if new in ("home", "out") and new != ws.where:
@@ -422,6 +599,10 @@ class Hub:
                     await ws.ping()
             if self.speaker_ws and now - self.talk_started > MAX_TALK_SEC:
                 await self.end_talk(self.speaker_ws, "too_long")
+            try:
+                await self.run_due_schedules()
+            except Exception as e:
+                log("예약 처리 오류: %r", e)
 
 
 async def main():

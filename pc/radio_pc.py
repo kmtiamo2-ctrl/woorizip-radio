@@ -459,6 +459,9 @@ class Radio:
         self.notice = ""
         self.clips = []          # 최근 메시지 (새것이 앞): 음성 dict(kind=clip, file) 또는 문자 dict(kind=text, text)
         self.outbox = []         # 연결이 끊겨 있을 때 보낸 문자: 연결되면 자동 전송
+        self.receipts = {}       # 내가 보낸 메시지 mid -> {이름: sent|received|seen}
+        self.seen_sent = set()   # 내가 '봤어요/들었어요'라고 알린 mid
+        self.schedules = []      # 내 예약 메시지 목록 (서버가 줌)
         self._load_outbox()
         self.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
         self.pending = {}
@@ -607,10 +610,28 @@ class Radio:
                 to = msg.get("to")
                 if isinstance(to, list):
                     to = ", ".join(to)
-                self._add_clip({"kind": "text", "id": int(msg.get("id", 0)), "from": self.cfg.name if to == "all" else to,
+                self._add_clip({"kind": "text", "id": int(msg.get("id", 0)), "mid": int(msg.get("mid", 0)),
+                                "from": self.cfg.name if to == "all" else to,
                                 "mode": "all" if to == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
                                 "text": msg.get("text", ""), "mine": True})
                 self.notice = "보냈어요"
+            elif t == "talk_sent":
+                to = msg.get("to") or []
+                self._add_clip({"kind": "voice_sent", "id": int(msg.get("mid", 0)), "mid": int(msg.get("mid", 0)),
+                                "from": self.cfg.name if msg.get("mode") == "all" else ", ".join(to),
+                                "mode": "all" if msg.get("mode") == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
+                                "seconds": float(msg.get("seconds") or 0), "mine": True})
+            elif t == "receipt":
+                self.receipts[int(msg.get("mid", 0))] = msg.get("status") or {}
+            elif t == "receipts":
+                for it in msg.get("items") or []:
+                    self.receipts[int(it.get("mid", 0))] = it.get("status") or {}
+            elif t == "schedules":
+                self.schedules = msg.get("items") or []
+                self._emit("schedules")
+            elif t == "schedule_failed":
+                self.notice = "예약 실패: %s" % msg.get("reason", "")
+                self._emit("schedules")
             elif t == "text_failed":
                 self.notice = "받을 사람이 없어요 (상대를 다시 골라 주세요)"
                 log("문자 실패(서버): 받을 사람 없음 to=%r" % msg.get("to"))
@@ -666,7 +687,7 @@ class Radio:
     def _save_texts(self):
         try:
             with open(os.path.join(data_dir(), "texts.json"), "w", encoding="utf-8") as f:
-                json.dump([c for c in self.clips if c.get("kind") == "text"][:30], f, ensure_ascii=False)
+                json.dump([c for c in self.clips if c.get("kind") in ("text", "voice_sent")][:30], f, ensure_ascii=False)
         except Exception:
             pass
 
@@ -680,7 +701,7 @@ class Radio:
                 except Exception:
                     pass
         del self.clips[40:]
-        if clip.get("kind") == "text":
+        if clip.get("kind") in ("text", "voice_sent"):
             self._save_texts()
 
     # ---- 문자 메시지 (말할 수 없을 때) ----
@@ -745,7 +766,7 @@ class Radio:
         sender, ts, text = msg.get("from"), int(msg.get("ts") or time.time()), msg.get("text", "")
         if any(c["from"] == sender and c["ts"] == ts and c.get("text") == text for c in self.clips):
             return
-        clip = {"kind": "text", "id": cid, "from": sender, "mode": msg.get("mode"), "ts": ts, "text": text}
+        clip = {"kind": "text", "id": cid, "mid": int(msg.get("mid", 0)), "from": sender, "mode": msg.get("mode"), "ts": ts, "text": text}
         self._add_clip(clip)
         if not self.cfg.dnd:
             self.audio.effect(BEEP_IN)
@@ -769,7 +790,7 @@ class Radio:
             except Exception:
                 return
             del pcm  # 메모리에 들고 있지 않음. 들을 때 파일에서 읽음
-            clip = {"kind": "clip", "id": cid, "from": sender, "mode": mode, "ts": ts, "seconds": seconds, "file": path}
+            clip = {"kind": "clip", "id": cid, "mid": int(meta.get("mid", 0)), "from": sender, "mode": mode, "ts": ts, "seconds": seconds, "file": path}
             self._add_clip(clip)
             if self.cfg.dnd:
                 return
@@ -778,9 +799,33 @@ class Radio:
                 self.play_clip(clip)
             self._emit("clip", {"clip": clip, "auto": auto})
 
+    def mark_seen(self, clip):
+        """받은 메시지를 봤다/들었다고 보낸 사람에게 알림 (한 번만)"""
+        mid = clip.get("mid") or 0
+        if not mid or clip.get("mine") or mid in self.seen_sent:
+            return
+        self.seen_sent.add(mid)
+        self.client.send_json({"type": "seen", "mid": mid})
+
+    def receipt_text(self, c):
+        """내가 보낸 메시지의 가족별 확인 표시: ✓ 받음, ✓✓ 봄(들음)"""
+        st = self.receipts.get(c.get("mid") or -1)
+        if not st:
+            return ""
+        mark = {"sent": "·", "received": "✓", "seen": "✓✓"}
+        return "  ".join("%s%s" % (n, mark.get(v, "·")) for n, v in st.items())
+
+    def schedule_add(self, text, at, repeat, to=None):
+        return self.client.send_json({"type": "schedule_add", "to": to if to else self.target_json(),
+                                      "text": text, "at": int(at), "repeat": repeat})
+
+    def schedule_delete(self, sid):
+        return self.client.send_json({"type": "schedule_delete", "sid": int(sid)})
+
     def clip_title(self, c):
         if c.get("mine"):
-            return "내가 %s" % ("모두에게" if c["mode"] == "all" else "%s님에게" % c["from"])
+            what = " (음성 %d초)" % max(1, int(c.get("seconds") or 0)) if c.get("kind") == "voice_sent" else ""
+            return "내가 %s%s" % ("모두에게" if c["mode"] == "all" else "%s님에게" % c["from"], what)
         if c["mode"] == "all":
             return "%s님 전체 방송" % c["from"]
         if c["mode"] == "group":
@@ -799,6 +844,7 @@ class Radio:
             self.playing = clip
             self.audio.play_all(pcm)
             threading.Timer(clip["seconds"] + 0.8, self._clip_done, [clip]).start()
+            self.mark_seen(clip)
 
     def _clip_done(self, clip):
         with self.lock:
@@ -961,6 +1007,99 @@ def run_ui(start_minimized):
     entry.pack(side="left", fill="x", expand=True)
     entry.bind("<Return>", lambda e: send_text(entry.get()))
     tk.Button(entry_row, text="보내기", font=(F, 10), command=lambda: send_text(entry.get())).pack(side="left", padx=(6, 0))
+    tk.Button(entry_row, text="⏰ 예약", font=(F, 10), command=lambda: open_schedule()).pack(side="left", padx=(4, 0))
+    tk.Label(text_box, text="보낸 메시지 옆 표시: ✓ 받음 · ✓✓ 봄(들음)", font=(F, 8), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(0, 6))
+
+    # ---- 예약 메시지 창 ----
+    sched_win = {"w": None, "list": None}
+
+    def open_schedule():
+        if sched_win["w"] and sched_win["w"].winfo_exists():
+            sched_win["w"].lift()
+            return
+        w = tk.Toplevel(root)
+        w.title("예약 메시지")
+        w.configure(bg=BG)
+        w.resizable(False, False)
+        sched_win["w"] = w
+        tk.Label(w, text="받는 사람: %s (창에서 고른 상대)" % radio.target_label(), font=(F, 10), fg=TXT, bg=BG).pack(anchor="w", padx=14, pady=(12, 0))
+        tk.Label(w, text="내용", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=14, pady=(8, 0))
+        t_entry = tk.Entry(w, font=(F, 11), width=40)
+        t_entry.insert(0, entry.get().strip())
+        t_entry.pack(padx=14)
+        row = tk.Frame(w, bg=BG)
+        row.pack(anchor="w", padx=14, pady=(8, 0))
+        tk.Label(row, text="시간", font=(F, 9), fg=SUB, bg=BG).pack(side="left")
+        now = time.localtime(time.time() + 600)
+        hh = tk.Spinbox(row, from_=0, to=23, width=3, format="%02.0f", font=(F, 11))
+        hh.delete(0, "end"); hh.insert(0, "%02d" % now.tm_hour)
+        hh.pack(side="left", padx=(6, 2))
+        tk.Label(row, text=":", font=(F, 11), fg=TXT, bg=BG).pack(side="left")
+        mm = tk.Spinbox(row, from_=0, to=59, width=3, format="%02.0f", font=(F, 11))
+        mm.delete(0, "end"); mm.insert(0, "%02d" % ((now.tm_min // 5) * 5))
+        mm.pack(side="left", padx=(2, 12))
+        day_var = tk.StringVar(value="오늘")
+        for d in ("오늘", "내일"):
+            tk.Radiobutton(row, text=d, value=d, variable=day_var, font=(F, 10), fg=TXT, bg=BG,
+                           selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left")
+        row2 = tk.Frame(w, bg=BG)
+        row2.pack(anchor="w", padx=14, pady=(6, 0))
+        tk.Label(row2, text="반복", font=(F, 9), fg=SUB, bg=BG).pack(side="left", padx=(0, 6))
+        rep_var = tk.StringVar(value="once")
+        for label, val in (("한 번", "once"), ("매일", "daily"), ("평일", "weekdays"), ("주말", "weekends")):
+            tk.Radiobutton(row2, text=label, value=val, variable=rep_var, font=(F, 10), fg=TXT, bg=BG,
+                           selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left")
+
+        def add():
+            text = t_entry.get().strip()
+            try:
+                h, m = int(hh.get()), int(mm.get())
+                assert 0 <= h < 24 and 0 <= m < 60
+            except Exception:
+                messagebox.showerror("예약", "시간을 확인하세요", parent=w)
+                return
+            if not text:
+                messagebox.showerror("예약", "내용을 입력하세요", parent=w)
+                return
+            lt = time.localtime()
+            base = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1))
+            if day_var.get() == "내일":
+                base += 86400
+            if rep_var.get() == "once" and base < time.time() - 60:
+                messagebox.showerror("예약", "이미 지난 시간이에요. '내일'을 고르세요", parent=w)
+                return
+            if not radio.schedule_add(text, base, rep_var.get()):
+                messagebox.showwarning("예약", "지금 연결이 없어요. 연결된 뒤 다시 시도하세요", parent=w)
+                return
+            t_entry.delete(0, "end")
+        tk.Button(w, text="예약 추가", font=(F, 10), command=add).pack(pady=(10, 6))
+        tk.Label(w, text="내 예약 목록", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=14)
+        lst = tk.Frame(w, bg=CARD)
+        lst.pack(fill="x", padx=14, pady=(2, 14))
+        sched_win["list"] = lst
+        render_schedules()
+        radio.client.send_json({"type": "schedule_list"})
+
+    def render_schedules():
+        lst = sched_win.get("list")
+        if not lst or not lst.winfo_exists():
+            return
+        for c in lst.winfo_children():
+            c.destroy()
+        items = radio.schedules
+        if not items:
+            tk.Label(lst, text="예약이 없어요", font=(F, 9), fg=SUB, bg=CARD).pack(anchor="w", padx=8, pady=6)
+            return
+        rep_label = {"once": "한 번", "daily": "매일", "weekdays": "평일", "weekends": "주말"}
+        for it in items:
+            r = tk.Frame(lst, bg=CARD)
+            r.pack(fill="x", padx=6, pady=2)
+            to = it.get("to")
+            to_s = "모두" if to == "all" else ", ".join(to if isinstance(to, list) else [str(to)])
+            when = time.strftime("%m/%d %H:%M", time.localtime(it["at"]))
+            tk.Label(r, text="%s · %s · %s\n%s" % (when, rep_label.get(it["repeat"], ""), to_s, it["text"]),
+                     font=(F, 9), fg=TXT, bg=CARD, justify="left").pack(side="left", padx=4)
+            tk.Button(r, text="삭제", font=(F, 9), command=lambda sid=it["sid"]: radio.schedule_delete(sid)).pack(side="right", padx=2)
 
     # 메시지 목록: 입력칸 아래, 높이 고정 + 스크롤 (목록이 늘어나도 입력칸을 밀지 않음)
     clips_box = tk.Frame(root, bg=CARD)
@@ -1186,7 +1325,7 @@ def run_ui(start_minimized):
                 pass
             popup["win"] = None
 
-    def show_popup(title, text, reply_to=None, seconds=5):
+    def show_popup(title, text, reply_to=None, seconds=5, clip=None):
         close_popup()
         pw = tk.Toplevel(root)
         pw.overrideredirect(True)
@@ -1214,6 +1353,8 @@ def run_ui(start_minimized):
 
         def show_reply(*_):
             keep()
+            if clip:
+                radio.mark_seen(clip)
             if reply_box.winfo_ismapped() or not reply_to:
                 return
             reply_box.pack(fill="x", padx=10, pady=(8, 10))
@@ -1283,14 +1424,16 @@ def run_ui(start_minimized):
                 c = info["clip"]
                 flash()
                 show_popup("🔊 " + radio.clip_title(c), "%d초 · %s" % (max(1, int(c["seconds"])),
-                           "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"), reply_to=c["from"])
+                           "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"), reply_to=c["from"], clip=c)
                 if not info["auto"]:
                     events.put(("show", None))
             elif kind == "text":
                 flash()
-                show_popup("💬 " + radio.clip_title(info), info.get("text", ""), reply_to=info["from"])
+                show_popup("💬 " + radio.clip_title(info), info.get("text", ""), reply_to=info["from"], clip=info)
             elif kind == "state":
                 set_tray(radio.connected, radio.where)
+            elif kind == "schedules":
+                render_schedules()
             elif kind == "hotkey_captured":
                 entry, combo = info
                 try:
@@ -1370,7 +1513,10 @@ def run_ui(start_minimized):
                 talk.config(text="누르고 말하기\n(%s)" % who, bg=BLUE)
             notice.config(text=radio.notice)
 
-            csig = tuple((c["id"], c["ts"], radio.playing is c) for c in radio.clips[:20])
+            window_visible = root.state() == "normal"
+            csig = tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
+                          window_visible and c.get("kind") == "text" and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent)
+                         for c in radio.clips[:20])
             if csig != cache["clips"]:
                 cache["clips"] = csig
                 for c in clips_list.winfo_children():
@@ -1386,15 +1532,23 @@ def run_ui(start_minimized):
                         when_ = time.strftime("%m/%d %H:%M", time.localtime(c["ts"]))
                         if c.get("kind") == "text":
                             desc = "%s\n💬 %s\n%s" % (radio.clip_title(c), c.get("text", ""), when_)
+                        elif c.get("kind") == "voice_sent":
+                            desc = "%s\n%s" % (radio.clip_title(c), when_)
                         else:
                             desc = "%s%s\n%s · %d초" % ("🔊 " if playing else "", radio.clip_title(c), when_, max(1, int(c["seconds"])))
+                        if c.get("mine"):
+                            rt = radio.receipt_text(c)
+                            if rt:
+                                desc += "\n" + rt
+                        elif c.get("kind") == "text" and window_visible:
+                            radio.mark_seen(c)   # 창이 화면에 보이는 상태에서 표시됨 = 봤음
                         tk.Label(row, text=desc, font=(F, 9), fg=SUB if c.get("mine") else TXT, bg=CARD,
                                  justify="left", wraplength=240).pack(side="left", padx=4)
                         tk.Button(row, text="삭제", font=(F, 9), command=lambda c=c: radio.delete_clip(c)).pack(side="right", padx=2)
                         if not c.get("mine"):
                             tk.Button(row, text="답장", font=(F, 9),
                                       command=lambda c=c: (radio.set_target(c["from"]), entry.focus_set())).pack(side="right", padx=2)
-                        if c.get("kind") != "text":
+                        if c.get("kind") == "clip":
                             tk.Button(row, text="정지" if playing else "듣기", font=(F, 9),
                                       command=(lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c))).pack(side="right", padx=2)
                 elif clips_box.winfo_ismapped():

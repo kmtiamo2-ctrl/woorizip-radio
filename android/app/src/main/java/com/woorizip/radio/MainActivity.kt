@@ -4,9 +4,9 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -20,57 +20,83 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
-import android.widget.Button
+import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
-import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.widget.NestedScrollView
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.card.MaterialCardView
+import com.google.android.material.chip.Chip
+import com.google.android.material.chip.ChipGroup
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
+import com.google.android.material.timepicker.MaterialTimePicker
+import com.google.android.material.timepicker.TimeFormat
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
-class MainActivity : ComponentActivity() {
+/**
+ * 우리집 — 메인 화면.
+ * 어두운 남색 바탕에 별 아이콘과 같은 앰버 포인트. 둥근 카드, 알약 모양 가족 버튼, 큰 말하기 버튼.
+ */
+class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: Prefs
-    private lateinit var statusText: TextView
-    private lateinit var incomingText: TextView
-    private lateinit var noticeText: TextView
-    private lateinit var memberRow1: LinearLayout
-    private lateinit var memberRow2: LinearLayout
-    private lateinit var talkButton: TextView
-    private lateinit var standbySwitch: Switch
-    private lateinit var settingsBox: LinearLayout
-    private lateinit var clipsBox: LinearLayout
-    private lateinit var clipsList: LinearLayout
-    private lateinit var input: EditText
-    private lateinit var chipRow: LinearLayout
-    private var chipSig = ""
-
-    private fun renderChips() {
-        val list = prefs.quickReplies
-        val sig = list.joinToString("|")
-        if (sig == chipSig) return
-        chipSig = sig
-        chipRow.removeAllViews()
-        list.forEach { q ->
-            chipRow.addView(TextView(this).apply {
-                text = q; textSize = 14f; setTextColor(textMain); background = rounded(Color.parseColor("#334155"), 20)
-                setPadding(dp(14), dp(8), dp(14), dp(8))
-                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
-                setOnClickListener { if (Radio.sendText(q)) toast("보냈어요: $q") }
-            })
-        }
-    }
-    private val refresh: () -> Unit = { render() }
     private val h = Handler(Looper.getMainLooper())
+    private val refresh: () -> Unit = { render() }
+    private val fmt = SimpleDateFormat("M/d HH:mm", Locale.KOREA)
 
-    // 화면이 켜져 앱이 보일 때는 볼륨 버튼의 누름/뗌을 정확히 받을 수 있음
+    // ---------- 팔레트 ----------
+    private val cBg = Color.parseColor("#0B1220")
+    private val cCard = Color.parseColor("#141C2E")
+    private val cCard2 = Color.parseColor("#1C2740")
+    private val cText = Color.parseColor("#F3F5F9")
+    private val cSub = Color.parseColor("#9AA6BC")
+    private val cAmber = Color.parseColor("#F5B301")
+    private val cAmberDark = Color.parseColor("#C98F00")
+    private val cOnAmber = Color.parseColor("#1A1200")
+    private val cGreen = Color.parseColor("#34D399")
+    private val cRed = Color.parseColor("#F26D6D")
+    private val cBlue = Color.parseColor("#8FB3FF")
+    private val cOutline = Color.parseColor("#2B3752")
+
+    // ---------- 화면 요소 ----------
+    private lateinit var root: LinearLayout
+    private lateinit var statusDot: View
+    private lateinit var statusText: TextView
+    private lateinit var incomingCard: MaterialCardView
+    private lateinit var incomingText: TextView
+    private lateinit var memberGroup: ChipGroup
+    private lateinit var talkCard: MaterialCardView
+    private lateinit var talkTitle: TextView
+    private lateinit var talkSub: TextView
+    private lateinit var noticeText: TextView
+    private lateinit var quickRow: LinearLayout
+    private lateinit var input: TextInputEditText
+    private lateinit var msgCard: MaterialCardView
+    private lateinit var msgList: LinearLayout
+    private lateinit var standbySwitch: MaterialSwitch
+    private lateinit var settingsBox: LinearLayout
+    private var quickSig = ""
+    private var memberSig = ""
+    private var msgSig = ""
+
     private var volTalking = false
     private val volHoldStart = Runnable { volTalking = true; Radio.startTalk() }
 
@@ -80,21 +106,13 @@ class MainActivity : ComponentActivity() {
         render()
     }
 
-    // ---------- 색 ----------
-    private val bg = Color.parseColor("#0F172A")
-    private val card = Color.parseColor("#1E293B")
-    private val textMain = Color.parseColor("#F1F5F9")
-    private val textSub = Color.parseColor("#94A3B8")
-    private val accent = Color.parseColor("#F59E0B")
-    private val green = Color.parseColor("#22C55E")
-    private val red = Color.parseColor("#EF4444")
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
         Radio.init(this)
         Notifs.createChannels(this)
         volumeControlStream = AudioManager.STREAM_MUSIC
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(buildUi())
         if (!prefs.isConfigured) settingsBox.visibility = View.VISIBLE
         else if (prefs.standby && !RadioService.running) ensurePermissionsThenStart()
@@ -104,8 +122,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         Radio.uiVisible = true
         Radio.addListener(refresh)
-        // 앱이 보이는 지금 서비스를 다시 올려 마이크 권한을 확실히 받아 둠 (백그라운드에서 시작됐으면 마이크가 무음이기 때문)
-        if (RadioService.running && hasMic()) RadioService.start(this)
+        if (RadioService.running && hasMic()) RadioService.start(this)   // 보이는 동안 마이크 권한 확실히
         render()
     }
 
@@ -115,46 +132,100 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    // ---------- 화면 구성 ----------
+    // ---------- 작은 도우미 ----------
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun dpf(v: Int) = v * resources.displayMetrics.density
 
-    private fun rounded(color: Int, radius: Int = 16) = GradientDrawable().apply {
-        setColor(color); cornerRadius = dp(radius).toFloat()
-    }
+    private fun lp(w: Int = ViewGroup.LayoutParams.MATCH_PARENT, h: Int = ViewGroup.LayoutParams.WRAP_CONTENT,
+                   top: Int = 0, bottom: Int = 0, start: Int = 0, end: Int = 0) =
+        LinearLayout.LayoutParams(w, h).apply { topMargin = dp(top); bottomMargin = dp(bottom); marginStart = dp(start); marginEnd = dp(end) }
 
-    private fun label(text: String, size: Float = 15f, color: Int = textMain, bold: Boolean = false) =
+    private fun label(text: CharSequence, size: Float = 15f, color: Int = cText, bold: Boolean = false) =
         TextView(this).apply {
             this.text = text; textSize = size; setTextColor(color)
-            if (bold) typeface = Typeface.DEFAULT_BOLD
+            typeface = if (bold) Typeface.create("sans-serif-medium", Typeface.BOLD) else Typeface.create("sans-serif", Typeface.NORMAL)
+            setLineSpacing(0f, 1.15f)
         }
 
-    private fun lp(w: Int = LinearLayout.LayoutParams.MATCH_PARENT, h: Int = LinearLayout.LayoutParams.WRAP_CONTENT, top: Int = 0) =
-        LinearLayout.LayoutParams(w, h).apply { topMargin = dp(top) }
+    private fun card(bg: Int = cCard, radius: Int = 22, pad: Int = 18): Pair<MaterialCardView, LinearLayout> {
+        val c = MaterialCardView(this).apply {
+            setCardBackgroundColor(bg); this.radius = dpf(radius); cardElevation = 0f
+            strokeWidth = dp(1); strokeColor = cOutline
+        }
+        val inner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(pad), dp(pad), dp(pad), dp(pad)) }
+        c.addView(inner)
+        return c to inner
+    }
+
+    private fun sectionTitle(text: String) = label(text, 13f, cSub, true).apply { letterSpacing = 0.04f }
+
+    private fun pill(text: String, filled: Boolean, onClick: () -> Unit) = MaterialButton(
+        this, null, if (filled) com.google.android.material.R.attr.materialButtonStyle else com.google.android.material.R.attr.materialButtonOutlinedStyle
+    ).apply {
+        this.text = text; isAllCaps = false; textSize = 14f; cornerRadius = dp(14)
+        if (filled) { backgroundTintList = ColorStateList.valueOf(cAmber); setTextColor(cOnAmber) }
+        else { strokeColor = ColorStateList.valueOf(cOutline); setTextColor(cText) }
+        setOnClickListener { onClick() }
+    }
+
+    private fun textButton(text: String, color: Int = cBlue, onClick: () -> Unit) = MaterialButton(
+        this, null, androidx.appcompat.R.attr.borderlessButtonStyle
+    ).apply {
+        this.text = text; isAllCaps = false; textSize = 13f; setTextColor(color)
+        minWidth = 0; minimumWidth = 0; setPadding(dp(10), 0, dp(10), 0)
+        setOnClickListener { onClick() }
+    }
+
+    private fun inputField(hint: String, value: String = "", type: Int = InputType.TYPE_CLASS_TEXT): Pair<TextInputLayout, TextInputEditText> {
+        val til = TextInputLayout(this, null, com.google.android.material.R.attr.textInputOutlinedStyle).apply {
+            this.hint = hint; boxStrokeColor = cAmber; setBoxCornerRadii(dpf(14), dpf(14), dpf(14), dpf(14))
+            hintTextColor = ColorStateList.valueOf(cAmber); defaultHintTextColor = ColorStateList.valueOf(cSub)
+        }
+        val et = TextInputEditText(til.context).apply { setText(value); inputType = type; setTextColor(cText); textSize = 15f }
+        til.addView(et)
+        return til to et
+    }
+
+    // ---------- 화면 구성 ----------
 
     @SuppressLint("ClickableViewAccessibility")
     private fun buildUi(): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(28), dp(20), dp(28))
+        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(16), dp(20), dp(28)) }
+
+        // 머리글: 별 + 우리집 + 버전
+        val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        head.addView(ImageView(this).apply { setImageResource(R.mipmap.ic_launcher) }, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginEnd = dp(12) })
+        val ver = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" }
+        val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titles.addView(label("우리집", 26f, cText, true))
+        val statusRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        statusDot = View(this).apply { background = circle(cSub) }
+        statusRow.addView(statusDot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(6) })
+        statusText = label("", 13f, cSub)
+        statusRow.addView(statusText)
+        titles.addView(statusRow, lp(top = 2))
+        head.addView(titles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        head.addView(label(ver, 12f, cSub))
+        root.addView(head)
+
+        // 지금 말하는 사람 배너
+        incomingCard = MaterialCardView(this).apply {
+            setCardBackgroundColor(cAmber); radius = dpf(18); cardElevation = 0f; visibility = View.GONE
         }
-        val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "" }
-        root.addView(label("우리집 무전기  $ver", 26f, textMain, true))
-        statusText = label("", 14f, textSub).also { root.addView(it, lp(top = 4)) }
+        incomingText = label("", 16f, cOnAmber, true).apply { gravity = Gravity.CENTER; setPadding(dp(14), dp(14), dp(14), dp(14)) }
+        incomingCard.addView(incomingText)
+        root.addView(incomingCard, lp(top = 16))
 
-        incomingText = label("", 17f, Color.BLACK, true).apply {
-            background = rounded(accent); gravity = Gravity.CENTER
-            setPadding(dp(12), dp(12), dp(12), dp(12)); visibility = View.GONE
-        }
-        root.addView(incomingText, lp(top = 16))
+        // 누구에게
+        root.addView(sectionTitle("누구에게  ·  여러 명 고를 수 있어요"), lp(top = 22))
+        memberGroup = ChipGroup(this).apply { chipSpacingHorizontal = dp(8); chipSpacingVertical = dp(6) }
+        root.addView(memberGroup, lp(top = 8))
 
-        root.addView(label("누구에게 말할까요? (여러 명 고를 수 있어요)", 15f, textSub), lp(top = 20))
-        memberRow1 = LinearLayout(this).also { root.addView(it, lp(top = 8)) }
-        memberRow2 = LinearLayout(this).also { root.addView(it, lp(top = 8)) }
-
-        talkButton = TextView(this).apply {
-            gravity = Gravity.CENTER; textSize = 24f; typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
+        // 말하기 버튼
+        talkCard = MaterialCardView(this).apply {
+            radius = dpf(30); cardElevation = dpf(6); setCardBackgroundColor(cAmber)
+            isClickable = true
             setOnTouchListener { v, e ->
                 when (e.actionMasked) {
                     MotionEvent.ACTION_DOWN -> { v.isPressed = true; Radio.startTalk() }
@@ -163,322 +234,394 @@ class MainActivity : ComponentActivity() {
                 true
             }
         }
-        root.addView(talkButton, lp(h = dp(200), top = 20))
-
-        noticeText = label("", 15f, accent).apply { gravity = Gravity.CENTER }
+        val talkInner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dp(16), dp(34), dp(16), dp(34)) }
+        talkTitle = label("", 24f, cOnAmber, true)
+        talkSub = label("", 14f, cOnAmber).apply { alpha = 0.8f }
+        talkInner.addView(talkTitle); talkInner.addView(talkSub, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 4))
+        talkCard.addView(talkInner)
+        root.addView(talkCard, lp(top = 18))
+        noticeText = label("", 14f, cAmber).apply { gravity = Gravity.CENTER }
         root.addView(noticeText, lp(top = 10))
 
-        // 글로 보내기 (말할 수 없을 때)
-        val textBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; background = rounded(card)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-        textBox.addView(label("말하기 어려우면 글로 보내기", 13f, textSub))
-        val chips = android.widget.HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
-        chipRow = LinearLayout(this)
-        renderChips()
-        chips.addView(chipRow)
-        textBox.addView(chips, lp(top = 8))
-        val inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        input = EditText(this).apply {
-            hint = "직접 입력"; setTextColor(textMain); setHintTextColor(textSub); maxLines = 2
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        val send = Button(this).apply {
-            text = "보내기"
-            setOnClickListener {
-                val t = input.text.toString()
-                if (t.isBlank()) return@setOnClickListener
-                if (Radio.sendText(t)) { input.setText(""); toast("보냈어요") }
-            }
-        }
-        inputRow.addView(input); inputRow.addView(send)
-        textBox.addView(inputRow, lp(top = 6))
-        root.addView(textBox, lp(top = 12))
+        // 글로 보내기
+        val (composeCard, compose) = card()
+        compose.addView(sectionTitle("글로 보내기  ·  말하기 어려울 때"))
+        val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+        quickRow = LinearLayout(this)
+        scroll.addView(quickRow)
+        compose.addView(scroll, lp(top = 10))
+        val (til, et) = inputField("직접 입력")
+        input = et
+        compose.addView(til, lp(top = 10))
+        val btnRow = LinearLayout(this)
+        btnRow.addView(pill("보내기", true) { val t = input.text.toString(); if (t.isNotBlank() && Radio.sendText(t)) { input.setText(""); toast("보냈어요") } },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(pill("⏰ 예약", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
+        compose.addView(btnRow, lp(top = 10))
+        compose.addView(label("보낸 메시지 아래 표시 ·  ✓ 받음   ✓✓ 봄(들음)", 11f, cSub), lp(top = 8))
+        root.addView(composeCard, lp(top = 18))
 
-        // 받은 메시지 (밖에 있을 때 / 연결이 끊겼을 때 온 말)
-        clipsBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; background = rounded(card)
-            setPadding(dp(16), dp(12), dp(16), dp(12)); visibility = View.GONE
-        }
-        clipsBox.addView(label("받은 메시지", 15f, textSub))
-        clipsList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        clipsBox.addView(clipsList, lp(top = 6))
-        root.addView(clipsBox, lp(top = 16))
+        // 메시지
+        val (mc, mi) = card(pad = 14)
+        msgCard = mc
+        mi.addView(sectionTitle("메시지").apply { setPadding(dp(4), 0, 0, 0) })
+        msgList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        mi.addView(msgList, lp(top = 6))
+        msgCard.visibility = View.GONE
+        root.addView(msgCard, lp(top = 14))
 
-        // 스위치들
-        val switches = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; background = rounded(card)
-            setPadding(dp(16), dp(8), dp(16), dp(8))
-        }
-        standbySwitch = Switch(this).apply {
-            text = "수신 대기 (화면 꺼져도 듣기·볼륨키로 말하기)"; setTextColor(textMain); textSize = 15f
-            setPadding(0, dp(8), 0, dp(8))
+        // 수신 대기 / 배터리 / 설정
+        val (ctrlCard, ctrl) = card(pad = 14)
+        standbySwitch = MaterialSwitch(this).apply {
+            text = "수신 대기 — 화면이 꺼져도 듣고, 볼륨키로 말하기"; setTextColor(cText); textSize = 14f
+            setPadding(dp(6), dp(6), dp(6), dp(6))
             setOnClickListener {
                 if (isChecked) ensurePermissionsThenStart() else { prefs.standby = false; RadioService.stop(this@MainActivity) }
                 h.postDelayed({ render() }, 300)
             }
         }
-        switches.addView(standbySwitch)
-        root.addView(switches, lp(top = 20))
-
-        val battery = Button(this).apply {
-            text = "배터리 최적화 제외 (수신이 끊기면 눌러 주세요)"
-            setOnClickListener { requestBatteryExemption() }
-        }
-        root.addView(battery, lp(top = 12))
-
-        val toggleSettings = Button(this).apply {
-            text = "설정"
-            setOnClickListener {
-                if (settingsBox.visibility == View.VISIBLE) {
-                    settingsBox.visibility = View.GONE
-                } else {
-                    val idx = root.indexOfChild(settingsBox)
-                    root.removeView(settingsBox)
-                    settingsBox = buildSettings()
-                    root.addView(settingsBox, idx, lp(top = 8))
-                }
-            }
-        }
-        root.addView(toggleSettings, lp(top = 4))
+        ctrl.addView(standbySwitch)
+        val ctrlBtns = LinearLayout(this)
+        ctrlBtns.addView(textButton("배터리 최적화 제외") { requestBatteryExemption() })
+        ctrlBtns.addView(textButton("설정") { toggleSettings() })
+        ctrl.addView(ctrlBtns, lp(top = 4))
+        root.addView(ctrlCard, lp(top = 14))
 
         settingsBox = buildSettings().apply { visibility = View.GONE }
-        root.addView(settingsBox, lp(top = 8))
+        root.addView(settingsBox, lp(top = 14))
 
-        val scroll = ScrollView(this).apply { setBackgroundColor(bg); addView(root) }
-        // 안드로이드 15: 화면이 상태바·내비게이션바 아래까지 그려지므로 그만큼 여백 추가
-        ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+        val scrollRoot = NestedScrollView(this).apply { setBackgroundColor(cBg); addView(root); isFillViewport = true }
+        ViewCompat.setOnApplyWindowInsetsListener(scrollRoot) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             insets
         }
-        return scroll
+        return scrollRoot
     }
 
-    private fun field(parent: LinearLayout, title: String, value: String, type: Int): EditText {
-        parent.addView(label(title, 13f, textSub), lp(top = 10))
-        return EditText(this).apply {
-            setText(value); inputType = type; setTextColor(textMain); setHintTextColor(textSub)
-            parent.addView(this, lp())
+    private fun circle(color: Int) = android.graphics.drawable.GradientDrawable().apply { shape = android.graphics.drawable.GradientDrawable.OVAL; setColor(color) }
+
+    private fun toggleSettings() {
+        if (settingsBox.visibility == View.VISIBLE) { settingsBox.visibility = View.GONE; return }
+        val idx = root.indexOfChild(settingsBox)
+        root.removeView(settingsBox)
+        settingsBox = buildSettings()
+        root.addView(settingsBox, idx, lp(top = 14))
+    }
+
+    // ---------- 가족 칩 / 빠른 답장 칩 ----------
+
+    private fun memberChip(text: String, value: String, isOnline: Boolean, selected: Boolean): Chip {
+        val place = when {
+            value == "all" || !isOnline -> ""
+            Radio.memberWhere[value] == "out" -> " · 밖"
+            else -> " · 집"
+        }
+        return Chip(this).apply {
+            this.text = if (value == "all") text else "${if (isOnline) "●" else "○"} $text$place"
+            isCheckable = true; isChecked = selected; isCheckedIconVisible = false
+            textSize = 14f
+            chipCornerRadius = dpf(18)
+            chipStrokeWidth = dpf(1)
+            chipStrokeColor = ColorStateList.valueOf(if (selected) cAmber else cOutline)
+            chipBackgroundColor = ColorStateList.valueOf(if (selected) cAmber else cCard)
+            setTextColor(if (selected) cOnAmber else if (isOnline || value == "all") cText else cSub)
+            setEnsureMinTouchTargetSize(false)
+            setOnClickListener { Radio.toggleTarget(value); render() }
         }
     }
 
-    private fun whoPicker(parent: LinearLayout, title: String): Pair<RadioGroup, List<RadioButton>> {
-        parent.addView(label(title, 14f, textSub), lp(top = 10))
-        val group = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+    private fun renderMembers() {
+        val me = prefs.name
+        val others = Radio.members.filter { it != me }
+        if (Radio.target != "all") {
+            val kept = prefs.targetList.filter { it in others }
+            if (kept.size != prefs.targetList.size) prefs.target = if (kept.isEmpty()) "all" else kept.joinToString(",")
+        }
+        val sig = listOf(others.joinToString(), Radio.online.joinToString(), Radio.target, Radio.memberWhere.toString()).joinToString("|")
+        if (sig == memberSig) return
+        memberSig = sig
+        memberGroup.removeAllViews()
+        memberGroup.addView(memberChip("전체", "all", true, Radio.target == "all"))
+        others.forEach { memberGroup.addView(memberChip(it, it, it in Radio.online, it in prefs.targetList)) }
+    }
+
+    private fun renderQuick() {
+        val list = prefs.quickReplies
+        val sig = list.joinToString("|")
+        if (sig == quickSig) return
+        quickSig = sig
+        quickRow.removeAllViews()
+        list.forEach { q ->
+            quickRow.addView(Chip(this).apply {
+                text = q; textSize = 13f; chipCornerRadius = dpf(16)
+                chipBackgroundColor = ColorStateList.valueOf(cCard2); setTextColor(cText)
+                chipStrokeWidth = dpf(1); chipStrokeColor = ColorStateList.valueOf(cOutline)
+                setEnsureMinTouchTargetSize(false)
+                setOnClickListener { if (Radio.sendText(q)) toast("보냈어요: $q") }
+            }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, end = 8))
+        }
+    }
+
+    // ---------- 설정 ----------
+
+    private fun whoPicker(parent: LinearLayout, title: String): ChipGroup {
+        parent.addView(sectionTitle(title), lp(top = 6))
         val names = Radio.members.ifEmpty { listOf("엄마", "아빠", "첫째", "둘째", "셋째") }
-        val buttons = names.map { n ->
-            RadioButton(this).apply { text = n; setTextColor(textMain); id = View.generateViewId(); textSize = 16f }
+        val group = ChipGroup(this).apply { isSingleSelection = true; chipSpacingHorizontal = dp(8) }
+        names.forEach { n ->
+            group.addView(Chip(this).apply {
+                text = n; isCheckable = true; isChecked = (n == prefs.name); textSize = 15f; tag = n
+                chipCornerRadius = dpf(18); isCheckedIconVisible = false
+                chipBackgroundColor = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(cAmber, cCard2))
+                setTextColor(ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(cOnAmber, cText)))
+                setEnsureMinTouchTargetSize(false)
+            })
         }
-        buttons.forEach { group.addView(it) }
-        buttons.firstOrNull { it.text == prefs.name }?.let { group.check(it.id) }
-        parent.addView(group)
-        return group to buttons
+        parent.addView(group, lp(top = 8))
+        return group
     }
+
+    private fun pickedName(group: ChipGroup): String =
+        (0 until group.childCount).map { group.getChildAt(it) as Chip }.firstOrNull { it.isChecked }?.tag?.toString() ?: ""
 
     private fun buildSettings(): LinearLayout {
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; background = rounded(card)
-            setPadding(dp(16), dp(8), dp(16), dp(16))
-        }
+        val (cardV, box) = card()
+        val wrapper = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        wrapper.addView(cardV)
 
-        // ---- 처음 실행: 누구 것인지만 고르면 끝 ----
+        // 처음 실행: 누구 것인지만
         val firstRun = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val (whoGroup0, whoButtons0) = whoPicker(firstRun, "이 폰은 누구 것인가요?")
-        firstRun.addView(Button(this).apply {
-            text = "시작"
-            setOnClickListener {
-                val n = whoButtons0.firstOrNull { it.id == whoGroup0.checkedRadioButtonId }?.text?.toString() ?: ""
-                if (n.isBlank()) { toast("누구 것인지 골라 주세요"); return@setOnClickListener }
-                prefs.name = n
-                settingsBox.visibility = View.GONE
-                ensurePermissionsThenStart()
-                render()
-            }
-        }, lp(top = 10))
+        val who0 = whoPicker(firstRun, "이 폰은 누구 것인가요?")
+        firstRun.addView(pill("시작", true) {
+            val n = pickedName(who0)
+            if (n.isBlank()) { toast("누구 것인지 골라 주세요"); return@pill }
+            prefs.name = n
+            settingsBox.visibility = View.GONE
+            ensurePermissionsThenStart()
+            render()
+        }, lp(top = 14))
         box.addView(firstRun)
 
-        // ---- 평소 설정: 누구나 바꿔도 되는 것만 ----
+        // 평소 설정
         val normal = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        normal.addView(label("이 폰: ${prefs.name}", 15f, textMain, true))
-        val quick = field(normal, "빠른 답장 문구 (쉼표로 구분)", prefs.quickReplies.joinToString(", "), InputType.TYPE_CLASS_TEXT)
-        normal.addView(label("화면 꺼짐 상태 볼륨 버튼", 13f, textSub), lp(top = 14))
-        val modes = RadioGroup(this)
-        val hold = RadioButton(this).apply { text = "길게 누르는 동안 말하기"; setTextColor(textMain); id = View.generateViewId() }
-        val dbl = RadioButton(this).apply { text = "두 번 눌러 켜기 / 두 번 눌러 끄기"; setTextColor(textMain); id = View.generateViewId() }
+        normal.addView(label("이 폰: ${prefs.name}", 16f, cText, true))
+        val (quickTil, quick) = inputField("빠른 답장 문구 (쉼표로 구분)", prefs.quickReplies.joinToString(", "))
+        normal.addView(quickTil, lp(top = 12))
+        normal.addView(sectionTitle("화면 꺼짐 상태 볼륨 버튼"), lp(top = 14))
+        val modes = MaterialButtonToggleGroup(this).apply { isSingleSelection = true; isSelectionRequired = true }
+        val hold = MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply { text = "길게 누르는 동안"; isAllCaps = false; id = View.generateViewId() }
+        val dbl = MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply { text = "두 번 눌러 켜고 끄기"; isAllCaps = false; id = View.generateViewId() }
         modes.addView(hold); modes.addView(dbl)
         modes.check(if (prefs.keyMode == "double") dbl.id else hold.id)
-        normal.addView(modes)
-        normal.addView(label("길게 누르기가 화면 꺼진 상태에서 잘 안 되는 기종이면 두 번 누르기로 바꿔 주세요.", 12f, textSub))
-        normal.addView(Button(this).apply {
-            text = "저장"
-            setOnClickListener {
-                prefs.quickReplies = quick.text.toString().split(",").map { it.trim() }.filter { it.isNotEmpty() }
-                    .ifEmpty { Prefs.DEFAULT_QUICK.split(",") }
-                prefs.keyMode = if (modes.checkedRadioButtonId == dbl.id) "double" else "hold"
-                renderChips()
-                settingsBox.visibility = View.GONE
-                toast("저장했어요")
-            }
-        }, lp(top = 12))
+        normal.addView(modes, lp(top = 6))
+        normal.addView(label("길게 누르기가 화면 꺼진 상태에서 잘 안 되는 기종이면 두 번 누르기로 바꿔 주세요.", 12f, cSub), lp(top = 4))
+        normal.addView(pill("저장", true) {
+            prefs.quickReplies = quick.text.toString().split(",").map { it.trim() }.filter { it.isNotEmpty() }.ifEmpty { Prefs.DEFAULT_QUICK.split(",") }
+            prefs.keyMode = if (modes.checkedButtonId == dbl.id) "double" else "hold"
+            renderQuick()
+            settingsBox.visibility = View.GONE
+            toast("저장했어요")
+        }, lp(top = 14))
 
-        // ---- 관리자 설정: 가족 암호를 알아야 열림 ----
+        // 관리자: 암호 필요
         val admin = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
-        val (whoGroup, whoButtons) = whoPicker(admin, "이 폰은 누구 것인가요? (바꾸면 바로 적용)")
-        val host = field(admin, "집 주소", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        val outHost = field(admin, "밖 주소 (Tailscale)", prefs.outHost, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        val key = field(admin, "가족 암호", prefs.key, InputType.TYPE_CLASS_TEXT)
-        admin.addView(Button(this).apply {
-            text = "변경 저장하고 다시 연결"
-            setOnClickListener {
-                val n = whoButtons.firstOrNull { it.id == whoGroup.checkedRadioButtonId }?.text?.toString() ?: ""
-                if (n.isBlank() || host.text.isBlank() || key.text.isBlank()) { toast("사용자·집 주소·암호는 비울 수 없어요"); return@setOnClickListener }
-                prefs.name = n; prefs.host = host.text.toString(); prefs.outHost = outHost.text.toString(); prefs.key = key.text.toString()
-                admin.visibility = View.GONE
-                settingsBox.visibility = View.GONE
-                if (RadioService.running) Radio.reconnect() else ensurePermissionsThenStart()
-                render()
-            }
+        val who = whoPicker(admin, "이 폰은 누구 것인가요? (바꾸면 바로 적용)")
+        val (hostTil, host) = inputField("집 주소", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val (outTil, outHost) = inputField("밖 주소 (Tailscale)", prefs.outHost, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val (keyTil, key) = inputField("가족 암호", prefs.key)
+        admin.addView(hostTil, lp(top = 10)); admin.addView(outTil, lp(top = 10)); admin.addView(keyTil, lp(top = 10))
+        admin.addView(pill("변경 저장하고 다시 연결", true) {
+            val n = pickedName(who)
+            if (n.isBlank() || host.text.isNullOrBlank() || key.text.isNullOrBlank()) { toast("사용자·집 주소·암호는 비울 수 없어요"); return@pill }
+            prefs.name = n; prefs.host = host.text.toString(); prefs.outHost = outHost.text.toString(); prefs.key = key.text.toString()
+            settingsBox.visibility = View.GONE
+            if (RadioService.running) Radio.reconnect() else ensurePermissionsThenStart()
+            render()
         }, lp(top = 12))
-        normal.addView(Button(this).apply {
-            text = "사용자·주소 변경 (가족 암호 필요)"
-            setOnClickListener {
-                val input = EditText(this@MainActivity).apply {
-                    inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
-                    hint = "가족 암호"
-                }
-                android.app.AlertDialog.Builder(this@MainActivity)
-                    .setTitle("가족 암호를 입력하세요")
-                    .setView(input)
-                    .setPositiveButton("확인") { _, _ ->
-                        if (input.text.toString() == prefs.key) admin.visibility = View.VISIBLE
-                        else toast("암호가 달라요")
-                    }
-                    .setNegativeButton("취소", null)
-                    .show()
-            }
-        }, lp(top = 16))
+        normal.addView(textButton("사용자·주소 변경 (가족 암호 필요)", cSub) {
+            val pw = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD; hint = "가족 암호" }
+            val wrap = FrameLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(pw) }
+            MaterialAlertDialogBuilder(this).setTitle("가족 암호를 입력하세요").setView(wrap)
+                .setPositiveButton("확인") { _, _ -> if (pw.text.toString() == prefs.key) admin.visibility = View.VISIBLE else toast("암호가 달라요") }
+                .setNegativeButton("취소", null).show()
+        }, lp(top = 10))
         normal.addView(admin)
         box.addView(normal)
 
-        // 어느 쪽을 보여줄지
         firstRun.visibility = if (prefs.name.isBlank()) View.VISIBLE else View.GONE
         normal.visibility = if (prefs.name.isBlank()) View.GONE else View.VISIBLE
-        return box
+        return wrapper
     }
 
-    private fun memberButton(text: String, value: String, isOnline: Boolean): TextView {
-        val selected = if (value == "all") Radio.target == "all" else value in prefs.targetList
-        val place = when {
-            value == "all" || !isOnline -> ""
-            Radio.memberWhere[value] == "out" -> "\n밖"
-            else -> "\n집"
+    // ---------- 예약 메시지 ----------
+
+    private fun openScheduleDialog() {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(8), dp(24), 0) }
+        box.addView(label("받는 사람: ${Radio.targetLabel()}", 14f, cSub))
+        val (tTil, tEt) = inputField("내용", input.text?.toString()?.trim() ?: "")
+        box.addView(tTil, lp(top = 10))
+        val cal = Calendar.getInstance().apply { add(Calendar.MINUTE, 10); set(Calendar.MINUTE, (get(Calendar.MINUTE) / 5) * 5) }
+        var hour = cal.get(Calendar.HOUR_OF_DAY); var minute = cal.get(Calendar.MINUTE)
+        val timeBtn = pill(String.format(Locale.KOREA, "시간  %02d:%02d", hour, minute), false) {}
+        timeBtn.setOnClickListener {
+            val picker = MaterialTimePicker.Builder().setTimeFormat(TimeFormat.CLOCK_24H).setHour(hour).setMinute(minute).setTitleText("보낼 시간").build()
+            picker.addOnPositiveButtonClickListener {
+                hour = picker.hour; minute = picker.minute
+                timeBtn.text = String.format(Locale.KOREA, "시간  %02d:%02d", hour, minute)
+            }
+            picker.show(supportFragmentManager, "time")
         }
-        return TextView(this).apply {
-            this.text = if (value == "all") text else "${if (isOnline) "●" else "○"} $text$place"
-            gravity = Gravity.CENTER; textSize = 16f; typeface = Typeface.DEFAULT_BOLD
-            setLineSpacing(0f, 0.9f)
-            setTextColor(if (selected) Color.BLACK else if (isOnline) textMain else textSub)
-            background = rounded(if (selected) accent else card, 12)
-            setPadding(0, dp(14), 0, dp(14))
-            setOnClickListener { Radio.toggleTarget(value) }
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(4); marginEnd = dp(4)
+        box.addView(timeBtn, lp(top = 10))
+        val dayGroup = MaterialButtonToggleGroup(this).apply { isSingleSelection = true; isSelectionRequired = true }
+        val today = MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply { text = "오늘"; isAllCaps = false; id = View.generateViewId() }
+        val tomorrow = MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply { text = "내일"; isAllCaps = false; id = View.generateViewId() }
+        dayGroup.addView(today); dayGroup.addView(tomorrow); dayGroup.check(today.id)
+        box.addView(dayGroup, lp(top = 10))
+        box.addView(sectionTitle("반복"), lp(top = 12))
+        val repGroup = ChipGroup(this).apply { isSingleSelection = true; isSelectionRequired = true; chipSpacingHorizontal = dp(6) }
+        val reps = listOf("once" to "한 번", "daily" to "매일", "weekdays" to "평일", "weekends" to "주말")
+        reps.forEach { (v, l) ->
+            repGroup.addView(Chip(this).apply {
+                text = l; tag = v; isCheckable = true; isChecked = v == "once"; isCheckedIconVisible = false
+                chipBackgroundColor = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(cAmber, cCard2))
+                setTextColor(ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(cOnAmber, cText)))
+                setEnsureMinTouchTargetSize(false)
+            })
+        }
+        box.addView(repGroup, lp(top = 4))
+        val listTitle = sectionTitle("내 예약 목록")
+        box.addView(listTitle, lp(top = 14))
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        box.addView(list, lp(top = 4))
+
+        fun renderList() {
+            list.removeAllViews()
+            val items = Radio.schedules
+            if (items.isEmpty()) { list.addView(label("예약이 없어요", 13f, cSub)); return }
+            val repLabel = mapOf("once" to "한 번", "daily" to "매일", "weekdays" to "평일", "weekends" to "주말")
+            items.forEach { it ->
+                val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                val to = if (it.to == "all") "모두" else it.to
+                row.addView(label("${fmt.format(Date(it.at * 1000))} · ${repLabel[it.repeat] ?: ""} · $to\n${it.text}", 13f, cText),
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                row.addView(textButton("삭제", cRed) { Radio.scheduleDelete(it.sid) })
+                list.addView(row, lp(top = 4))
             }
         }
+        renderList()
+        val listener: () -> Unit = { renderList(); if (Radio.scheduleNotice.isNotBlank()) toast(Radio.scheduleNotice) }
+        Radio.addListener(listener)
+        Radio.scheduleRefresh()
+
+        val scroll = NestedScrollView(this).apply { addView(box) }
+        val dlg = MaterialAlertDialogBuilder(this).setTitle("⏰ 예약 메시지").setView(scroll)
+            .setPositiveButton("예약 추가", null).setNegativeButton("닫기", null)
+            .setOnDismissListener { Radio.removeListener(listener) }
+            .create()
+        dlg.setOnShowListener {
+            dlg.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val text = tEt.text?.toString()?.trim() ?: ""
+                if (text.isBlank()) { toast("내용을 입력하세요"); return@setOnClickListener }
+                val c = Calendar.getInstance().apply {
+                    set(Calendar.HOUR_OF_DAY, hour); set(Calendar.MINUTE, minute); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                    if (dayGroup.checkedButtonId == tomorrow.id) add(Calendar.DAY_OF_MONTH, 1)
+                }
+                val repeat = (0 until repGroup.childCount).map { repGroup.getChildAt(it) as Chip }.firstOrNull { it.isChecked }?.tag?.toString() ?: "once"
+                if (repeat == "once" && c.timeInMillis < System.currentTimeMillis() - 60_000) { toast("이미 지난 시간이에요. '내일'을 고르세요"); return@setOnClickListener }
+                if (!Radio.scheduleAdd(text, c.timeInMillis / 1000, repeat)) { toast("지금 연결이 없어요. 연결된 뒤 다시 시도하세요"); return@setOnClickListener }
+                tEt.setText("")
+                toast("예약했어요")
+            }
+        }
+        dlg.show()
     }
 
     // ---------- 화면 갱신 ----------
 
     private fun render() {
-        val me = prefs.name
-        val others = Radio.members.filter { it != me }
-        val buttons = listOf(memberButton("전체", "all", true)) +
-            others.map { memberButton(it, it, Radio.online.contains(it)) }
-        memberRow1.removeAllViews(); memberRow2.removeAllViews()
-        buttons.forEachIndexed { i, b -> (if (i < 3) memberRow1 else memberRow2).addView(b) }
-        // 선택했던 사람이 목록에 없으면 빼고, 아무도 없으면 전체로
-        if (Radio.target != "all") {
-            val kept = prefs.targetList.filter { it in others }
-            if (kept.size != prefs.targetList.size) prefs.target = if (kept.isEmpty()) "all" else kept.joinToString(",")
-        }
+        renderMembers()
+        renderQuick()
+        renderMessages()
 
-        val online = Radio.online.size
+        val me = prefs.name
         val place = if (Radio.atHome) "집" else "밖"
-        statusText.text = if (Radio.connected) "● $me · 지금 $place · 가족 ${online}명 접속 중" else Radio.status
-        statusText.setTextColor(if (Radio.connected) green else textSub)
-        renderClips()
+        if (Radio.connected) {
+            statusText.text = "$me · 지금 $place · 가족 ${Radio.online.size}명 접속 중"
+            statusText.setTextColor(cGreen); statusDot.background = circle(cGreen)
+        } else {
+            statusText.text = Radio.status
+            statusText.setTextColor(cSub); statusDot.background = circle(cSub)
+        }
 
         val from = Radio.incomingFrom
         if (from != null) {
-            incomingText.visibility = View.VISIBLE
-            incomingText.text = if (Radio.incomingMode == "all") "🔊 ${from}님 전체 방송 중" else "🔊 ${from}님이 나에게 말하는 중"
-        } else incomingText.visibility = View.GONE
+            incomingCard.visibility = View.VISIBLE
+            incomingText.text = if (Radio.incomingMode == "all") "🔊  ${from}님 전체 방송 중" else "🔊  ${from}님이 나에게 말하는 중"
+        } else incomingCard.visibility = View.GONE
 
         val who = Radio.targetLabel()
         when {
-            Radio.talking -> { talkButton.text = "🎙 말하는 중…\n손을 떼면 끝"; talkButton.background = rounded(red, 24) }
-            Radio.requesting -> { talkButton.text = "잠깐만요…"; talkButton.background = rounded(Color.parseColor("#B45309"), 24) }
-            !Radio.connected -> { talkButton.text = "연결 대기 중"; talkButton.background = rounded(Color.parseColor("#334155"), 24) }
-            else -> { talkButton.text = "누르고 말하기\n($who)"; talkButton.background = rounded(Color.parseColor("#2563EB"), 24) }
+            Radio.talking -> { talkTitle.text = "말하는 중…"; talkSub.text = "손을 떼면 끝"; talkCard.setCardBackgroundColor(cRed); talkTitle.setTextColor(Color.WHITE); talkSub.setTextColor(Color.WHITE) }
+            Radio.requesting -> { talkTitle.text = "잠깐만요…"; talkSub.text = ""; talkCard.setCardBackgroundColor(cAmberDark); talkTitle.setTextColor(cOnAmber); talkSub.setTextColor(cOnAmber) }
+            !Radio.connected -> { talkTitle.text = "연결 대기 중"; talkSub.text = Radio.status; talkCard.setCardBackgroundColor(cCard2); talkTitle.setTextColor(cSub); talkSub.setTextColor(cSub) }
+            else -> { talkTitle.text = "누르고 말하기"; talkSub.text = who; talkCard.setCardBackgroundColor(cAmber); talkTitle.setTextColor(cOnAmber); talkSub.setTextColor(cOnAmber) }
         }
         noticeText.text = Radio.notice
         standbySwitch.isChecked = RadioService.running
     }
 
-    private fun renderClips() {
+    private fun renderMessages() {
         val clips = Radio.clips
-        clipsBox.visibility = if (clips.isEmpty()) View.GONE else View.VISIBLE
-        clipsList.removeAllViews()
-        val fmt = java.text.SimpleDateFormat("M/d HH:mm", java.util.Locale.KOREA)
-        clips.take(10).forEach { c ->
+        msgCard.visibility = if (clips.isEmpty()) View.GONE else View.VISIBLE
+        val sig = clips.take(12).joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}" }
+        if (sig == msgSig) return
+        msgSig = sig
+        msgList.removeAllViews()
+        clips.take(12).forEachIndexed { i, c ->
             val playing = Radio.playingClip === c
-            val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-            val when_ = fmt.format(java.util.Date(c.ts * 1000))
-            val desc = if (c.isText) "${c.title}\n💬 ${c.text}\n$when_"
-                       else "${if (playing) "🔊 " else ""}${c.title}\n$when_ · ${c.seconds.toInt().coerceAtLeast(1)}초"
-            val info = label(desc, 14f, if (c.mine) textSub else textMain)
-            info.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            row.addView(info)
-            if (!c.isText) row.addView(Button(this).apply {
-                text = if (playing) "정지" else "듣기"
-                setOnClickListener { if (playing) Radio.stopClip() else Radio.playClip(c) }
-            })
-            if (!c.mine) row.addView(Button(this).apply {
-                text = "답장"
-                setOnClickListener { Radio.target = c.from; input.requestFocus(); toast("${c.from}님에게 보내기로 바뀌었어요") }  // 답장은 그 사람 한 명에게
-            })
-            row.addView(Button(this).apply { text = "삭제"; setOnClickListener { Radio.deleteClip(c) } })
-            clipsList.addView(row, lp(top = 4))
+            val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(4), dp(10), dp(4), dp(8)) }
+            val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+            top.addView(label(c.title, 13f, if (c.mine) cSub else cAmber, true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            top.addView(label(fmt.format(Date(c.ts * 1000)), 11f, cSub))
+            row.addView(top)
+            when {
+                c.isText -> row.addView(label(c.text ?: "", 16f, cText), lp(top = 2))
+                c.voiceSent -> {}
+                else -> row.addView(label("${if (playing) "🔊 재생 중" else "🎙 음성"} · ${c.seconds.toInt().coerceAtLeast(1)}초", 15f, cText), lp(top = 2))
+            }
+            if (c.mine) {
+                val rt = Radio.receiptText(c)
+                if (rt.isNotBlank()) row.addView(label(rt, 12f, cAmber), lp(top = 4))
+            } else if (c.isText) {
+                Radio.markSeen(c)   // 화면에 표시됨 = 봤음
+            }
+            val btns = LinearLayout(this).apply { gravity = Gravity.END }
+            if (!c.isText && !c.voiceSent) btns.addView(textButton(if (playing) "정지" else "듣기") { if (playing) Radio.stopClip() else Radio.playClip(c) })
+            if (!c.mine) btns.addView(textButton("답장") { Radio.target = c.from; input.requestFocus(); toast("${c.from}님에게 보내기로 바뀌었어요") })
+            btns.addView(textButton("삭제", cSub) { Radio.deleteClip(c) })
+            row.addView(btns, lp(top = 2))
+            msgList.addView(row)
+            if (i < clips.take(12).size - 1) msgList.addView(View(this).apply { setBackgroundColor(cOutline) }, lp(h = dp(1)))
         }
     }
 
-    // ---------- 볼륨 버튼 (앱이 화면에 보일 때) ----------
+    // ---------- 볼륨 버튼 (앱이 보일 때) ----------
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val code = event.keyCode
         if ((code != KeyEvent.KEYCODE_VOLUME_UP && code != KeyEvent.KEYCODE_VOLUME_DOWN) || !Radio.connected)
             return super.dispatchKeyEvent(event)
         when (event.action) {
-            KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) {
-                volTalking = false
-                h.postDelayed(volHoldStart, 500)
-            }
+            KeyEvent.ACTION_DOWN -> if (event.repeatCount == 0) { volTalking = false; h.postDelayed(volHoldStart, 500) }
             KeyEvent.ACTION_UP -> {
                 h.removeCallbacks(volHoldStart)
-                if (volTalking) {
-                    volTalking = false
-                    Radio.stopTalk()
-                } else {
-                    // 짧게 눌렀으면 원래 음량 조절
-                    getSystemService(AudioManager::class.java).adjustStreamVolume(
-                        AudioManager.STREAM_MUSIC,
-                        if (code == KeyEvent.KEYCODE_VOLUME_UP) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
-                        AudioManager.FLAG_SHOW_UI
-                    )
-                }
+                if (volTalking) { volTalking = false; Radio.stopTalk() }
+                else getSystemService(AudioManager::class.java).adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    if (code == KeyEvent.KEYCODE_VOLUME_UP) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+                    AudioManager.FLAG_SHOW_UI
+                )
             }
         }
         return true
@@ -486,41 +629,25 @@ class MainActivity : ComponentActivity() {
 
     // ---------- 권한·서비스 ----------
 
-    private fun hasMic() =
-        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    private fun hasMic() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
     private fun ensurePermissionsThenStart() {
-        if (!prefs.isConfigured) {
-            settingsBox.visibility = View.VISIBLE
-            toast("먼저 설정을 입력해 주세요")
-            render()
-            return
-        }
+        if (!prefs.isConfigured) { settingsBox.visibility = View.VISIBLE; toast("먼저 이 폰이 누구 것인지 골라 주세요"); render(); return }
         val need = mutableListOf<String>()
         if (!hasMic()) need += Manifest.permission.RECORD_AUDIO
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) need += Manifest.permission.POST_NOTIFICATIONS
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            need += Manifest.permission.POST_NOTIFICATIONS
         if (need.isEmpty()) startStandby() else askPerms.launch(need.toTypedArray())
     }
 
-    private fun startStandby() {
-        RadioService.start(this)
-        h.postDelayed({ render() }, 300)
-    }
+    private fun startStandby() { RadioService.start(this); h.postDelayed({ render() }, 300) }
 
     @SuppressLint("BatteryLife")
     private fun requestBatteryExemption() {
         val pm = getSystemService(PowerManager::class.java)
-        if (pm.isIgnoringBatteryOptimizations(packageName)) {
-            toast("이미 배터리 최적화에서 제외되어 있어요")
-            return
-        }
-        try {
-            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
-        } catch (_: Exception) {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-        }
+        if (pm.isIgnoringBatteryOptimizations(packageName)) { toast("이미 배터리 최적화에서 제외되어 있어요"); return }
+        try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
+        catch (_: Exception) { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()

@@ -1,0 +1,26 @@
+<resources>
+    <!-- 우리집: 어두운 남색 바탕 + 별과 같은 앰버 포인트 -->
+    <style name="Theme.Woorizip" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#F5B301</item>
+        <item name="colorOnPrimary">#1A1200</item>
+        <item name="colorPrimaryContainer">#4A3A00</item>
+        <item name="colorOnPrimaryContainer">#FFE08A</item>
+        <item name="colorSecondary">#8FB3FF</item>
+        <item name="colorOnSecondary">#0B1220</item>
+        <item name="colorSecondaryContainer">#1E2A44</item>
+        <item name="colorOnSecondaryContainer">#DCE6FF</item>
+        <item name="colorSurface">#0B1220</item>
+        <item name="colorOnSurface">#F3F5F9</item>
+        <item name="colorSurfaceVariant">#182236</item>
+        <item name="colorOnSurfaceVariant">#A3AEC4</item>
+        <item name="colorSurfaceContainer">#141C2E</item>
+        <item name="colorSurfaceContainerHigh">#1A2438</item>
+        <item name="colorSurfaceContainerHighest">#202C44</item>
+        <item name="colorOutline">#2B3752</item>
+        <item name="colorError">#F26D6D</item>
+        <item name="android:windowBackground">#0B1220</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

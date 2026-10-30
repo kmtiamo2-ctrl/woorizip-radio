@@ -61,8 +61,8 @@ object Notifs {
             Radio.talking -> "🎙 $who 에게 말하는 중"
             Radio.playingClip != null -> "🔊 ${Radio.playingClip?.title} 재생 중"
             Radio.incomingFrom != null -> "🔊 ${Radio.incomingFrom}님이 말하는 중"
-            Radio.connected -> "우리집 무전기 · 수신 대기 중$place"
-            else -> "우리집 무전기 · ${Radio.status}"
+            Radio.connected -> "우리집 · 수신 대기 중$place"
+            else -> "우리집 · ${Radio.status}"
         }
         val text = when {
             !Radio.micReady -> "말하기를 쓰려면 앱을 한 번 열어 주세요"
@@ -156,7 +156,7 @@ object Notifs {
         if (!canNotify(ctx)) return
         val n = NotificationCompat.Builder(ctx, CH_STANDBY)
             .setSmallIcon(R.drawable.ic_star)
-            .setContentTitle("우리집 무전기")
+            .setContentTitle("우리집")
             .setContentText("눌러서 수신 대기를 다시 켜 주세요")
             .setAutoCancel(true)
             .setContentIntent(openApp(ctx))

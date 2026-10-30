@@ -36,9 +36,42 @@ jobs:
         shell: bash
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
-          { echo '```'; cat pcout/selftest.log 2>/dev/null | tail -150; echo; echo "--- 서버 기록 ---"; tail -40 pcout/server.log 2>/dev/null; echo '```'; } > body.md
+          { echo '```'; cat pcout/selftest.log 2>/dev/null | tail -150; echo; echo "--- 서버 기록 ---"; tail -40 pcout/server.log 2>/dev/null; echo; echo "--- 설치·교체 점검 ---"; cat pcout/install.log 2>/dev/null | tail -60; echo '```'; } > body.md
           gh issue create --title "PC 자가 점검 실패 (${{ github.run_number }})" --body-file body.md
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray --collect-all customtkinter pc/radio_pc.py
+      - name: 실제 exe로 설치·교체 흐름 점검 (내려받은 파일 실행 → 자가 설치 → 새 파일로 교체 → 종료)
+        shell: pwsh
+        timeout-minutes: 6
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'la'
+          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'ra'
+          New-Item -ItemType Directory -Force (Join-Path $env:APPDATA 'WoorizipRadio') | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $env:APPDATA 'WoorizipRadio\config.json') '{"host":"127.0.0.1","out_host":"","name":"아빠","key":"105403","autostart":false}'
+          $inst = Join-Path $env:LOCALAPPDATA 'WoorizipRadio\WoorizipRadio.exe'
+          $log = @()
+          Copy-Item dist\WoorizipRadio.exe (Join-Path $env:RUNNER_TEMP 'dl1.exe')
+          Start-Process (Join-Path $env:RUNNER_TEMP 'dl1.exe') -ArgumentList '--minimized'
+          Start-Sleep 20
+          $p1 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
+          $log += "1) 내려받은 파일 실행 → 설치본 존재: $(Test-Path $inst) / 실행 중: $($p1.Count)개 / 경로: $(($p1 | ForEach-Object { $_.Path }) -join ' , ')"
+          Copy-Item dist\WoorizipRadio.exe (Join-Path $env:RUNNER_TEMP 'dl2.exe')
+          Start-Process (Join-Path $env:RUNNER_TEMP 'dl2.exe') -ArgumentList '--minimized','--updated'
+          Start-Sleep 25
+          $p2 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
+          $log += "2) 새 파일로 교체 실행 → 실행 중: $($p2.Count)개 / 경로: $(($p2 | ForEach-Object { $_.Path }) -join ' , ')"
+          python -c "import socket; s=socket.create_connection(('127.0.0.1',47651),timeout=3); s.sendall(b'quit'); s.close()"
+          Start-Sleep 8
+          $p3 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
+          $log += "3) 종료 요청 → 실행 중: $($p3.Count)개"
+          $okPaths = ($p2.Count -gt 0) -and (($p2 | Where-Object { $_.Path -ne $inst }).Count -eq 0)
+          $pass = (Test-Path $inst) -and ($p1.Count -ge 1) -and ($p2.Count -ge 1) -and $okPaths -and ($p3.Count -eq 0)
+          $log += "결과: " + $(if ($pass) { "통과" } else { "실패" })
+          $log += "--- 기록 파일 ---"
+          $log += (Get-Content (Join-Path $env:APPDATA 'WoorizipRadio\log.txt') -ErrorAction SilentlyContinue)
+          $log | Out-File -Encoding utf8 pcout/install.log
+          $log | Write-Host
+          if (-not $pass) { Get-Process WoorizipRadio -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host "::error title=설치·교체 점검 실패::$($log[0..3] -join ' | ')"; exit 1 }
       - run: Copy-Item dist/WoorizipRadio.exe pcout/
       - uses: actions/upload-artifact@v4
         with:
@@ -88,6 +121,7 @@ jobs:
                          "- **폰(안드로이드)**: \`WoorizipRadio-Phone-v$N.apk\` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)" \
                          "" "<details><summary>PC 프로그램 자동 점검 결과</summary>" "" '```' > notes.md
           cat out/pc/selftest.log >> notes.md 2>/dev/null || echo "(점검 기록 없음)" >> notes.md
+          { echo; echo "--- 실제 exe 설치·교체 점검 ---"; cat out/pc/install.log 2>/dev/null | grep -v "^$" | head -12; } >> notes.md
           printf '%s\n' '```' "</details>" >> notes.md
           set +e
           gh release create "v$N" out/*.exe out/*.apk --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest > release.log 2>&1

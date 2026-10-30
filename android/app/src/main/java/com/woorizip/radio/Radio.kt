@@ -8,13 +8,26 @@ import android.os.Handler
 import android.os.Looper
 import org.json.JSONArray
 import org.json.JSONObject
+import android.speech.tts.TextToSpeech
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
 
-/** 보관 음성(클립) 한 개: 밖에 있을 때나 접속이 끊겼을 때 받은 가족의 말 */
-data class Clip(val id: Int, val from: String, val mode: String, val ts: Long, val seconds: Double, val file: File) {
-    val title get() = if (mode == "all") "${from}님 전체 방송" else "${from}님이 나에게"
+/**
+ * 받은 메시지 한 개. 음성(file)이거나 문자(text).
+ * 음성: 밖에 있을 때나 접속이 끊겼을 때 받은 가족의 말. 문자: 가족이 글로 보낸 것
+ */
+data class Clip(
+    val id: Int, val from: String, val mode: String, val ts: Long, val seconds: Double,
+    val file: File?, val text: String? = null, val mine: Boolean = false
+) {
+    val isText get() = text != null
+    val title get() = when {
+        mine -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"}"
+        mode == "all" -> "${from}님 전체 방송"
+        else -> "${from}님이 나에게"
+    }
 }
 
 /**
@@ -35,6 +48,9 @@ object Radio : RadioClient.Listener {
     private val listeners = CopyOnWriteArraySet<() -> Unit>()
     private var focus: AudioFocusRequest? = null
     private val pendingClips = HashMap<Int, JSONObject>()   // 헤더는 왔는데 음성은 아직
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    val quickReplies = listOf("응", "알았어", "지금 가", "조금 있다가", "지금은 못 해")
 
     // ---- 화면에 보여줄 상태 ----
     @Volatile var connected = false; private set
@@ -68,6 +84,9 @@ object Radio : RadioClient.Listener {
         client = RadioClient(app, this)
         me = Prefs(app).name
         loadClips()
+        tts = TextToSpeech(app) { status ->
+            ttsReady = status == TextToSpeech.SUCCESS && tts?.setLanguage(Locale.KOREAN) != TextToSpeech.LANG_NOT_SUPPORTED
+        }
     }
 
     fun addListener(l: () -> Unit) { listeners.add(l) }
@@ -160,8 +179,69 @@ object Radio : RadioClient.Listener {
             "incoming" -> onIncoming(msg.optString("from"), msg.optString("mode"))
             "incoming_end" -> endIncoming()
             "clip" -> pendingClips[msg.optInt("id")] = msg
+            "text" -> onTextArrived(msg)
+            "text_sent" -> {
+                val to = msg.optString("to")
+                addClip(Clip(msg.optInt("id"), if (to == "all") me else to, if (to == "all") "all" else "direct",
+                    msg.optLong("ts", System.currentTimeMillis() / 1000), 0.0, null, msg.optString("text"), mine = true))
+                notice = "보냈어요"
+            }
+            "text_failed" -> notice = "보낼 수 없어요"
         }
         changed()
+    }
+
+    // ---- 문자 메시지 (말할 수 없을 때) ----
+
+    /** to: "all" 또는 이름. 비우면 지금 고른 상대 */
+    fun sendText(text: String, to: String? = null): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return false
+        if (!connected) { notice = "NAS에 연결되어 있지 않아요"; changed(); return false }
+        return client.sendJson(JSONObject().put("type", "text").put("to", to ?: target).put("text", t))
+    }
+
+    private fun onTextArrived(msg: JSONObject) {
+        val id = msg.optInt("id")
+        client.sendJson(JSONObject().put("type", "clip_ack").put("id", id))
+        val from = msg.optString("from")
+        val ts = msg.optLong("ts", System.currentTimeMillis() / 1000)
+        val text = msg.optString("text")
+        if (clips.any { it.from == from && it.ts == ts && it.text == text }) return
+        val clip = Clip(id, from, msg.optString("mode"), ts, 0.0, null, text)
+        addClip(clip)
+        if (Prefs(app).dnd) return
+        val speak = atHome || isParent
+        if (speak) {
+            Feedback.vibrate(app, longArrayOf(0, 120))
+            speakText(from, text)
+        } else {
+            Feedback.vibrate(app, longArrayOf(0, 250, 150, 250))
+        }
+        Notifs.showClip(app, clip, autoPlayed = speak)
+    }
+
+    /** 집에 있는 폰은 받은 글을 소리로 읽어 줌 (무음·진동 모드면 읽지 않음) */
+    private fun speakText(from: String, text: String) {
+        val am = app.getSystemService(AudioManager::class.java)
+        if (am.ringerMode != AudioManager.RINGER_MODE_NORMAL || !ttsReady || incomingFrom != null || talking) return
+        Feedback.incoming()
+        tts?.speak("$from: $text", TextToSpeech.QUEUE_ADD, null, "msg${System.currentTimeMillis()}")
+    }
+
+    private fun saveTextIndex() {
+        val arr = JSONArray()
+        clips.filter { it.isText }.take(30).forEach {
+            arr.put(JSONObject().put("id", it.id).put("from", it.from).put("mode", it.mode)
+                .put("ts", it.ts).put("text", it.text).put("mine", it.mine))
+        }
+        try { File(app.filesDir, "texts.json").writeText(arr.toString()) } catch (_: Exception) {}
+    }
+
+    private fun addClip(clip: Clip) {
+        clips = (listOf(clip) + clips).sortedByDescending { it.ts }.take(40)
+        clipDir().listFiles()?.forEach { f -> if (clips.none { it.file == f }) f.delete() }
+        if (clip.isText) saveTextIndex()
     }
 
     override fun onAudio(data: ByteArray) {
@@ -228,13 +308,21 @@ object Radio : RadioClient.Listener {
     private fun clipDir() = File(app.filesDir, "clips").apply { mkdirs() }
 
     private fun loadClips() {
-        clips = clipDir().listFiles()?.mapNotNull { f ->
+        val texts = try {
+            val arr = JSONArray(File(app.filesDir, "texts.json").readText())
+            (0 until arr.length()).map { arr.getJSONObject(it) }.map {
+                Clip(it.optInt("id"), it.optString("from"), it.optString("mode"), it.optLong("ts"), 0.0, null,
+                    it.optString("text"), it.optBoolean("mine"))
+            }
+        } catch (_: Exception) { emptyList() }
+        val voices = clipDir().listFiles()?.mapNotNull { f ->
             // 파일 이름: id_from_mode_ts_seconds.pcm
             val p = f.nameWithoutExtension.split("_")
             if (p.size < 5) return@mapNotNull null
             Clip(p[0].toIntOrNull() ?: return@mapNotNull null, p[1], p[2],
                 p[3].toLongOrNull() ?: 0L, p[4].toDoubleOrNull() ?: 0.0, f)
-        }?.sortedByDescending { it.ts }?.take(30) ?: emptyList()
+        } ?: emptyList()
+        clips = (texts + voices).sortedByDescending { it.ts }.take(40)
     }
 
     private fun onClipArrived(id: Int, pcm: ByteArray) {
@@ -248,9 +336,7 @@ object Radio : RadioClient.Listener {
         val file = File(clipDir(), "${id}_${from}_${mode}_${ts}_${seconds}.pcm")
         try { file.writeBytes(pcm) } catch (_: Exception) { return }
         val clip = Clip(id, from, mode, ts, seconds, file)
-        clips = (listOf(clip) + clips).take(30).also { keep ->
-            clipDir().listFiles()?.forEach { f -> if (keep.none { it.file == f }) f.delete() }
-        }
+        addClip(clip)
         if (Prefs(app).dnd) return
         if (atHome || isParent) {
             // 집에 있거나 부모면 바로 들려줌 (접속이 끊겼던 사이에 온 말)
@@ -268,6 +354,11 @@ object Radio : RadioClient.Listener {
 
     fun playClip(clip: Clip) {
         if (incomingFrom != null || talking) return
+        val f = clip.file
+        if (f == null) {   // 문자 메시지는 읽어 줌
+            if (ttsReady) tts?.speak("${clip.from}: ${clip.text}", TextToSpeech.QUEUE_FLUSH, null, "msg${clip.id}")
+            return
+        }
         stopClip()
         val am = app.getSystemService(AudioManager::class.java)
         requestFocus(am)
@@ -276,7 +367,7 @@ object Radio : RadioClient.Listener {
         player.start()
         Thread {
             try {
-                val pcm = clip.file.readBytes()
+                val pcm = f.readBytes()
                 val t0 = System.nanoTime()
                 var i = 0
                 var n = 0L
@@ -307,8 +398,9 @@ object Radio : RadioClient.Listener {
 
     fun deleteClip(clip: Clip) {
         if (playingClip === clip) stopClip()
-        clip.file.delete()
+        clip.file?.delete()
         clips = clips.filter { it !== clip }
+        if (clip.isText) saveTextIndex()
         changed()
     }
 

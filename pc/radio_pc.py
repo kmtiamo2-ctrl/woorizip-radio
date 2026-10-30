@@ -34,10 +34,7 @@ try:
     import sounddevice as sd
 except Exception:
     sd = None
-try:
-    import keyboard
-except Exception:
-    keyboard = None
+keyboard = None  # 단축키를 설정한 경우에만 로드 (메모리 절약)
 
 
 # ---------------------------------------------------------------- 설정
@@ -416,7 +413,8 @@ class Radio:
         self.incoming_from = None
         self.incoming_mode = None
         self.notice = ""
-        self.clips = []          # 최근 받은 메시지 (새것이 앞): dict(id, from, mode, ts, seconds, pcm)
+        self.clips = []          # 최근 메시지 (새것이 앞): 음성 dict(kind=clip, file) 또는 문자 dict(kind=text, text)
+        self.quick_replies = ["응", "알았어", "지금 가", "조금 있다가", "지금은 못 해"]
         self.pending = {}
         self.playing = None
         self.on_event = None     # ("incoming"|"clip"|"state", 정보) → 화면 알림용
@@ -531,6 +529,16 @@ class Radio:
                 self.incoming_from = self.incoming_mode = None
             elif t == "clip":
                 self.pending[int(msg.get("id", 0))] = msg
+            elif t == "text":
+                self._on_text_msg(msg)
+            elif t == "text_sent":
+                to = msg.get("to")
+                self._add_clip({"kind": "text", "id": int(msg.get("id", 0)), "from": self.cfg.name if to == "all" else to,
+                                "mode": "all" if to == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
+                                "text": msg.get("text", ""), "mine": True})
+                self.notice = "보냈어요"
+            elif t == "text_failed":
+                self.notice = "보낼 수 없어요"
 
     def _on_bin(self, data):
         if not data:
@@ -565,14 +573,61 @@ class Radio:
             if len(p) < 5:
                 continue
             try:
-                with open(os.path.join(self.clip_dir, fn), "rb") as f:
-                    pcm = f.read()
-                items.append({"id": int(p[0]), "from": p[1], "mode": p[2], "ts": int(p[3]),
-                              "seconds": float(p[4]), "pcm": pcm, "file": os.path.join(self.clip_dir, fn)})
+                items.append({"kind": "clip", "id": int(p[0]), "from": p[1], "mode": p[2], "ts": int(p[3]),
+                              "seconds": float(p[4]), "file": os.path.join(self.clip_dir, fn)})
             except Exception:
                 pass
+        # 문자 메시지 기록
+        try:
+            with open(os.path.join(data_dir(), "texts.json"), encoding="utf-8") as f:
+                items += json.load(f)
+        except Exception:
+            pass
         items.sort(key=lambda c: -c["ts"])
-        self.clips = items[:30]
+        self.clips = items[:40]
+
+    def _save_texts(self):
+        try:
+            with open(os.path.join(data_dir(), "texts.json"), "w", encoding="utf-8") as f:
+                json.dump([c for c in self.clips if c.get("kind") == "text"][:30], f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _add_clip(self, clip):
+        self.clips.insert(0, clip)
+        self.clips.sort(key=lambda c: -c["ts"])
+        for old in self.clips[40:]:
+            if old.get("file"):
+                try:
+                    os.remove(old["file"])
+                except Exception:
+                    pass
+        del self.clips[40:]
+        if clip.get("kind") == "text":
+            self._save_texts()
+
+    # ---- 문자 메시지 (말할 수 없을 때) ----
+
+    def send_text(self, text, to=None):
+        text = text.strip()
+        if not text:
+            return False
+        if not self.connected:
+            self.notice = "NAS에 연결되어 있지 않아요"
+            return False
+        return self.client.send_json({"type": "text", "to": to or self.target, "text": text})
+
+    def _on_text_msg(self, msg):
+        cid = int(msg.get("id", 0))
+        self.client.send_json({"type": "clip_ack", "id": cid})
+        sender, ts, text = msg.get("from"), int(msg.get("ts") or time.time()), msg.get("text", "")
+        if any(c["from"] == sender and c["ts"] == ts and c.get("text") == text for c in self.clips):
+            return
+        clip = {"kind": "text", "id": cid, "from": sender, "mode": msg.get("mode"), "ts": ts, "text": text}
+        self._add_clip(clip)
+        if not self.cfg.dnd:
+            self.audio.effect(BEEP_IN)
+            self._emit("text", clip)
 
     def _on_clip(self, cid, pcm):
         with self.lock:
@@ -590,15 +645,10 @@ class Radio:
                 with open(path, "wb") as f:
                     f.write(pcm)
             except Exception:
-                pass
-            clip = {"id": cid, "from": sender, "mode": mode, "ts": ts, "seconds": seconds, "pcm": pcm, "file": path}
-            self.clips.insert(0, clip)
-            for old in self.clips[30:]:
-                try:
-                    os.remove(old["file"])
-                except Exception:
-                    pass
-            del self.clips[30:]
+                return
+            del pcm  # 메모리에 들고 있지 않음. 들을 때 파일에서 읽음
+            clip = {"kind": "clip", "id": cid, "from": sender, "mode": mode, "ts": ts, "seconds": seconds, "file": path}
+            self._add_clip(clip)
             if self.cfg.dnd:
                 return
             auto = self.where == "home" or self.is_parent
@@ -607,14 +657,21 @@ class Radio:
             self._emit("clip", {"clip": clip, "auto": auto})
 
     def clip_title(self, c):
+        if c.get("mine"):
+            return "내가 %s" % ("모두에게" if c["mode"] == "all" else "%s님에게" % c["from"])
         return "%s님 전체 방송" % c["from"] if c["mode"] == "all" else "%s님이 나에게" % c["from"]
 
     def play_clip(self, clip):
         with self.lock:
-            if self.incoming_from or self.talking:
+            if self.incoming_from or self.talking or not clip.get("file"):
+                return
+            try:
+                with open(clip["file"], "rb") as f:
+                    pcm = f.read()
+            except Exception:
                 return
             self.playing = clip
-            self.audio.play_all(clip["pcm"])
+            self.audio.play_all(pcm)
             threading.Timer(clip["seconds"] + 0.8, self._clip_done, [clip]).start()
 
     def _clip_done(self, clip):
@@ -633,10 +690,13 @@ class Radio:
             if self.playing is clip:
                 self.stop_clip()
             self.clips = [c for c in self.clips if c is not clip]
-            try:
-                os.remove(clip["file"])
-            except Exception:
-                pass
+            if clip.get("file"):
+                try:
+                    os.remove(clip["file"])
+                except Exception:
+                    pass
+            else:
+                self._save_texts()
 
 
 # ---------------------------------------------------------------- 알림 풍선 / 트레이
@@ -676,8 +736,8 @@ def run_ui(start_minimized):
     root = tk.Tk()
     root.title(APP_TITLE)
     root.configure(bg=BG)
-    root.geometry("440x720")
-    root.minsize(400, 600)
+    root.geometry("460x800")
+    root.minsize(420, 640)
 
     # ---- 트레이 아이콘 ----
     tray = {"icon": None}
@@ -745,6 +805,25 @@ def run_ui(start_minimized):
     notice = tk.Label(root, text="", font=(F, 11), fg=ACCENT, bg=BG, wraplength=400)
     notice.pack(pady=(0, 6))
 
+    # 글로 보내기 (말할 수 없을 때)
+    text_box = tk.Frame(root, bg=CARD)
+    text_box.pack(fill="x", padx=20, pady=6)
+    tk.Label(text_box, text="말하기 어려우면 글로 보내기", font=(F, 9), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(8, 2))
+    chip_row = tk.Frame(text_box, bg=CARD)
+    chip_row.pack(fill="x", padx=6)
+
+    def send_text(t):
+        if radio.send_text(t):
+            entry.delete(0, "end")
+    for q in radio.quick_replies:
+        tk.Button(chip_row, text=q, font=(F, 9), command=lambda q=q: send_text(q)).pack(side="left", padx=2, pady=2)
+    entry_row = tk.Frame(text_box, bg=CARD)
+    entry_row.pack(fill="x", padx=8, pady=(2, 8))
+    entry = tk.Entry(entry_row, font=(F, 11))
+    entry.pack(side="left", fill="x", expand=True)
+    entry.bind("<Return>", lambda e: send_text(entry.get()))
+    tk.Button(entry_row, text="보내기", font=(F, 10), command=lambda: send_text(entry.get())).pack(side="left", padx=(6, 0))
+
     clips_box = tk.Frame(root, bg=CARD)
     tk.Label(clips_box, text="받은 메시지", font=(F, 10), fg=SUB, bg=CARD).pack(anchor="w", padx=10, pady=(8, 2))
     clips_list = tk.Frame(clips_box, bg=CARD)
@@ -764,17 +843,27 @@ def run_ui(start_minimized):
     hk = {"down": False}
 
     def bind_hotkey():
-        if keyboard is None:
-            hotkey_label.config(text="")
+        global keyboard
+        key = cfg.hotkey.strip().lower()
+        if not key:
+            if keyboard is not None:
+                try:
+                    keyboard.unhook_all()
+                except Exception:
+                    pass
+            hotkey_label.config(text="단축키 없음 (설정에서 F9 등을 넣으면 다른 창에서도 말하기 가능)")
             return
+        if keyboard is None:
+            try:
+                import keyboard as _kb
+                keyboard = _kb
+            except Exception:
+                hotkey_label.config(text="단축키 기능을 쓸 수 없어요")
+                return
         try:
             keyboard.unhook_all()
         except Exception:
             pass
-        key = cfg.hotkey.strip().lower()
-        if not key:
-            hotkey_label.config(text="단축키 없음 (설정에서 F9 등을 넣으면 다른 창에서도 말하기 가능)")
-            return
 
         def down(_):
             if not hk["down"]:
@@ -860,7 +949,10 @@ def run_ui(start_minimized):
                 toast(radio.clip_title(c), "%d초 · %s" % (max(1, int(c["seconds"])),
                                                         "방금 재생했어요" if info["auto"] else "창을 열어 [듣기]를 누르세요"))
                 if not info["auto"]:
-                    show_window()
+                    events.put(("show", None))
+            elif kind == "text":
+                flash()
+                toast("💬 " + radio.clip_title(info), info.get("text", ""))
             elif kind == "state":
                 set_tray(radio.connected, radio.where)
             elif kind == "dnd":
@@ -929,7 +1021,7 @@ def run_ui(start_minimized):
                 talk.config(text="누르고 말하기\n(%s)" % who, bg=BLUE)
             notice.config(text=radio.notice)
 
-            csig = tuple((id(c), radio.playing is c) for c in radio.clips[:8])
+            csig = tuple((c["id"], c["ts"], radio.playing is c) for c in radio.clips[:8])
             if csig != cache["clips"]:
                 cache["clips"] = csig
                 for c in clips_list.winfo_children():
@@ -941,13 +1033,20 @@ def run_ui(start_minimized):
                         row = tk.Frame(clips_list, bg=CARD)
                         row.pack(fill="x", pady=2)
                         playing = radio.playing is c
-                        tk.Label(row, text="%s%s\n%s · %d초" % ("🔊 " if playing else "", radio.clip_title(c),
-                                                                time.strftime("%m/%d %H:%M", time.localtime(c["ts"])),
-                                                                max(1, int(c["seconds"]))),
-                                 font=(F, 9), fg=TXT, bg=CARD, justify="left").pack(side="left", padx=4)
+                        when_ = time.strftime("%m/%d %H:%M", time.localtime(c["ts"]))
+                        if c.get("kind") == "text":
+                            desc = "%s\n💬 %s\n%s" % (radio.clip_title(c), c.get("text", ""), when_)
+                        else:
+                            desc = "%s%s\n%s · %d초" % ("🔊 " if playing else "", radio.clip_title(c), when_, max(1, int(c["seconds"])))
+                        tk.Label(row, text=desc, font=(F, 9), fg=SUB if c.get("mine") else TXT, bg=CARD,
+                                 justify="left", wraplength=240).pack(side="left", padx=4)
                         tk.Button(row, text="삭제", font=(F, 9), command=lambda c=c: radio.delete_clip(c)).pack(side="right", padx=2)
-                        tk.Button(row, text="정지" if playing else "듣기", font=(F, 9),
-                                  command=(lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c))).pack(side="right", padx=2)
+                        if not c.get("mine"):
+                            tk.Button(row, text="답장", font=(F, 9),
+                                      command=lambda c=c: (radio.set_target(c["from"]), entry.focus_set())).pack(side="right", padx=2)
+                        if c.get("kind") != "text":
+                            tk.Button(row, text="정지" if playing else "듣기", font=(F, 9),
+                                      command=(lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c))).pack(side="right", padx=2)
                 elif clips_box.winfo_ismapped():
                     clips_box.pack_forget()
         root.after(150, refresh)

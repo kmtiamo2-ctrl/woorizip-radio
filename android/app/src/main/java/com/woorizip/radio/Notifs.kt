@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.core.app.NotificationCompat
+import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 
 object Notifs {
@@ -103,7 +104,9 @@ object Notifs {
         ctx.getSystemService(NotificationManager::class.java).cancel(ID_INCOMING)
     }
 
-    /** 보관 음성 도착 알림. autoPlayed면 이미 재생했으니 [다시 듣기], 아니면 [듣기] */
+    const val KEY_REPLY = "reply_text"
+
+    /** 받은 메시지(음성·문자) 알림. 알림에서 바로 글로 답장할 수 있음 */
     fun showClip(ctx: Context, clip: Clip, autoPlayed: Boolean) {
         if (!canNotify(ctx)) return
         val play = PendingIntent.getService(
@@ -111,19 +114,42 @@ object Notifs {
             Intent(ctx, RadioService::class.java).setAction(RadioService.ACTION_PLAY_CLIP).putExtra("id", clip.id),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        // 답장: 보낸 사람에게 글로 (RemoteInput은 MUTABLE 필요)
+        val replyIntent = PendingIntent.getService(
+            ctx, 5000 + clip.id,
+            Intent(ctx, RadioService::class.java).setAction(RadioService.ACTION_REPLY).putExtra("to", clip.from),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val reply = NotificationCompat.Action.Builder(0, "답장", replyIntent)
+            .addRemoteInput(
+                RemoteInput.Builder(KEY_REPLY).setLabel("글로 답장")
+                    .setChoices(Radio.quickReplies.toTypedArray()).build()
+            )
+            .setAllowGeneratedReplies(false)
+            .build()
         val secs = clip.seconds.toInt().coerceAtLeast(1)
-        val n = NotificationCompat.Builder(ctx, CH_CLIP)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+        val body = when {
+            clip.isText -> clip.text ?: ""
+            autoPlayed -> "${secs}초 · 방금 재생했어요"
+            else -> "${secs}초 · 눌러서 들어 보세요"
+        }
+        val b = NotificationCompat.Builder(ctx, CH_CLIP)
+            .setSmallIcon(if (clip.isText) android.R.drawable.ic_dialog_email else android.R.drawable.ic_btn_speak_now)
             .setContentTitle(clip.title)
-            .setContentText(if (autoPlayed) "${secs}초 · 방금 재생했어요" else "${secs}초 · 눌러서 들어 보세요")
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setAutoCancel(true)
             .setVibrate(longArrayOf(0, 250, 150, 250))
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            .setContentIntent(play)
-            .addAction(0, if (autoPlayed) "다시 듣기" else "듣기", play)
-            .addAction(0, "열기", openApp(ctx))
-            .build()
-        ctx.getSystemService(NotificationManager::class.java).notify(ID_CLIP, n)
+            .setContentIntent(if (clip.isText) openApp(ctx) else play)
+        if (!clip.isText) b.addAction(0, if (autoPlayed) "다시 듣기" else "듣기", play)
+        b.addAction(reply)
+        b.addAction(0, "열기", openApp(ctx))
+        ctx.getSystemService(NotificationManager::class.java).notify(ID_CLIP, b.build())
+    }
+
+    fun cancelClip(ctx: Context) {
+        ctx.getSystemService(NotificationManager::class.java).cancel(ID_CLIP)
     }
 
     /** 재부팅 후: 안드로이드 정책상 마이크 서비스를 자동으로 켤 수 없어서 한 번 눌러 달라고 안내 */

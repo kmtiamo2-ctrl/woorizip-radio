@@ -27,6 +27,7 @@ class RadioService : Service() {
         const val ACTION_TOGGLE = "com.woorizip.radio.TOGGLE"
         const val ACTION_STOP = "com.woorizip.radio.STOP"
         const val ACTION_PLAY_CLIP = "com.woorizip.radio.PLAY_CLIP"
+        const val ACTION_REPLY = "com.woorizip.radio.REPLY"
         @Volatile var running = false; private set
 
         /** 반드시 앱 화면이 보이는 상태에서 호출 (마이크 사용 권한 때문) */
@@ -63,6 +64,15 @@ class RadioService : Service() {
             ACTION_TOGGLE -> if (running) {
                 Radio.toggleTalk()
                 return START_STICKY
+            }
+            ACTION_REPLY -> {
+                val text = androidx.core.app.RemoteInput.getResultsFromIntent(intent)?.getCharSequence(Notifs.KEY_REPLY)?.toString()
+                val to = intent.getStringExtra("to")
+                if (!text.isNullOrBlank() && !to.isNullOrBlank()) {
+                    Radio.sendText(text, to)
+                    Notifs.cancelClip(this)
+                }
+                if (running) return START_STICKY
             }
             ACTION_PLAY_CLIP -> {
                 Radio.clipById(intent.getIntExtra("id", -1))?.let { Radio.playClip(it) }

@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var settingsBox: LinearLayout
     private lateinit var clipsBox: LinearLayout
     private lateinit var clipsList: LinearLayout
+    private lateinit var input: EditText
     private val refresh: () -> Unit = { render() }
     private val h = Handler(Looper.getMainLooper())
 
@@ -148,6 +149,42 @@ class MainActivity : ComponentActivity() {
 
         noticeText = label("", 15f, accent).apply { gravity = Gravity.CENTER }
         root.addView(noticeText, lp(top = 10))
+
+        // 글로 보내기 (말할 수 없을 때)
+        val textBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; background = rounded(card)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        textBox.addView(label("말하기 어려우면 글로 보내기", 13f, textSub))
+        val chips = android.widget.HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+        val chipRow = LinearLayout(this)
+        Radio.quickReplies.forEach { q ->
+            chipRow.addView(TextView(this).apply {
+                text = q; textSize = 14f; setTextColor(textMain); background = rounded(Color.parseColor("#334155"), 20)
+                setPadding(dp(14), dp(8), dp(14), dp(8))
+                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
+                setOnClickListener { if (Radio.sendText(q)) toast("보냈어요: $q") }
+            })
+        }
+        chips.addView(chipRow)
+        textBox.addView(chips, lp(top = 8))
+        val inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        input = EditText(this).apply {
+            hint = "직접 입력"; setTextColor(textMain); setHintTextColor(textSub); maxLines = 2
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val send = Button(this).apply {
+            text = "보내기"
+            setOnClickListener {
+                val t = input.text.toString()
+                if (t.isBlank()) return@setOnClickListener
+                if (Radio.sendText(t)) { input.setText(""); toast("보냈어요") }
+            }
+        }
+        inputRow.addView(input); inputRow.addView(send)
+        textBox.addView(inputRow, lp(top = 6))
+        root.addView(textBox, lp(top = 12))
 
         // 받은 메시지 (밖에 있을 때 / 연결이 끊겼을 때 온 말)
         clipsBox = LinearLayout(this).apply {
@@ -316,14 +353,21 @@ class MainActivity : ComponentActivity() {
         clips.take(10).forEach { c ->
             val playing = Radio.playingClip === c
             val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-            val info = label("${if (playing) "🔊 " else ""}${c.title}\n${fmt.format(java.util.Date(c.ts * 1000))} · ${c.seconds.toInt().coerceAtLeast(1)}초", 14f, textMain)
+            val when_ = fmt.format(java.util.Date(c.ts * 1000))
+            val desc = if (c.isText) "${c.title}\n💬 ${c.text}\n$when_"
+                       else "${if (playing) "🔊 " else ""}${c.title}\n$when_ · ${c.seconds.toInt().coerceAtLeast(1)}초"
+            val info = label(desc, 14f, if (c.mine) textSub else textMain)
             info.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            val play = Button(this).apply {
+            row.addView(info)
+            if (!c.isText) row.addView(Button(this).apply {
                 text = if (playing) "정지" else "듣기"
                 setOnClickListener { if (playing) Radio.stopClip() else Radio.playClip(c) }
-            }
-            val del = Button(this).apply { text = "삭제"; setOnClickListener { Radio.deleteClip(c) } }
-            row.addView(info); row.addView(play); row.addView(del)
+            })
+            if (!c.mine) row.addView(Button(this).apply {
+                text = "답장"
+                setOnClickListener { Radio.target = c.from; input.requestFocus(); toast("${c.from}님에게 보내기로 바뀌었어요") }
+            })
+            row.addView(Button(this).apply { text = "삭제"; setOnClickListener { Radio.deleteClip(c) } })
             clipsList.addView(row, lp(top = 4))
         }
     }

@@ -14,7 +14,11 @@
   PARENTS      밖에서도 바로 소리로 받는 가족 (기본: 엄마,아빠). 나머지는 밖에서 알림만 받음
   PORT         포트 (기본: 8765)
   MAX_TALK_SEC 한 번에 말할 수 있는 최대 시간(초) (기본: 60)
-  KEEP_HOURS   보관한 음성을 몇 시간까지 전달 시도할지 (기본: 24)
+  KEEP_HOURS   보관한 음성·문자를 몇 시간까지 전달 시도할지 (기본: 24)
+
+문자 메시지: 마이크를 쓸 수 없을 때 짧은 글로 보냄. 음성 클립과 같은 방식으로 보관·전달됨
+  클라이언트 → {"type":"text","to":"all"|이름,"text":"..."}
+  서버 → 받는 쪽 {"type":"text","id","from","mode","ts","text"} (받으면 clip_ack로 확인)
 
 서버 → 클라이언트 바이너리 프레임 형식
   첫 바이트 1 = 실시간 음성 (뒤에 PCM 16kHz 모노 16비트)
@@ -258,6 +262,31 @@ class Hub:
         for w in self.live:
             await w.send_bytes(frame)
 
+    # ---- 문자 메시지 ----
+
+    async def send_text(self, name, ws, to, text):
+        text = str(text).strip()[:200]
+        if not text:
+            return
+        if to == "all":
+            targets = [m for m in MEMBERS if m != name]
+            mode = "all"
+        elif to in MEMBERS and to != name:
+            targets = [to]
+            mode = "direct"
+        else:
+            await ws.send_json({"type": "text_failed", "to": to})
+            return
+        self.clip_seq += 1
+        item = {"kind": "text", "id": self.clip_seq, "from": name, "mode": mode, "ts": time.time(), "text": text}
+        log("문자: %s -> %s: %s", name, "전체" if mode == "all" else to, text)
+        for t in targets:
+            q = self.queue.setdefault(t, [])
+            q.append(item)
+            del q[:-MAX_QUEUE]
+            await self.flush_queue(t)
+        await ws.send_json({"type": "text_sent", "id": item["id"], "to": to, "text": text, "ts": int(item["ts"])})
+
     # ---- 보관 음성(클립) ----
 
     async def deliver_clip(self, sender, mode, targets, live, pcm):
@@ -266,7 +295,7 @@ class Hub:
             if t in live_names:
                 continue  # 실시간으로 들은 사람은 클립 불필요
             self.clip_seq += 1
-            clip = {"id": self.clip_seq, "from": sender, "mode": mode, "ts": time.time(), "pcm": pcm}
+            clip = {"kind": "clip", "id": self.clip_seq, "from": sender, "mode": mode, "ts": time.time(), "pcm": pcm}
             q = self.queue.setdefault(t, [])
             q.append(clip)
             del q[:-MAX_QUEUE]
@@ -282,6 +311,10 @@ class Hub:
                 if c["id"] in w.sent_clips:
                     continue
                 w.sent_clips.add(c["id"])
+                if c.get("kind") == "text":
+                    await w.send_json({"type": "text", "id": c["id"], "from": c["from"], "mode": c["mode"],
+                                       "ts": int(c["ts"]), "text": c["text"]})
+                    continue
                 await w.send_json({"type": "clip", "id": c["id"], "from": c["from"], "mode": c["mode"],
                                    "ts": int(c["ts"]), "seconds": round(len(c["pcm"]) / 32000, 1)})
                 await w.send_bytes(bytes([CLIP]) + struct.pack("!I", c["id"]) + c["pcm"])
@@ -344,6 +377,8 @@ class Hub:
                     await self.start_talk(name, ws, msg.get("to", "all"))
                 elif t == "talk_end":
                     await self.end_talk(ws)
+                elif t == "text":
+                    await self.send_text(name, ws, msg.get("to", "all"), msg.get("text", ""))
                 elif t == "clip_ack":
                     self.ack_clip(name, int(msg.get("id", 0)))
                 elif t == "where":

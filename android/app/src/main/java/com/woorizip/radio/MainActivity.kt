@@ -259,7 +259,16 @@ class MainActivity : ComponentActivity() {
         }
         val host = field(box, "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)", prefs.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         val outHost = field(box, "밖 주소 — Tailscale 주소(예: 100.101.102.103) 또는 DDNS 주소. 비우면 집에서만", prefs.outHost, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        val name = field(box, "내 이름 (엄마·아빠·첫째·둘째·셋째 중 하나)", prefs.name, InputType.TYPE_CLASS_TEXT)
+        // 누구의 기기인지: 타이핑 대신 버튼으로 고름
+        box.addView(label("이 폰은 누구 것인가요?", 13f, textSub), lp(top = 14))
+        val whoGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        val names = Radio.members.ifEmpty { listOf("엄마", "아빠", "첫째", "둘째", "셋째") }
+        val whoButtons = names.map { n ->
+            RadioButton(this).apply { text = n; setTextColor(textMain); id = View.generateViewId(); textSize = 15f }
+        }
+        whoButtons.forEach { whoGroup.addView(it) }
+        whoButtons.firstOrNull { it.text == prefs.name }?.let { whoGroup.check(it.id) }
+        box.addView(whoGroup)
         val key = field(box, "가족 암호 (NAS 설정과 같게)", prefs.key, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
 
         box.addView(label("화면 꺼짐 상태 볼륨 버튼", 13f, textSub), lp(top = 14))
@@ -276,10 +285,11 @@ class MainActivity : ComponentActivity() {
             setOnClickListener {
                 prefs.host = host.text.toString()
                 prefs.outHost = outHost.text.toString()
-                prefs.name = name.text.toString()
+                prefs.name = whoButtons.firstOrNull { it.id == whoGroup.checkedRadioButtonId }?.text?.toString() ?: ""
+                if (prefs.name.isBlank()) { toast("이 폰이 누구 것인지 골라 주세요"); return@setOnClickListener }
                 prefs.key = key.text.toString()
                 prefs.keyMode = if (modes.checkedRadioButtonId == dbl.id) "double" else "hold"
-                if (!prefs.isConfigured) { toast("주소·이름·암호를 모두 입력하세요"); return@setOnClickListener }
+                if (!prefs.isConfigured) { toast("집 주소와 가족 암호를 입력하세요"); return@setOnClickListener }
                 settingsBox.visibility = View.GONE
                 if (RadioService.running) Radio.reconnect() else ensurePermissionsThenStart()
                 render()

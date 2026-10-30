@@ -888,9 +888,16 @@ def run_ui(start_minimized):
         w.configure(bg=BG)
         w.resizable(False, False)
         fields = {}
+        # 누구의 PC인지: 타이핑 대신 버튼으로 고름
+        tk.Label(w, text="이 PC는 누구 것인가요?", font=(F, 9), fg=SUB, bg=BG).pack(anchor="w", padx=16, pady=(12, 0))
+        who_var = tk.StringVar(value=cfg.name)
+        who_row = tk.Frame(w, bg=BG)
+        who_row.pack(anchor="w", padx=12)
+        for n in (radio.members or DEFAULT_MEMBERS):
+            tk.Radiobutton(who_row, text=n, value=n, variable=who_var, font=(F, 11), fg=TXT, bg=BG,
+                           selectcolor=BG, activebackground=BG, activeforeground=TXT).pack(side="left", padx=4)
         rows = [("host", "집 주소 — NAS의 집 안 주소 (예: 192.168.0.10)"),
                 ("out_host", "밖 주소 — Tailscale(예: 100.101.102.103) 또는 DDNS. 비우면 집에서만"),
-                ("name", "이 PC를 주로 쓰는 가족 (엄마·아빠·첫째·둘째·셋째)"),
                 ("key", "가족 암호 (NAS 설정과 같게)"),
                 ("hotkey", "말하기 단축키 (비우면 없음. 예: f9, scroll lock)")]
         for k, label in rows:
@@ -906,8 +913,12 @@ def run_ui(start_minimized):
 
         def save():
             v = {k: e.get().strip() for k, e in fields.items()}
-            if not (v["host"] and v["name"] and v["key"]):
-                messagebox.showerror("설정", "집 주소·이름·암호를 모두 입력하세요", parent=w)
+            v["name"] = who_var.get().strip()
+            if not v["name"]:
+                messagebox.showerror("설정", "이 PC가 누구 것인지 골라 주세요", parent=w)
+                return
+            if not (v["host"] and v["key"]):
+                messagebox.showerror("설정", "집 주소와 가족 암호를 입력하세요", parent=w)
                 return
             v["autostart"] = auto_var.get()
             cfg.set(**v)

@@ -8,3 +8,5 @@ __pycache__/
 pc/build/
 pc/dist/
 *.spec
+*.jks
+*.keystore

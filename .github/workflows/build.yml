@@ -94,8 +94,13 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
+      - name: 서명 키 준비 (GitHub Secrets에 있을 때만)
+        env: { KS_B64: "${{ secrets.ANDROID_KEYSTORE_B64 }}" }
+        run: |
+          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/woorizip.jks" && echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/woorizip.jks" >> "$GITHUB_ENV" && echo "가족 서명 키 사용"; else echo "::warning title=서명 키 없음::GitHub Secrets에 ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD 가 없어 임시 키로 서명함 (덮어 설치가 안 될 수 있음)"; fi
       - name: 빌드
         id: build
+        env: { ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" }
         run: chmod +x gradlew && (./gradlew assembleRelease --no-daemon --stacktrace -PappVersion=v${{ github.run_number }} -PappVersionCode=${{ github.run_number }} 2>&1 | tee build.log; exit ${PIPESTATUS[0]})
         working-directory: android
       - name: 실패하면 오류 내용을 이슈로 남김

@@ -61,6 +61,8 @@ class MainActivity : AppCompatActivity() {
     private val h = Handler(Looper.getMainLooper())
     private val refresh: () -> Unit = { render() }
     private val fmt = SimpleDateFormat("M/d HH:mm", Locale.KOREA)
+    private val fmtTime = SimpleDateFormat("HH:mm", Locale.KOREA)
+    private var lastNewestKey: String? = null
 
     // ---------- 팔레트 ----------
     private val cBg = Color.parseColor("#0B1220")
@@ -97,6 +99,9 @@ class MainActivity : AppCompatActivity() {
     private var quickSig = ""
     private var memberSig = ""
     private var msgSig = ""
+    private var stickBottom = false
+    private lateinit var scrollRoot: NestedScrollView
+    private val dayNames = arrayOf("일", "월", "화", "수", "목", "금", "토")
 
     private var volTalking = false
     private val volHoldStart = Runnable { volTalking = true; Radio.startTalk() }
@@ -269,32 +274,25 @@ class MainActivity : AppCompatActivity() {
         noticeText = label("", 14f, cAmber).apply { gravity = Gravity.CENTER }
         root.addView(noticeText, lp(top = 10))
 
-        // 글로 보내기
-        val (composeCard, compose) = card()
-        compose.addView(sectionTitle("글로 보내기  ·  말하기 어려울 때"))
-        val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
-        quickRow = LinearLayout(this)
-        scroll.addView(quickRow)
-        compose.addView(scroll, lp(top = 10))
-        val (til, et) = inputField("직접 입력")
-        input = et
-        compose.addView(til, lp(top = 10))
-        val btnRow = LinearLayout(this)
-        btnRow.addView(pill("보내기", true) { val t = input.text.toString(); if (t.isNotBlank() && Radio.sendText(t)) { input.setText(""); toast("보냈어요") } },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        btnRow.addView(pill("⏰ 예약", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
-        compose.addView(btnRow, lp(top = 10))
-        compose.addView(label("보낸 메시지 아래 표시 ·  ✓ 받음   ✓✓ 봄(들음)", 11f, cSub), lp(top = 8))
-        root.addView(composeCard, lp(top = 18))
-
-        // 메시지
+        // 대화 카드: 말풍선 목록(최신이 아래) + 빠른 답장 + 입력칸
         val (mc, mi) = card(pad = 14)
         msgCard = mc
-        msgHead = sectionTitle("메시지").apply { setPadding(dp(4), 0, 0, 0) }
+        msgHead = sectionTitle("대화").apply { setPadding(dp(4), 0, 0, 0) }
         mi.addView(msgHead)
         msgList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         mi.addView(msgList, lp(top = 6))
-        msgCard.visibility = View.GONE
+        val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+        quickRow = LinearLayout(this)
+        scroll.addView(quickRow)
+        mi.addView(scroll, lp(top = 12))
+        val inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        val (til, et) = inputField("메시지 입력")
+        input = et
+        inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        inputRow.addView(pill("보내기", true) { val t = input.text.toString(); if (t.isNotBlank() && Radio.sendText(t)) { input.setText(""); stickBottom = true } },
+            lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
+        inputRow.addView(pill("⏰", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
+        mi.addView(inputRow, lp(top = 8))
         root.addView(msgCard, lp(top = 14))
 
         // 수신 대기 / 배터리 / 설정
@@ -317,7 +315,7 @@ class MainActivity : AppCompatActivity() {
         settingsBox = buildSettings().apply { visibility = View.GONE }
         root.addView(settingsBox, lp(top = 14))
 
-        val scrollRoot = NestedScrollView(this).apply { setBackgroundColor(cBg); addView(root); isFillViewport = true }
+        scrollRoot = NestedScrollView(this).apply { setBackgroundColor(cBg); addView(root); isFillViewport = true }
         ViewCompat.setOnApplyWindowInsetsListener(scrollRoot) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
@@ -615,47 +613,99 @@ class MainActivity : AppCompatActivity() {
         standbySwitch.isChecked = RadioService.running
     }
 
+    private fun dayLabel(ts: Long): String {
+        val d = Calendar.getInstance().apply { timeInMillis = ts * 1000 }
+        val now = Calendar.getInstance()
+        val yd = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
+        fun same(a: Calendar, b: Calendar) = a.get(Calendar.YEAR) == b.get(Calendar.YEAR) && a.get(Calendar.DAY_OF_YEAR) == b.get(Calendar.DAY_OF_YEAR)
+        return when {
+            same(d, now) -> "오늘"
+            same(d, yd) -> "어제"
+            else -> "%d/%d (%s)".format(d.get(Calendar.MONTH) + 1, d.get(Calendar.DAY_OF_MONTH), dayNames[d.get(Calendar.DAY_OF_WEEK) - 1])
+        }
+    }
+
+    private fun bubbleMenu(c: Clip) {
+        val items = ArrayList<String>()
+        if (c.isText) items.add("복사")
+        if (!c.mine) items.add("${c.from} 방으로")
+        items.add("삭제")
+        MaterialAlertDialogBuilder(this).setItems(items.toTypedArray()) { _, i ->
+            when (items[i]) {
+                "복사" -> { (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("우리집", c.text ?: "")); toast("복사했어요") }
+                "삭제" -> Radio.deleteClip(c)
+                else -> { Radio.selectRoom(c.from); render() }
+            }
+        }.show()
+    }
+
     private fun renderMessages() {
         val room = Radio.currentRoom()
-        val clips = Radio.roomClips(room)
-        msgCard.visibility = if (Radio.clips.isEmpty()) View.GONE else View.VISIBLE
-        val sig = room.key + "|" + clips.take(12).joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}" }
+        val shown = Radio.roomClips(room).take(40).reversed()   // 오래된 것 → 최신 (최신이 아래)
+        val sig = room.key + "|" + shown.joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}" }
         if (sig == msgSig) return
+        val newestKey = shown.lastOrNull()?.let { "${it.id}:${it.ts}" }
+        val newestChanged = newestKey != null && newestKey != lastNewestKey
+        lastNewestKey = newestKey
+        val child = scrollRoot.getChildAt(0)
+        val nearBottom = child == null || child.bottom - (scrollRoot.height + scrollRoot.scrollY) < dp(160)
         msgSig = sig
         msgList.removeAllViews()
-        if (clips.isEmpty()) msgList.addView(label("이 방에는 아직 메시지가 없어요", 13f, cSub).apply { setPadding(dp(4), dp(16), dp(4), dp(16)) })
-        clips.take(12).forEachIndexed { i, c ->
-            val playing = Radio.playingClip === c
-            val whoColor = if (c.mine) cSub else Family.color(c.from)
-            // 보낸 사람 색은 왼쪽 가는 띠와 이름에만 — 글 내용은 밝은 글씨 그대로
-            val outer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            outer.addView(View(this).apply { background = roundRect(whoColor, 3) }, LinearLayout.LayoutParams(dp(4), ViewGroup.LayoutParams.MATCH_PARENT).apply { setMargins(0, dp(10), dp(10), dp(8)) })
-            val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(10), dp(4), dp(8)) }
-            outer.addView(row, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-            val name = if (c.mine) c.title else "${Family.icon(c.from)} ${c.title}"
-            top.addView(label(name, 13f, whoColor, true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            top.addView(label(fmt.format(Date(c.ts * 1000)), 11f, cSub))
-            row.addView(top)
-            when {
-                c.isText -> row.addView(label(c.text ?: "", 19f, cText), lp(top = 4))
-                c.voiceSent -> {}
-                else -> row.addView(label("${if (playing) "🔊 재생 중" else "🎙 음성"} · ${c.seconds.toInt().coerceAtLeast(1)}초", 16f, cText), lp(top = 4))
+        if (shown.isEmpty()) msgList.addView(label("아직 대화가 없어요. 아래에 적어 보내거나, 큰 버튼을 누르고 말해 보세요.", 13f, cSub).apply { setPadding(dp(4), dp(20), dp(4), dp(20)); gravity = Gravity.CENTER })
+        var prevDay: String? = null
+        var prevFrom: String? = null
+        var prevTs = 0L
+        val onDark = cText
+        shown.forEach { c ->
+            val day = dayLabel(c.ts)
+            if (day != prevDay) {
+                msgList.addView(label(day, 11f, cSub).apply { gravity = Gravity.CENTER; background = roundRect(cBg, 10); setPadding(dp(10), dp(3), dp(10), dp(3)) },
+                    lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 10).apply { gravity = Gravity.CENTER_HORIZONTAL })
+                prevDay = day; prevFrom = null
             }
+            val sender = if (c.mine) "나" else c.from
+            val same = sender == prevFrom && c.ts - prevTs < 180
+            prevFrom = sender; prevTs = c.ts
+            val whoColor = Family.color(c.from)
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val colLp = lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = if (same) 2 else 10).apply {
+                gravity = if (c.mine) Gravity.END else Gravity.START
+                if (c.mine) marginStart = dp(48) else marginEnd = dp(48)
+            }
+            if (!c.mine && !same) col.addView(label("${Family.icon(c.from)} ${c.from}", 13f, whoColor, true).apply { setPadding(dp(6), 0, 0, dp(2)) })
+            val bubble = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = roundRect(if (c.mine) Color.parseColor("#2A3F66") else cCard2, 16)
+                setPadding(dp(14), dp(9), dp(14), dp(9))
+                setOnLongClickListener { bubbleMenu(c); true }
+            }
+            if (c.mine && c.mode != "all") bubble.addView(label("→ ${c.from}", 11f, cSub))
+            val playing = Radio.playingClip === c
+            when {
+                c.isText -> bubble.addView(label(c.text ?: "", 19f, onDark).apply { setTextIsSelectable(false) })
+                c.voiceSent -> bubble.addView(label("🎙  음성 ${c.seconds.toInt().coerceAtLeast(1)}초 보냄", 15f, onDark))
+                else -> bubble.addView(MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
+                    text = if (playing) "■  재생 중 · ${c.seconds.toInt().coerceAtLeast(1)}초" else "▶  음성 ${c.seconds.toInt().coerceAtLeast(1)}초"
+                    isAllCaps = false; textSize = 16f; setTextColor(onDark); insetTop = 0; insetBottom = 0; minHeight = 0; minimumHeight = 0
+                    setPadding(dp(4), dp(4), dp(4), dp(4))
+                    setOnClickListener { if (playing) Radio.stopClip() else Radio.playClip(c) }
+                    setOnLongClickListener { bubbleMenu(c); true }
+                })
+            }
+            col.addView(bubble, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = if (c.mine) Gravity.END else Gravity.START })
+            var meta = fmtTime.format(Date(c.ts * 1000))
+            var metaColor = cSub
             if (c.mine) {
                 val rt = Radio.receiptText(c)
-                if (rt.isNotBlank()) row.addView(label(rt, 12f, cAmber), lp(top = 4))
+                if (rt.isNotBlank()) { meta = "$rt  ·  $meta"; metaColor = cAmber }
             } else if (c.isText) {
                 Radio.markSeen(c)   // 화면에 표시됨 = 봤음
             }
-            val btns = LinearLayout(this).apply { gravity = Gravity.END }
-            if (!c.isText && !c.voiceSent) btns.addView(textButton(if (playing) "정지" else "듣기") { if (playing) Radio.stopClip() else Radio.playClip(c) })
-            if (!c.mine) btns.addView(textButton("답장") { Radio.target = c.from; input.requestFocus(); toast("${c.from}님에게 보내기로 바뀌었어요") })
-            btns.addView(textButton("삭제", cSub) { Radio.deleteClip(c) })
-            row.addView(btns, lp(top = 2))
-            msgList.addView(outer)
-            if (i < clips.take(12).size - 1) msgList.addView(View(this).apply { setBackgroundColor(cOutline) }, lp(h = dp(1)))
+            col.addView(label(meta, 10f, metaColor).apply { setPadding(dp(6), dp(1), dp(6), 0) }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = if (c.mine) Gravity.END else Gravity.START })
+            msgList.addView(col, colLp)
         }
+        if (stickBottom || (newestChanged && nearBottom)) scrollRoot.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }
+        stickBottom = false
     }
 
     // ---------- 볼륨 버튼 (앱이 보일 때) ----------

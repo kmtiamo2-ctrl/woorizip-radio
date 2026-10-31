@@ -72,6 +72,8 @@ data class Schedule(val sid: Int, val to: String, val text: String, val at: Long
  */
 object Radio : RadioClient.Listener {
 
+    private const val MAX_CLIPS = 150
+
     private const val LIVE: Byte = 1
     private const val CLIP: Byte = 2
 
@@ -296,6 +298,7 @@ object Radio : RadioClient.Listener {
                     msg.optLong("ts", System.currentTimeMillis() / 1000), msg.optDouble("seconds", 0.0), null, null,
                     mine = true, mid = msg.optInt("mid"), voiceSent = true))
             }
+            "history" -> mergeHistory(msg.optJSONArray("items"))
             "receipt" -> {
                 val st = msg.optJSONObject("status") ?: JSONObject()
                 receipts = receipts + (msg.optInt("mid") to st.keys().asSequence().associateWith { st.optString(it) })
@@ -429,7 +432,7 @@ object Radio : RadioClient.Listener {
 
     private fun saveTextIndex() {
         val arr = JSONArray()
-        clips.filter { it.isText || it.voiceSent }.take(30).forEach {
+        clips.filter { it.isText || it.voiceSent }.take(120).forEach {
             arr.put(JSONObject().put("id", it.id).put("from", it.from).put("mode", it.mode)
                 .put("ts", it.ts).put("text", it.text).put("mine", it.mine).put("mid", it.mid)
                 .put("voice", it.voiceSent).put("seconds", it.seconds))
@@ -438,9 +441,31 @@ object Radio : RadioClient.Listener {
     }
 
     private fun addClip(clip: Clip) {
-        clips = (listOf(clip) + clips).sortedByDescending { it.ts }.take(40)
+        clips = (listOf(clip) + clips).sortedByDescending { it.ts }.take(MAX_CLIPS)
         clipDir().listFiles()?.forEach { f -> if (clips.none { it.file == f }) f.delete() }
         if (clip.isText || clip.voiceSent) saveTextIndex()
+    }
+
+    /** 서버가 보관한 문자 기록을 합침 (이미 있는 것은 mid로 건너뜀) → 폰·PC 어디서나 같은 대화 */
+    private fun mergeHistory(items: JSONArray?) {
+        if (items == null) return
+        val have = clips.mapNotNull { if (it.mid != 0) it.mid else null }.toHashSet()
+        val added = ArrayList<Clip>()
+        for (i in 0 until items.length()) {
+            val it = items.optJSONObject(i) ?: continue
+            val mid = it.optInt("mid")
+            if (mid == 0 || mid in have) continue
+            val mine = it.optString("from") == me
+            val to = it.optJSONArray("to").toList()
+            val mode = it.optString("mode", "direct")
+            added.add(Clip(mid, if (mine) (if (mode == "all") me else to.joinToString(", ")) else it.optString("from"), mode,
+                it.optLong("ts"), 0.0, null, it.optString("text"), mine = mine, mid = mid))
+            have.add(mid)
+        }
+        if (added.isEmpty()) return
+        clips = (clips + added).sortedByDescending { it.ts }.take(MAX_CLIPS)
+        saveTextIndex()
+        changed()
     }
 
     override fun onAudio(data: ByteArray) {
@@ -522,7 +547,7 @@ object Radio : RadioClient.Listener {
             Clip(p[0].toIntOrNull() ?: return@mapNotNull null, p[1], p[2],
                 p[3].toLongOrNull() ?: 0L, p[4].toDoubleOrNull() ?: 0.0, f, mid = p.getOrNull(5)?.toIntOrNull() ?: 0)
         } ?: emptyList()
-        clips = (texts + voices).sortedByDescending { it.ts }.take(40)
+        clips = (texts + voices).sortedByDescending { it.ts }.take(MAX_CLIPS)
     }
 
     private fun onClipArrived(id: Int, pcm: ByteArray) {

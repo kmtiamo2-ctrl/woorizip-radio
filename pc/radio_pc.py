@@ -708,6 +708,8 @@ class Radio:
                                 "from": self.cfg.name if msg.get("mode") == "all" else ", ".join(to),
                                 "mode": "all" if msg.get("mode") == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
                                 "seconds": float(msg.get("seconds") or 0), "mine": True})
+            elif t == "history":
+                self._merge_history(msg.get("items") or [])
             elif t == "receipt":
                 self.receipts[int(msg.get("mid", 0))] = msg.get("status") or {}
             elif t == "receipts":
@@ -769,27 +771,53 @@ class Radio:
         except Exception:
             pass
         items.sort(key=lambda c: -c["ts"])
-        self.clips = items[:40]
+        self.clips = items[:self.MAX_CLIPS]
+
+    MAX_CLIPS = 150
 
     def _save_texts(self):
         try:
             with open(os.path.join(data_dir(), "texts.json"), "w", encoding="utf-8") as f:
-                json.dump([c for c in self.clips if c.get("kind") in ("text", "voice_sent")][:30], f, ensure_ascii=False)
+                json.dump([c for c in self.clips if c.get("kind") in ("text", "voice_sent")][:120], f, ensure_ascii=False)
         except Exception:
             pass
 
     def _add_clip(self, clip):
         self.clips.insert(0, clip)
         self.clips.sort(key=lambda c: -c["ts"])
-        for old in self.clips[40:]:
+        for old in self.clips[self.MAX_CLIPS:]:
             if old.get("file"):
                 try:
                     os.remove(old["file"])
                 except Exception:
                     pass
-        del self.clips[40:]
+        del self.clips[self.MAX_CLIPS:]
         if clip.get("kind") in ("text", "voice_sent"):
             self._save_texts()
+
+    def _merge_history(self, items):
+        """서버가 보관한 문자 기록을 합침 (이미 있는 것은 mid로 건너뜀) → 폰·PC 어디서나 같은 대화"""
+        have = {c.get("mid") for c in self.clips if c.get("mid")}
+        added = 0
+        for it in items:
+            mid = int(it.get("mid") or 0)
+            if not mid or mid in have:
+                continue
+            mine = it.get("from") == self.cfg.name
+            to = it.get("to") or []
+            clip = {"kind": "text", "id": mid, "mid": mid, "ts": int(it.get("ts") or 0), "text": str(it.get("text", "")),
+                    "mode": it.get("mode") or "direct",
+                    "from": (self.cfg.name if it.get("mode") == "all" else ", ".join(to)) if mine else it.get("from")}
+            if mine:
+                clip["mine"] = True
+            self.clips.append(clip)
+            have.add(mid)
+            added += 1
+        if added:
+            self.clips.sort(key=lambda c: -c["ts"])
+            del self.clips[self.MAX_CLIPS:]
+            self._save_texts()
+            log("대화 기록 %d개 합침" % added)
 
     # ---- 문자 메시지 (말할 수 없을 때) ----
 
@@ -902,7 +930,7 @@ class Radio:
         if not st:
             return ""
         mark = {"sent": "·", "received": "✓", "seen": "✓✓"}
-        return "  ".join("%s%s" % (n, mark.get(v, "·")) for n, v in st.items())
+        return " · ".join("%s%s" % (n, mark.get(v, "·")) for n, v in st.items())
 
     def schedule_add(self, text, at, repeat, to=None):
         return self.client.send_json({"type": "schedule_add", "to": to if to else self.target_json(),
@@ -1236,39 +1264,49 @@ def run_ui(start_minimized, selftest=False):
         grid.columnconfigure(c, weight=1, uniform="fam")
 
     # 말하기 버튼
-    talk = ctk.CTkFrame(body, fg_color=AMBER, corner_radius=28, height=140)
-    talk.pack(fill="x", pady=(18, 0))
+    talk = ctk.CTkFrame(body, fg_color=AMBER, corner_radius=26, height=112)
+    talk.pack(fill="x", pady=(16, 0))
     talk.pack_propagate(False)
-    talk_title = ctk.CTkLabel(talk, text="", font=font(24, True), text_color=ON_AMBER)
-    talk_title.pack(pady=(34, 0))
-    talk_sub = ctk.CTkLabel(talk, text="", font=font(13), text_color=ON_AMBER)
+    talk_title = ctk.CTkLabel(talk, text="", font=font(22, True), text_color=ON_AMBER)
+    talk_title.pack(pady=(26, 0))
+    talk_sub = ctk.CTkLabel(talk, text="", font=font(12), text_color=ON_AMBER)
     talk_sub.pack()
     for wdg in (talk, talk_title, talk_sub):
         wdg.bind("<ButtonPress-1>", lambda e: radio.start_talk())
         wdg.bind("<ButtonRelease-1>", lambda e: radio.stop_talk())
         wdg.configure(cursor="hand2")
-    notice = ctk.CTkLabel(body, text="", font=font(13), text_color=AMBER, wraplength=400)
-    notice.pack(pady=(8, 0))
+    notice = ctk.CTkLabel(body, text="", font=font(12), text_color=AMBER, wraplength=400)
+    notice.pack(pady=(6, 0))
 
-    # 글로 보내기
-    compose_card, compose = card(body)
-    compose_card.pack(fill="x", pady=(16, 0))
-    section(compose, "글로 보내기  ·  말하기 어려울 때").pack(anchor="w")
-    chip_row = ctk.CTkFrame(compose, fg_color="transparent")
-    chip_row.pack(fill="x", pady=(8, 0))
-    entry_row = ctk.CTkFrame(compose, fg_color="transparent")
-    entry_row.pack(fill="x", pady=(10, 0))
-    entry = ctk.CTkEntry(entry_row, placeholder_text="직접 입력", font=font(14), height=40, corner_radius=14,
+    # 하단: 단축키 안내 + 설정 (먼저 아래쪽에 붙여 두고, 대화 카드가 남은 공간을 채움)
+    foot = ctk.CTkFrame(body, fg_color="transparent")
+    foot.pack(side="bottom", fill="x", pady=(8, 0))
+    hotkey_label = ctk.CTkLabel(foot, text="", font=font(11), text_color=SUB, anchor="w", wraplength=320, justify="left")
+    hotkey_label.pack(side="left", fill="x", expand=True)
+    pill(foot, "설정", lambda: open_settings(), filled=False, width=70).pack(side="right")
+
+    # ---- 대화 카드: 말풍선 목록(최신이 아래) + 빠른 답장 + 입력칸 ----
+    msg_card, msg_inner = card(body, pad=12)
+    msg_card.pack(fill="both", expand=True, pady=(12, 0))
+    msg_head = section(msg_inner, "대화")
+    msg_head.pack(anchor="w", padx=4)
+
+    entry_row = ctk.CTkFrame(msg_inner, fg_color="transparent")
+    entry_row.pack(side="bottom", fill="x", pady=(8, 0))
+    entry = ctk.CTkEntry(entry_row, placeholder_text="메시지 입력  (Enter로 보내기)", font=font(15), height=44, corner_radius=16,
                          fg_color=BG, border_color=OUTLINE, text_color=TXT)
     entry.pack(side="left", fill="x", expand=True)
 
     def send_text(t):
         if radio.send_text(t):
             entry.delete(0, "end")
+            chat["stick"] = True
     entry.bind("<Return>", lambda e: send_text(entry.get()))
-    pill(entry_row, "보내기", lambda: send_text(entry.get()), width=80).pack(side="left", padx=(8, 0))
-    pill(entry_row, "⏰ 예약", lambda: open_schedule(), filled=False, width=80).pack(side="left", padx=(6, 0))
-    ctk.CTkLabel(compose, text="보낸 메시지 아래 표시  ·  ✓ 받음   ✓✓ 봄(들음)", font=font(11), text_color=SUB, anchor="w").pack(anchor="w", pady=(8, 0))
+    pill(entry_row, "보내기", lambda: send_text(entry.get()), width=76).pack(side="left", padx=(8, 0))
+    pill(entry_row, "⏰", lambda: open_schedule(), filled=False, width=44).pack(side="left", padx=(6, 0))
+
+    chip_row = ctk.CTkFrame(msg_inner, fg_color="transparent")
+    chip_row.pack(side="bottom", fill="x", pady=(8, 0))
 
     def render_chips():
         for c in chip_row.winfo_children():
@@ -1279,23 +1317,70 @@ def run_ui(start_minimized, selftest=False):
                           width=10).pack(side="left", padx=(0, 6), pady=2)
     render_chips()
 
-    # 하단: 단축키 안내 + 설정 (먼저 아래쪽에 붙여 두고, 메시지 목록이 남은 공간을 채움)
-    foot = ctk.CTkFrame(body, fg_color="transparent")
-    foot.pack(side="bottom", fill="x", pady=(10, 0))
-    hotkey_label = ctk.CTkLabel(foot, text="", font=font(11), text_color=SUB, anchor="w", wraplength=320, justify="left")
-    hotkey_label.pack(side="left", fill="x", expand=True)
-    pill(foot, "설정", lambda: open_settings(), filled=False, width=70).pack(side="right")
+    msg_wrap = ctk.CTkFrame(msg_inner, fg_color="transparent")
+    msg_wrap.pack(fill="both", expand=True, pady=(4, 0))
+    msg_list = ctk.CTkScrollableFrame(msg_wrap, fg_color="transparent", scrollbar_button_color=CARD2, scrollbar_button_hover_color=OUTLINE)
+    msg_list.pack(fill="both", expand=True)
+    chat = {"stick": True, "last_sig": None}   # stick: 맨 아래를 따라감 (위로 올려 보는 중이면 False)
 
-    # 메시지 목록
-    msg_card, msg_inner = card(body, pad=12)
-    msg_card.pack(fill="both", expand=True, pady=(14, 0))
-    msg_head = section(msg_inner, "메시지  ·  최근 것이 위")
-    msg_head.pack(anchor="w", padx=4)
-    msg_list = ctk.CTkScrollableFrame(msg_inner, fg_color="transparent", scrollbar_button_color=CARD2, scrollbar_button_hover_color=OUTLINE)
-    msg_list.pack(fill="both", expand=True, pady=(4, 0))
+    def chat_canvas():
+        return msg_list._parent_canvas
+
+    def at_bottom():
+        try:
+            return chat_canvas().yview()[1] >= 0.985
+        except Exception:
+            return True
+
+    def scroll_bottom(*_):
+        chat["stick"] = True
+        try:
+            msg_list.update_idletasks()
+            chat_canvas().yview_moveto(1.0)
+        except Exception:
+            pass
+        new_btn.place_forget()
+
+    new_btn = ctk.CTkButton(msg_wrap, text="새 메시지 ↓", command=scroll_bottom, font=font(12, True), height=30, corner_radius=15,
+                            fg_color=AMBER, hover_color=AMBER_D, text_color=ON_AMBER, width=110)
+
+    def on_wheel(_e=None):   # 사용자가 위로 올려 보면 자동 따라가기 멈춤, 다시 맨 아래로 내리면 재개
+        root.after(50, lambda: chat.__setitem__("stick", at_bottom()) or (new_btn.place_forget() if chat["stick"] else None))
+    root.bind_all("<MouseWheel>", on_wheel, add="+")
+    root.bind_all("<Button-4>", on_wheel, add="+")
+    root.bind_all("<Button-5>", on_wheel, add="+")
+
+    def day_label(ts):
+        d = time.localtime(ts)
+        today = time.localtime()
+        if (d.tm_year, d.tm_yday) == (today.tm_year, today.tm_yday):
+            return "오늘"
+        yd = time.localtime(time.time() - 86400)
+        if (d.tm_year, d.tm_yday) == (yd.tm_year, yd.tm_yday):
+            return "어제"
+        return time.strftime("%m/%d (%a)", d).replace("Mon", "월").replace("Tue", "화").replace("Wed", "수").replace("Thu", "목").replace("Fri", "금").replace("Sat", "토").replace("Sun", "일")
+
+    def bubble_menu(event, c):
+        m = tk.Menu(root, tearoff=0, bg=CARD2, fg=TXT, activebackground=OUTLINE, activeforeground=TXT, font=("Malgun Gothic", 11))
+        if c.get("kind") == "text":
+            m.add_command(label="복사", command=lambda: (root.clipboard_clear(), root.clipboard_append(c.get("text", ""))))
+        if not c.get("mine"):
+            m.add_command(label="%s 방으로" % c["from"], command=lambda: radio.select_room(c["from"]))
+        m.add_command(label="삭제", command=lambda: radio.delete_clip(c))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
 
     # ---- 단축키 ----
     hk = {"down": False}
+
+    def room_key(i):
+        rs = radio.rooms()
+        if 0 <= i < len(rs):
+            radio.select_room(rs[i][0])
+    for i in range(1, 9):
+        root.bind("<Control-Key-%d>" % i, lambda e, i=i: room_key(i - 1))
 
     def bind_hotkey():
         global keyboard
@@ -1898,49 +1983,68 @@ def run_ui(start_minimized, selftest=False):
             msg_head.configure(text="%s %s  ·  최근 것이 위" % (room_icon, "모두의 대화" if cur[0] == "all" else room_name + "와의 대화"), text_color=room_color)
 
             window_visible = root.state() in ("normal", "zoomed")   # 최대화된 창도 보이는 것
-            shown = radio.room_clips(cur)[:20]
+            shown = list(reversed(radio.room_clips(cur)[:40]))   # 오래된 것 → 최신 (최신이 아래)
             csig = (cur[0],) + tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
                                       window_visible and c.get("kind") == "text" and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent)
                                      for c in shown)
             if csig != cache["clips"]:
+                prev_last = cache["clips"][-1] if (cache["clips"] and len(cache["clips"]) > 1) else None
+                newest_changed = bool(shown) and prev_last != csig[-1]
+                was_bottom = chat["stick"] or at_bottom()
                 cache["clips"] = csig
                 for c in msg_list.winfo_children():
                     c.destroy()
                 if not shown:
-                    ctk.CTkLabel(msg_list, text="아직 메시지가 없어요", font=font(12), text_color=SUB).pack(pady=24)
-                else:
-                    for c in shown:
+                    ctk.CTkLabel(msg_list, text="아직 대화가 없어요. 아래에 적어 보내거나, 큰 버튼을 누르고 말해 보세요.", font=font(12), text_color=SUB, wraplength=360).pack(pady=28)
+                prev_day, prev_from, prev_ts = None, None, 0
+                for c in shown:
+                    day = day_label(c["ts"])
+                    if day != prev_day:
+                        ctk.CTkLabel(msg_list, text=day, font=font(10), text_color=SUB, fg_color=BG, corner_radius=10, height=20).pack(pady=(10, 4))
+                        prev_day, prev_from = day, None
+                    mine = bool(c.get("mine"))
+                    sender = "나" if mine else c.get("from")
+                    same = (sender == prev_from) and (c["ts"] - prev_ts < 180)
+                    prev_from, prev_ts = sender, c["ts"]
+                    who_color = member_style(c.get("from"))[1]
+                    line = ctk.CTkFrame(msg_list, fg_color="transparent")
+                    line.pack(fill="x", pady=(1 if same else 6, 1))
+                    col = ctk.CTkFrame(line, fg_color="transparent")
+                    col.pack(side="right" if mine else "left", padx=(60, 4) if mine else (4, 60))
+                    if not mine and not same:
+                        ctk.CTkLabel(col, text="%s %s" % (member_style(c["from"])[0], c["from"]), font=font(12, True), text_color=who_color, anchor="w").pack(anchor="w", padx=4)
+                    row = ctk.CTkFrame(col, fg_color=("#2A3F66" if mine else CARD2), corner_radius=16, border_width=0)
+                    row.pack(anchor="e" if mine else "w")
+                    if mine and c.get("mode") != "all":
+                        ctk.CTkLabel(row, text="→ %s" % c["from"], font=font(10), text_color=SUB, anchor="w").pack(anchor="w", padx=12, pady=(6, 0))
+                    if c.get("kind") == "text":
+                        ctk.CTkLabel(row, text=c.get("text", ""), font=font(17), text_color=TXT, anchor="w", wraplength=300, justify="left").pack(padx=12, pady=(8, 8))
+                    else:
                         playing = radio.playing is c
-                        who_color = SUB if c.get("mine") else member_style(c.get("from"))[1]
-                        row = ctk.CTkFrame(msg_list, fg_color=CARD2, corner_radius=12)
-                        row.pack(fill="x", pady=3)
-                        # 보낸 사람 색은 왼쪽 가는 띠와 이름에만 — 글 내용은 밝은 글씨 그대로
-                        ctk.CTkFrame(row, fg_color=who_color, width=5, corner_radius=3).pack(side="left", fill="y", padx=(6, 0), pady=6)
-                        body_ = ctk.CTkFrame(row, fg_color="transparent")
-                        body_.pack(side="left", fill="both", expand=True)
-                        when_ = time.strftime("%m/%d %H:%M", time.localtime(c["ts"]))
-                        top = ctk.CTkFrame(body_, fg_color="transparent")
-                        top.pack(fill="x", padx=10, pady=(8, 0))
-                        name_ = radio.clip_title(c) if c.get("mine") else "%s %s" % (member_style(c.get("from"))[0], radio.clip_title(c))
-                        ctk.CTkLabel(top, text=name_, font=font(12, True), text_color=who_color, anchor="w").pack(side="left")
-                        ctk.CTkLabel(top, text=when_, font=font(10), text_color=SUB).pack(side="right")
-                        if c.get("kind") == "text":
-                            ctk.CTkLabel(body_, text=c.get("text", ""), font=font(17), text_color=TXT, anchor="w", wraplength=330, justify="left").pack(fill="x", padx=10, pady=(2, 0))
-                        elif c.get("kind") == "clip":
-                            ctk.CTkLabel(body_, text="%s · %d초" % ("🔊 재생 중" if playing else "🎙 음성", max(1, int(c["seconds"]))), font=font(15), text_color=TXT, anchor="w").pack(fill="x", padx=10, pady=(2, 0))
-                        if c.get("mine"):
-                            rt = radio.receipt_text(c)
-                            if rt:
-                                ctk.CTkLabel(body_, text=rt, font=font(11), text_color=AMBER, anchor="w").pack(fill="x", padx=10)
-                        elif c.get("kind") == "text" and window_visible:
-                            radio.mark_seen(c)
-                        btns = ctk.CTkFrame(body_, fg_color="transparent")
-                        btns.pack(fill="x", padx=6, pady=(0, 4))
-                        small(btns, "삭제", lambda c=c: radio.delete_clip(c), color=SUB).pack(side="right")
-                        if not c.get("mine"):
-                            small(btns, "답장", lambda c=c: (radio.set_target(c["from"]), entry.focus_set())).pack(side="right")
+                        secs = max(1, int(c.get("seconds") or 0))
                         if c.get("kind") == "clip":
-                            small(btns, "정지" if playing else "듣기", lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c)).pack(side="right")
+                            ctk.CTkButton(row, text=("■  재생 중 · %d초" % secs) if playing else ("▶  음성 %d초" % secs), font=font(15, True),
+                                          fg_color="transparent", hover_color=OUTLINE, text_color=TXT, height=40, corner_radius=12,
+                                          command=lambda c=c, p=playing: radio.stop_clip() if p else radio.play_clip(c)).pack(padx=6, pady=4)
+                        else:
+                            ctk.CTkLabel(row, text="🎙  음성 %d초 보냄" % secs, font=font(14), text_color=TXT).pack(padx=12, pady=(8, 8))
+                    for wdg in [row] + row.winfo_children():
+                        try:
+                            wdg.bind("<Button-3>", lambda e, c=c: bubble_menu(e, c))
+                        except Exception:
+                            pass
+                    meta = time.strftime("%H:%M", time.localtime(c["ts"]))
+                    if mine:
+                        rt = radio.receipt_text(c)
+                        if rt:
+                            meta = rt + "  ·  " + meta
+                    elif c.get("kind") == "text" and window_visible:
+                        radio.mark_seen(c)
+                    ctk.CTkLabel(col, text=meta, font=font(10), text_color=(AMBER if (mine and radio.receipt_text(c)) else SUB)).pack(anchor="e" if mine else "w", padx=6)
+                if was_bottom or not shown:
+                    root.after(30, scroll_bottom)
+                elif newest_changed:
+                    new_btn.place(relx=0.5, rely=1.0, anchor="s", y=-6)
 
     def on_close():
         if tray["icon"]:
@@ -2305,7 +2409,7 @@ def _selftest_start(ctx):
         radio._on_bin(bytes([CLIP]) + struct.pack("!I", 9001) + bytes(32000))
     step("음성 클립 받기 → 목록·팝업", inject_clip,
          until=lambda: any(c.get("kind") == "clip" and c.get("id") == 9001 for c in radio.clips)
-         and any(txt(b) in ("듣기", "정지") for b in widgets(ctx["msg_list"], ctk.CTkButton)))
+         and any("음성" in (txt(b) or "") for b in widgets(ctx["msg_list"], ctk.CTkButton)))
 
     # 6. 설정창: 관리 항목(암호) · 바로가기 · 저장
     step("설정창 열기", ctx["open_settings"], until=lambda: any(txt(b) == "저장" for b in widgets(root, ctk.CTkButton)))
@@ -2322,6 +2426,11 @@ def _selftest_start(ctx):
         button("변경 저장하고 다시 연결").invoke()
     step("관리 저장(다시 연결)", save_admin, until=lambda: not tops())
     step("새 연결로 다시 붙음", until=lambda: radio.connected and radio.client.sock is not None and radio.client.sock is not ctx["old_sock"], timeout=20)
+
+    def history_ok():   # 다시 붙으면 서버가 보낸 기록이 합쳐지되 중복은 없어야 함
+        mids = [c.get("mid") for c in radio.clips if c.get("mid")]
+        return len(mids) == len(set(mids)) and any(c.get("text") == "지금 갈게요" for c in radio.clips) and helper.find("history")
+    step("서버 대화 기록 합침(중복 없음)", until=history_ok)
 
     def fake_update():   # 서버의 updates 폴더에 가짜 새 버전을 놓고, 클라이언트가 받아서 sha256까지 확인하는지
         d = os.path.join(os.environ.get("DATA_DIR") or tempfile_dir(), "updates")

@@ -55,6 +55,9 @@ MAX_TALK_SEC = float(os.environ.get("MAX_TALK_SEC", "60"))
 KEEP_HOURS = float(os.environ.get("KEEP_HOURS", "24"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 SCHEDULE_FILE = os.path.join(DATA_DIR, "schedules.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")   # 문자 대화 기록 (폰·PC 어디서 열어도 같은 대화가 보이게)
+HISTORY_KEEP = 400
+HISTORY_SEND = 120
 RECEIPT_KEEP = 300
 MAX_QUEUE = 20
 PING_INTERVAL = 20      # 감시 주기 (예약 메시지도 이 주기로 확인)
@@ -238,6 +241,8 @@ class Hub:
         self.schedules = []      # 예약 메시지 목록 (파일에 저장)
         self.sched_seq = 0
         self.load_schedules()
+        self.history = []        # 문자 기록 [{mid, from, mode, to, text, ts, status}]
+        self.load_history()
 
     # ---- 상태 ----
 
@@ -346,6 +351,10 @@ class Hub:
         mid = self.new_receipt(name, "text", targets)
         item = {"kind": "text", "id": self.clip_seq, "mid": mid, "from": name, "mode": mode, "ts": time.time(), "text": text}
         log("문자: %s -> %s: %s", name, "전체" if mode == "all" else ",".join(targets), text)
+        self.history.append({"mid": mid, "from": name, "mode": mode, "to": targets, "text": text, "ts": int(item["ts"]),
+                             "status": self.receipts[mid]["status"]})
+        del self.history[:-HISTORY_KEEP]
+        self.save_history()
         for t in targets:
             q = self.queue.setdefault(t, [])
             q.append(item)
@@ -365,7 +374,39 @@ class Hub:
         if len(self.receipts) > RECEIPT_KEEP:
             for old in sorted(self.receipts)[:len(self.receipts) - RECEIPT_KEEP]:
                 del self.receipts[old]
+        if kind != "text":
+            self.save_history()   # 번호(seq)가 재시작 뒤에도 이어지도록
         return mid
+
+    # ---- 문자 대화 기록 ----
+
+    def load_history(self):
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.history = data.get("items", [])[-HISTORY_KEEP:]
+            self.clip_seq = max(self.clip_seq, int(data.get("seq", 0)))
+        except Exception:
+            self.history = []
+        for it in self.history:   # 재시작 뒤에도 읽음 확인이 이어지게 복원
+            if it.get("mid") and isinstance(it.get("status"), dict):
+                self.receipts[it["mid"]] = {"from": it["from"], "kind": "text", "ts": it["ts"], "status": it["status"]}
+
+    def save_history(self):
+        try:
+            tmp = HISTORY_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"items": self.history[-HISTORY_KEEP:], "seq": self.clip_seq}, f, ensure_ascii=False)
+            os.replace(tmp, HISTORY_FILE)
+        except Exception as e:
+            log("기록 저장 실패: %r", e)
+
+    async def send_history(self, ws):
+        """접속 직후: 내가 보냈거나 받은 최근 문자 기록"""
+        name = ws.name
+        mine = [{"mid": it["mid"], "from": it["from"], "mode": it["mode"], "to": it["to"], "text": it["text"], "ts": it["ts"]}
+                for it in self.history if it["from"] == name or name in it.get("to", [])]
+        await ws.send_json({"type": "history", "items": mine[-HISTORY_SEND:]})
 
     async def mark(self, mid, who, state):
         """받는 사람의 상태를 올림 (sent < received < seen). 바뀌면 보낸 사람에게 알림"""
@@ -572,6 +613,7 @@ class Hub:
             await ws.send_json({"type": "welcome", "members": MEMBERS, "you": name, "where": where,
                                 "parents": sorted(PARENTS)})
             await self.broadcast_presence()
+            await self.send_history(ws)
             await self.flush_queue(name)
             await self.send_my_receipts(ws)
             await self.send_schedules(name)

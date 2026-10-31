@@ -19,8 +19,8 @@
         <item name="colorOutline">#2B3752</item>
         <item name="colorError">#F26D6D</item>
         <item name="android:windowBackground">#0B1220</item>
-        <item name="android:statusBarColor">@android:color/transparent</item>
-        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:statusBarColor">#0B1220</item>
+        <item name="android:navigationBarColor">#0B1220</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

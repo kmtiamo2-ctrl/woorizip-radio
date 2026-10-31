@@ -91,6 +91,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var noticeText: TextView
     private lateinit var quickRow: LinearLayout
     private lateinit var input: TextInputEditText
+    private lateinit var inputRow: LinearLayout
     private lateinit var msgCard: MaterialCardView
     private lateinit var msgHead: TextView
     private lateinit var msgList: LinearLayout
@@ -118,7 +119,6 @@ class MainActivity : AppCompatActivity() {
         Radio.init(this)
         Notifs.createChannels(this)
         volumeControlStream = AudioManager.STREAM_MUSIC
-        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(buildUi())
         if (!prefs.isConfigured) settingsBox.visibility = View.VISIBLE
         else if (prefs.standby && !RadioService.running) ensurePermissionsThenStart()
@@ -285,7 +285,7 @@ class MainActivity : AppCompatActivity() {
         quickRow = LinearLayout(this)
         scroll.addView(quickRow)
         mi.addView(scroll, lp(top = 12))
-        val inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val (til, et) = inputField("메시지 입력")
         input = et
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -318,10 +318,15 @@ class MainActivity : AppCompatActivity() {
         root.addView(settingsBox, lp(top = 14))
 
         scrollRoot = NestedScrollView(this).apply { setBackgroundColor(cBg); addView(root); isFillViewport = true }
+        // 키패드 대응 두 가지를 모두 지원:
+        //  - 시스템이 창을 줄여 주는 기기(adjustResize): 창 높이가 줄면 입력칸까지 스크롤
+        //  - 가장자리까지 그리는 기기(Android 15 이상): 키패드 높이만큼 아래 여백을 두고 입력칸까지 스크롤
+        scrollRoot.addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
+            if (bottom < oldBottom && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
+        }
         ViewCompat.setOnApplyWindowInsetsListener(scrollRoot) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-            // 키패드가 올라오면 입력칸이 가려지지 않게 그 자리까지 스크롤
             if (insets.isVisible(WindowInsetsCompat.Type.ime()) && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
             insets
         }
@@ -617,11 +622,19 @@ class MainActivity : AppCompatActivity() {
         standbySwitch.isChecked = RadioService.running
     }
 
-    /** 입력칸(과 그 아래 보내기 줄)이 화면 안에 보이도록 스크롤 */
+    /** 입력칸 줄이 (키패드 위) 보이는 영역 안에 오도록 스크롤. 아래 여백(padding)까지 감안해서 직접 계산 */
     private fun revealInput() {
         if (!::input.isInitialized || !::scrollRoot.isInitialized) return
-        val r = android.graphics.Rect(0, 0, input.width, input.height + dp(72))
-        input.requestRectangleOnScreen(r, true)
+        var y = 0
+        var v: View = inputRow
+        while (v !== scrollRoot) {
+            y += v.top
+            v = (v.parent as? View) ?: return
+        }
+        val rowBottom = y + inputRow.height + dp(16)
+        val visibleH = scrollRoot.height - scrollRoot.paddingTop - scrollRoot.paddingBottom
+        val target = rowBottom - visibleH
+        if (target > scrollRoot.scrollY) scrollRoot.smoothScrollTo(0, target)
     }
 
     private fun dayLabel(ts: Long): String {

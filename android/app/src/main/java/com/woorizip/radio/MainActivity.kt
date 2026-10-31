@@ -97,6 +97,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var noticeText: TextView
     private lateinit var quickRow: LinearLayout
     private lateinit var input: TextInputEditText
+    private lateinit var inputTil: TextInputLayout
+    private lateinit var sendBtn: MaterialButton
     private lateinit var inputRow: LinearLayout
     private lateinit var msgCard: MaterialCardView
     private lateinit var msgHead: TextView
@@ -319,12 +321,13 @@ class MainActivity : AppCompatActivity() {
         bottom.addView(scroll)
         inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val (til, et) = inputField("메시지 입력")
-        input = et
+        input = et; inputTil = til
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         input.setOnFocusChangeListener { _, has -> if (has) scrollRoot.postDelayed({ scrollRoot.fullScroll(View.FOCUS_DOWN) }, 300) }
         input.imeOptions = EditorInfo.IME_ACTION_SEND   // 키패드의 '완료' 대신 '전송' — 치고 바로 보내고, 키패드는 그대로 열려 있음
         input.setOnEditorActionListener { _, action, _ -> if (action == EditorInfo.IME_ACTION_SEND) { sendTyped(); true } else false }
-        inputRow.addView(pill("보내기", true) { sendTyped() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
+        sendBtn = pill("보내기", true) { sendTyped() }
+        inputRow.addView(sendBtn, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
         inputRow.addView(pill("⏰", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
         bottom.addView(inputRow, lp(top = 6))
         outer.addView(bottom)
@@ -711,10 +714,20 @@ class MainActivity : AppCompatActivity() {
         }
         msgHead.text = "${room.icon} ${if (room.key == "all") "모두의 대화" else room.label + "와의 대화"}"
         msgHead.setTextColor(room.color)
+        if (inputRoomKey != room.key) {   // 입력칸 테두리·보내기 버튼·안내 글을 고른 방 색으로 — 키패드 위 입력줄만 봐도 누구에게 보내는지 보이게
+            inputRoomKey = room.key
+            inputTil.boxStrokeColor = room.color
+            inputTil.hintTextColor = ColorStateList.valueOf(room.color)
+            inputTil.defaultHintTextColor = ColorStateList.valueOf(room.color)
+            inputTil.hint = "${if (room.key == "all") "모두" else room.label}에게 메시지"
+            sendBtn.backgroundTintList = ColorStateList.valueOf(room.color)
+            sendBtn.setTextColor(onRoom)
+        }
         noticeText.text = Radio.notice
         if (::standbySwitch.isInitialized) standbySwitch.isChecked = RadioService.running
     }
 
+    private var inputRoomKey: String? = null
     private var insetPad = intArrayOf(0, 0, 0, 0)
     private var keyboardOverlap = 0   // 창이 안 줄어드는 기기에서 키패드가 가린 높이 (아래 여백으로 보정)
     private var keyboardTaken = 0     // 키패드가 차지한 높이 (열림/닫힘 판단용)

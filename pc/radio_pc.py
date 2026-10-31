@@ -1326,7 +1326,8 @@ def run_ui(start_minimized, selftest=False):
             entry.delete(0, "end")
             chat["stick"] = True
     entry.bind("<Return>", lambda e: send_text(entry.get()))
-    pill(entry_row, "보내기", lambda: send_text(entry.get()), width=76).pack(side="left", padx=(8, 0))
+    send_btn = pill(entry_row, "보내기", lambda: send_text(entry.get()), width=76)
+    send_btn.pack(side="left", padx=(8, 0))
     pill(entry_row, "⏰", lambda: open_schedule(), filled=False, width=44).pack(side="left", padx=(6, 0))
 
     chip_row = ctk.CTkFrame(msg_inner, fg_color="transparent")
@@ -2042,6 +2043,10 @@ def run_ui(start_minimized, selftest=False):
                 talk.configure(fg_color=room_color); talk_title.configure(text="%s %s에게 말하기" % (room_icon, room_name), text_color="#101418"); talk_sub.configure(text="누르고 있는 동안 말해요", text_color="#101418")
             notice.configure(text=radio.notice)
             msg_head.configure(text="%s %s" % (room_icon, "모두의 대화" if cur[0] == "all" else room_name + "와의 대화"), text_color=room_color)
+            if chat.get("entry_room") != cur[0]:   # 입력칸 테두리·보내기 버튼·안내 글을 고른 방 색으로 — 누구에게 보내는지 입력줄만 봐도 보이게
+                chat["entry_room"] = cur[0]
+                entry.configure(border_color=room_color, placeholder_text="%s에게 메시지  (Enter로 보내기)" % ("모두" if cur[0] == "all" else room_name))
+                send_btn.configure(fg_color=room_color, hover_color=blend(room_color, "#000000", 0.85), text_color="#101418")
 
             window_visible = root.state() in ("normal", "zoomed")   # 최대화된 창도 보이는 것
             shown = list(reversed(radio.room_clips(cur)[:40]))   # 오래된 것 → 최신 (최신이 아래)

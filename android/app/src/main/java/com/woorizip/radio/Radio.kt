@@ -195,6 +195,8 @@ object Radio : RadioClient.Listener {
 
     val httpBase: String? get() = client.httpBase
     val currentNetwork: android.net.Network? get() = client.currentNetwork
+    val homeNote: String get() = client.homeNote
+    fun testHome(done: (String) -> Unit) = client.testHome(done)
     fun startConnection() { me = Prefs(app).name; client.start() }
     fun stopConnection() { stopTalk(); client.stop() }
     fun reconnect() { me = Prefs(app).name; client.reconnectNow() }

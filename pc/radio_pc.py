@@ -49,6 +49,13 @@ def member_style(name):
     return MEMBER_STYLE.get(name, ("🙂", "#9AA6BC"))
 
 
+def blend(fg, bg, a):
+    """두 색을 섞음 (a=0 → bg, 1 → fg). 대화 묶음 상자의 연한 바탕색에 사용"""
+    f = [int(fg[i:i + 2], 16) for i in (1, 3, 5)]
+    g = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02X%02X%02X" % tuple(int(g[i] + (f[i] - g[i]) * a) for i in range(3))
+
+
 def parse_groups(text):
     """'아이들=첫째,둘째;부모님=엄마,아빠' → [(이름, [멤버...]), ...]"""
     out = []
@@ -578,6 +585,19 @@ class Radio:
             elif c.get("from") in ms:
                 out.append(c)
         return out
+
+    def conv_of(self, c):
+        """이 메시지가 '누구와의 대화'인지. 모두에게 보낸 글은 None(묶음 없음), 그 외는 (키, 꼬리표, 색)"""
+        if c.get("mode") == "all":
+            return None
+        names = [n for n in str(c.get("from", "")).split(", ") if n] if c.get("mine") else [c.get("from")]
+        if len(names) == 1:
+            ic, col = member_style(names[0])
+            return (names[0], "%s %s와의 대화" % (ic, names[0]), col)
+        for room in self.rooms():
+            if room[2] is not None and set(room[2]) == set(names):
+                return (room[0], "%s %s에게" % (room[3], room[1]), room[4])
+        return ("c:" + ",".join(sorted(names)), ", ".join(names) + "에게", "#9AA6BC")
 
     def unread_count(self, room):
         return sum(1 for c in self.room_clips(room)
@@ -1210,7 +1230,7 @@ def run_ui(start_minimized, selftest=False):
             return
         try:
             icon.icon = make_icon((34, 197, 94, 255) if connected else (100, 116, 139, 255))
-            icon.title = "%s · %s" % (APP_TITLE, ("집" if where == "home" else "밖") if connected else "연결 안 됨")
+            icon.title = "%s · %s" % (APP_TITLE, "연결됨" if connected else "연결 안 됨")
         except Exception:
             pass
 
@@ -1937,7 +1957,7 @@ def run_ui(start_minimized, selftest=False):
             sub = "%d명 접속" % len(radio.online)
         elif len(members) == 1:
             on = members[0] in radio.online
-            sub = ("밖" if radio.member_where.get(members[0]) == "out" else "집") if on else "꺼짐"
+            sub = "●" if on else "꺼짐"   # 연결된 사람은 점만, 안 된 사람만 "꺼짐" (집/밖 글자는 안 씀)
         else:
             sub = "%d명" % len(members)
         if unread:
@@ -2000,7 +2020,7 @@ def run_ui(start_minimized, selftest=False):
                     room_button(grid, room, room[0] == cur[0], unread[room[0]]).grid(row=i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
 
             if radio.connected:
-                status.configure(text="●  %s · 지금 %s · 가족 %d명 접속 중" % (me, "집" if radio.where == "home" else "밖", len(radio.online)), text_color=GREEN)
+                status.configure(text="●  %s · 연결됨 · 가족 %d명" % (me, len(radio.online)), text_color=GREEN)
             else:
                 status.configure(text="●  " + radio.status, text_color=SUB)
 
@@ -2021,7 +2041,7 @@ def run_ui(start_minimized, selftest=False):
             else:
                 talk.configure(fg_color=room_color); talk_title.configure(text="%s %s에게 말하기" % (room_icon, room_name), text_color="#101418"); talk_sub.configure(text="누르고 있는 동안 말해요", text_color="#101418")
             notice.configure(text=radio.notice)
-            msg_head.configure(text="%s %s  ·  최근 것이 위" % (room_icon, "모두의 대화" if cur[0] == "all" else room_name + "와의 대화"), text_color=room_color)
+            msg_head.configure(text="%s %s" % (room_icon, "모두의 대화" if cur[0] == "all" else room_name + "와의 대화"), text_color=room_color)
 
             window_visible = root.state() in ("normal", "zoomed")   # 최대화된 창도 보이는 것
             shown = list(reversed(radio.room_clips(cur)[:40]))   # 오래된 것 → 최신 (최신이 아래)
@@ -2038,26 +2058,37 @@ def run_ui(start_minimized, selftest=False):
                 if not shown:
                     ctk.CTkLabel(msg_list, text="아직 대화가 없어요. 아래에 적어 보내거나, 큰 버튼을 누르고 말해 보세요.", font=font(12), text_color=SUB, wraplength=360).pack(pady=28)
                 prev_day, prev_from, prev_ts = None, None, 0
+                block, block_key = None, None   # 같은 상대와 주고받은 연속 글은 그 사람 색 테두리 상자로 묶음 (모두에게 보낸 글은 상자 없음)
                 for c in shown:
+                    conv = radio.conv_of(c)
+                    key = conv[0] if conv else None
+                    if key != block_key:
+                        block_key = key
+                        if conv:
+                            block = ctk.CTkFrame(msg_list, fg_color=blend(conv[2], BG, 0.10), border_width=2, border_color=conv[2], corner_radius=14)
+                            block.pack(fill="x", pady=(8, 4), padx=2)
+                            ctk.CTkLabel(block, text=conv[1], font=font(11, True), text_color=conv[2], anchor="w").pack(anchor="w", padx=10, pady=(6, 0))
+                        else:
+                            block = None
+                        prev_from = None
+                    holder = block if block is not None else msg_list
                     day = day_label(c["ts"])
                     if day != prev_day:
-                        ctk.CTkLabel(msg_list, text=day, font=font(10), text_color=SUB, fg_color=BG, corner_radius=10, height=20).pack(pady=(10, 4))
+                        ctk.CTkLabel(holder, text=day, font=font(10), text_color=SUB, fg_color=BG, corner_radius=10, height=20).pack(pady=(10, 4))
                         prev_day, prev_from = day, None
                     mine = bool(c.get("mine"))
                     sender = "나" if mine else c.get("from")
                     same = (sender == prev_from) and (c["ts"] - prev_ts < 180)
                     prev_from, prev_ts = sender, c["ts"]
                     who_color = member_style(c.get("from"))[1]
-                    line = ctk.CTkFrame(msg_list, fg_color="transparent")
-                    line.pack(fill="x", pady=(1 if same else 6, 1))
+                    line = ctk.CTkFrame(holder, fg_color="transparent")
+                    line.pack(fill="x", pady=(1 if same else 6, 1) if block is None else (1 if same else 4, 3), padx=0 if block is None else 6)
                     col = ctk.CTkFrame(line, fg_color="transparent")
                     col.pack(side="right" if mine else "left", padx=(60, 4) if mine else (4, 60))
                     if not mine and not same:
                         ctk.CTkLabel(col, text="%s %s" % (member_style(c["from"])[0], c["from"]), font=font(12, True), text_color=who_color, anchor="w").pack(anchor="w", padx=4)
                     row = ctk.CTkFrame(col, fg_color=("#2A3F66" if mine else CARD2), corner_radius=16, border_width=0)
                     row.pack(anchor="e" if mine else "w")
-                    if mine and c.get("mode") != "all":
-                        ctk.CTkLabel(row, text="→ %s" % c["from"], font=font(10), text_color=SUB, anchor="w").pack(anchor="w", padx=12, pady=(6, 0))
                     if c.get("kind") == "text":
                         ctk.CTkLabel(row, text=c.get("text", ""), font=font(17), text_color=TXT, anchor="w", wraplength=300, justify="left").pack(padx=12, pady=(8, 8))
                     else:
@@ -2423,6 +2454,7 @@ def _selftest_start(ctx):
          until=lambda: helper.find("text", text="알겠어요", mode="direct") and ctx["popup"]["win"] is ctx["reply_popup"] and labels_with("✓ 보냈어요", ctx["popup"]["win"]))
     step("'보냈어요' 팝업은 저절로 닫힘", until=lambda: ctx["popup"]["win"] is None, timeout=8)
     step("엄마 쪽에 '봄' 확인 도착", until=lambda: any((m.get("status") or {}).get("아빠") == "seen" for m in helper.find("receipt")))
+    step("1:1 글은 '엄마와의 대화' 상자로 묶임", until=lambda: labels_with("엄마와의 대화", ctx["msg_list"]))
     step("답장칸 열어 두고 본 창 클릭 → 닫힘", lambda: (helper.send({"type": "text", "to": "아빠", "text": "밥은?"}), None)[1],
          until=lambda: ctx["popup"]["win"] is not None and labels_with("밥은?", ctx["popup"]["win"]))
 

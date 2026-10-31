@@ -67,7 +67,7 @@ object Notifs {
     /** 수신 대기 알림 (최소 등급이라 알림창 맨 아래에 작게 보임, 말하기 시작/끝 버튼 포함). '수신 끄기'는 아이들이 눌러 버리지 않게 앱 설정에서만 */
     fun standby(ctx: Context): Notification {
         val who = Radio.targetLabel()
-        val place = if (Radio.where == "out") " · 밖" else ""
+        val place = ""   // 집/밖은 글자로 보여주지 않음
         val title = when {
             Radio.talking -> "🎙 $who 에게 말하는 중"
             Radio.playingClip != null -> "🔊 ${Radio.playingClip?.title} 재생 중"

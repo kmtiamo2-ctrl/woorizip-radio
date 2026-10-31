@@ -428,13 +428,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun roomChip(room: Room, selected: Boolean, unread: Int): Chip {
         val m = room.members
-        val base = if (m == null) "${Radio.online.size}명 접속"
-            else if (m.size == 1) (if (m[0] in Radio.online) (if (Radio.memberWhere[m[0]] == "out") "밖" else "집") else "꺼짐")
-            else "${m.size}명"
-        val sub = base + (if (unread > 0) " · 새 글 $unread" else "")
-        val dim = m != null && m.size == 1 && m[0] !in Radio.online
+        val single = m != null && m.size == 1
+        val on = single && m!![0] in Radio.online
+        // 사람 방: 연결된 사람은 초록 점만, 안 된 사람만 "꺼짐" (집/밖 글자는 안 씀)
+        val base = if (m == null) "${Radio.online.size}명 접속" else if (single) (if (on) "" else "꺼짐") else "${m.size}명"
+        val sub = listOf(base, if (unread > 0) "새 글 $unread" else "").filter { it.isNotEmpty() }.joinToString(" · ")
+        val dim = single && !on
         return Chip(this).apply {
-            text = "${room.icon} ${room.label} · $sub"
+            text = "${room.icon} ${room.label}" + (if (sub.isNotEmpty()) " · $sub" else "")
+            if (on) { chipIcon = circle(if (selected) Color.parseColor("#101418") else cGreen); chipIconSize = dpf(9); isChipIconVisible = true; iconStartPadding = dpf(6) }
             isCheckable = true; isChecked = selected; isCheckedIconVisible = false
             textSize = 14f
             chipCornerRadius = dpf(18)
@@ -680,9 +682,8 @@ class MainActivity : AppCompatActivity() {
         renderMessages()
 
         val me = prefs.name
-        val place = if (Radio.atHome) "집" else "밖"
         if (Radio.connected) {
-            statusText.text = "$me · 지금 $place · 가족 ${Radio.online.size}명 접속 중"
+            statusText.text = "$me · 연결됨 · 가족 ${Radio.online.size}명"   // 집/밖 구분은 동작(밖의 아이는 진동)에만 쓰고 글자로는 안 보여줌
             statusText.setTextColor(cGreen); statusDot.background = circle(cGreen)
         } else {
             statusText.text = Radio.status
@@ -750,6 +751,24 @@ class MainActivity : AppCompatActivity() {
         }.show()
     }
 
+    private class Conv(val key: String, val label: String, val color: Int)
+
+    /** 이 메시지가 '누구와의 대화'인지. 모두에게 보낸 글은 null(묶음 없음), 그 외는 상대 키·꼬리표·색 */
+    private fun convOf(c: Clip): Conv? {
+        if (c.mode == "all") return null
+        val names = if (c.mine) c.from.split(", ").filter { it.isNotBlank() } else listOf(c.from)
+        if (names.size == 1) return Conv(names[0], "${Family.icon(names[0])} ${names[0]}와의 대화", Family.color(names[0]))
+        val set = names.toSet()
+        val room = Radio.rooms().firstOrNull { it.members != null && it.members.toSet() == set }
+        return if (room != null) Conv(room.key, "${room.icon} ${room.label}에게", room.color)
+        else Conv("c:" + names.sorted().joinToString(","), names.joinToString(", ") + "에게", cSub)
+    }
+
+    private fun blendColor(fg: Int, bg: Int, a: Float): Int = Color.rgb(
+        (Color.red(bg) + (Color.red(fg) - Color.red(bg)) * a).toInt(),
+        (Color.green(bg) + (Color.green(fg) - Color.green(bg)) * a).toInt(),
+        (Color.blue(bg) + (Color.blue(fg) - Color.blue(bg)) * a).toInt())
+
     private fun renderMessages() {
         val room = Radio.currentRoom()
         val shown = Radio.roomClips(room).take(40).reversed()   // 오래된 것 → 최신 (최신이 아래)
@@ -767,10 +786,27 @@ class MainActivity : AppCompatActivity() {
         var prevFrom: String? = null
         var prevTs = 0L
         val onDark = cText
+        var block: LinearLayout? = null   // 같은 상대와 주고받은 연속 글은 그 사람 색 테두리 상자로 묶음 (모두에게 보낸 글은 상자 없음)
+        var blockKey: String? = null
         shown.forEach { c ->
+            val conv = convOf(c)
+            if (conv?.key != blockKey) {
+                blockKey = conv?.key
+                block = if (conv == null) null else LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        cornerRadius = dpf(16); setStroke(dp(2), conv.color); setColor(blendColor(conv.color, cBg, 0.10f))
+                    }
+                    setPadding(dp(8), dp(6), dp(8), dp(8))
+                    addView(label(conv.label, 11f, conv.color, true).apply { setPadding(dp(4), 0, 0, 0) })
+                    msgList.addView(this, lp(top = 10))
+                }
+                prevFrom = null
+            }
+            val holder: LinearLayout = block ?: msgList
             val day = dayLabel(c.ts)
             if (day != prevDay) {
-                msgList.addView(label(day, 11f, cSub).apply { gravity = Gravity.CENTER; background = roundRect(cBg, 10); setPadding(dp(10), dp(3), dp(10), dp(3)) },
+                holder.addView(label(day, 11f, cSub).apply { gravity = Gravity.CENTER; background = roundRect(cBg, 10); setPadding(dp(10), dp(3), dp(10), dp(3)) },
                     lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 10).apply { gravity = Gravity.CENTER_HORIZONTAL })
                 prevDay = day; prevFrom = null
             }
@@ -790,7 +826,6 @@ class MainActivity : AppCompatActivity() {
                 setPadding(dp(14), dp(9), dp(14), dp(9))
                 setOnLongClickListener { bubbleMenu(c); true }
             }
-            if (c.mine && c.mode != "all") bubble.addView(label("→ ${c.from}", 11f, cSub))
             val playing = Radio.playingClip === c
             when {
                 c.isText -> bubble.addView(label(c.text ?: "", 19f, onDark).apply { setTextIsSelectable(false) })
@@ -813,7 +848,7 @@ class MainActivity : AppCompatActivity() {
                 Radio.markSeen(c)   // 화면에 표시됨 = 봤음
             }
             col.addView(label(meta, 10f, metaColor).apply { setPadding(dp(6), dp(1), dp(6), 0) }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = if (c.mine) Gravity.END else Gravity.START })
-            msgList.addView(col, colLp)
+            holder.addView(col, colLp)
         }
         if (stickBottom || (newestChanged && nearBottom)) scrollRoot.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }
         stickBottom = false

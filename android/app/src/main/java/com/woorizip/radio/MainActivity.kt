@@ -21,6 +21,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -87,6 +88,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var incomingCard: MaterialCardView
     private lateinit var incomingText: TextView
     private lateinit var memberGroup: ChipGroup
+    private lateinit var memberHolder: FrameLayout          // 평소: 여러 줄로 펼침
+    private lateinit var memberScroll: HorizontalScrollView // 키패드 열림: 한 줄로 접어 옆으로 넘김
+    private lateinit var roomsGuide: TextView
     private lateinit var talkCard: MaterialCardView
     private lateinit var talkTitle: TextView
     private lateinit var talkSub: TextView
@@ -263,10 +267,15 @@ class MainActivity : AppCompatActivity() {
         incomingCard.addView(incomingText)
         root.addView(incomingCard, lp(top = 12))
 
-        // 대화방
-        root.addView(sectionTitle("대화방  ·  누르면 그 방  ·  길게 누르면 몇 명만 묶기"), lp(top = 14))
+        // 대화방 (평소엔 여러 줄로 펼침, 키패드가 열리면 한 줄로 접어 대화 칸에 자리를 내줌)
+        roomsGuide = sectionTitle("대화방  ·  누르면 그 방  ·  길게 누르면 몇 명만 묶기")
+        root.addView(roomsGuide, lp(top = 14))
         memberGroup = ChipGroup(this).apply { chipSpacingHorizontal = dp(8); chipSpacingVertical = dp(4) }
-        root.addView(memberGroup, lp(top = 6))
+        memberHolder = FrameLayout(this)
+        memberHolder.addView(memberGroup, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(memberHolder, lp(top = 6))
+        memberScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; clipToPadding = false; visibility = View.GONE }
+        root.addView(memberScroll, lp(top = 6))
 
         // 말하기 버튼
         talkCard = MaterialCardView(this).apply {
@@ -313,8 +322,9 @@ class MainActivity : AppCompatActivity() {
         input = et
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         input.setOnFocusChangeListener { _, has -> if (has) scrollRoot.postDelayed({ scrollRoot.fullScroll(View.FOCUS_DOWN) }, 300) }
-        inputRow.addView(pill("보내기", true) { val t = input.text.toString(); if (t.isNotBlank() && Radio.sendText(t)) { input.setText(""); stickBottom = true } },
-            lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
+        input.imeOptions = EditorInfo.IME_ACTION_SEND   // 키패드의 '완료' 대신 '전송' — 치고 바로 보내고, 키패드는 그대로 열려 있음
+        input.setOnEditorActionListener { _, action, _ -> if (action == EditorInfo.IME_ACTION_SEND) { sendTyped(); true } else false }
+        inputRow.addView(pill("보내기", true) { sendTyped() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
         inputRow.addView(pill("⏰", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
         bottom.addView(inputRow, lp(top = 6))
         outer.addView(bottom)
@@ -324,8 +334,10 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.setOnApplyWindowInsetsListener(outer) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            barsBottom = bars.bottom; imeBottom = ime.bottom
             insetPad = intArrayOf(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
             applyKeyboardPadding()
+            applyKeyboardLayout()
             insets
         }
         outer.viewTreeObserver.addOnGlobalLayoutListener {
@@ -334,9 +346,51 @@ class MainActivity : AppCompatActivity() {
             val loc = IntArray(2); outer.getLocationOnScreen(loc)
             val covered = (loc[1] + outer.height) - r.bottom
             val kb = (covered - insetPad[3]).coerceAtLeast(0)
+            // 키패드가 차지한 높이: 창이 줄어드는 기기(옛 방식)도, 가장자리까지 그리는 기기도 모두 보이는 영역으로 잼
+            val taken = (outer.rootView.height - r.bottom - barsBottom).coerceAtLeast(0)
+            keyboardTaken = maxOf(kb, taken)
             if (kb != keyboardOverlap) { keyboardOverlap = kb; applyKeyboardPadding() }
+            applyKeyboardLayout()
         }
         return outer
+    }
+
+    private fun sendTyped() {
+        val t = input.text.toString()
+        if (t.isNotBlank() && Radio.sendText(t)) { input.setText(""); stickBottom = true }
+    }
+
+    private var compactMode = false
+
+    /** 키패드가 열리면 큰 말하기 버튼·안내 줄을 숨기고 대화방 칩을 한 줄로 접어, 그 자리에 선택한 방의 대화가 보이게 함. 내리면 원래대로. */
+    private fun applyKeyboardLayout() {
+        if (!::talkCard.isInitialized) return
+        val compact = imeBottom > 0 || keyboardOverlap > 0 || keyboardTaken > dp(80)
+        if (compact == compactMode) return
+        compactMode = compact
+        val shown = if (compact) View.GONE else View.VISIBLE
+        roomsGuide.visibility = shown
+        talkCard.visibility = shown
+        noticeText.visibility = shown
+        (memberGroup.parent as? ViewGroup)?.removeView(memberGroup)
+        memberGroup.isSingleLine = compact
+        if (compact) {
+            memberScroll.addView(memberGroup, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            memberHolder.visibility = View.GONE; memberScroll.visibility = View.VISIBLE
+            memberScroll.post { scrollToSelectedChip() }
+            scrollRoot.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }   // 선택한 방의 최신 글이 입력칸 바로 위에 오게
+        } else {
+            memberHolder.addView(memberGroup, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            memberScroll.visibility = View.GONE; memberHolder.visibility = View.VISIBLE
+        }
+    }
+
+    private fun scrollToSelectedChip() {
+        if (!compactMode) return
+        for (i in 0 until memberGroup.childCount) {
+            val c = memberGroup.getChildAt(i) as? Chip ?: continue
+            if (c.isChecked) { memberScroll.smoothScrollTo((c.left - dp(8)).coerceAtLeast(0), 0); break }
+        }
     }
 
     private fun circle(color: Int) = android.graphics.drawable.GradientDrawable().apply { shape = android.graphics.drawable.GradientDrawable.OVAL; setColor(color) }
@@ -409,6 +463,7 @@ class MainActivity : AppCompatActivity() {
         memberSig = sig
         memberGroup.removeAllViews()
         rooms.forEach { memberGroup.addView(roomChip(it, it.key == cur.key, unread[it.key] ?: 0)) }
+        if (compactMode) memberScroll.post { scrollToSelectedChip() }   // 한 줄로 접힌 상태면 선택한 방이 보이게 옆으로 맞춤
     }
 
     private fun renderQuick() {
@@ -649,7 +704,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var insetPad = intArrayOf(0, 0, 0, 0)
-    private var keyboardOverlap = 0
+    private var keyboardOverlap = 0   // 창이 안 줄어드는 기기에서 키패드가 가린 높이 (아래 여백으로 보정)
+    private var keyboardTaken = 0     // 키패드가 차지한 높이 (열림/닫힘 판단용)
+    private var barsBottom = 0
+    private var imeBottom = 0
 
     private fun applyKeyboardPadding() {
         if (!::outer.isInitialized) return

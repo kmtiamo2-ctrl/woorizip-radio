@@ -26,6 +26,11 @@ class Prefs(ctx: Context) {
         get() = (sp.getString("key", null) ?: "").ifBlank { DEFAULT_KEY }
         set(v) = sp.edit().putString("key", v).apply()
 
+    /** 대화방 묶음: "아이들=첫째,둘째,셋째;부모님=엄마,아빠" */
+    var groups: String
+        get() = (sp.getString("groups", null) ?: "").ifBlank { DEFAULT_GROUPS }
+        set(v) = sp.edit().putString("groups", v.trim()).apply()
+
     /** 화면 꺼짐 볼륨키 방식: "hold" = 길게 누르는 동안 말하기, "double" = 두 번 눌러 켜고 끄기 */
     var keyMode: String
         get() = sp.getString("keyMode", "hold") ?: "hold"
@@ -59,6 +64,7 @@ class Prefs(ctx: Context) {
         const val DEFAULT_OUT_HOST = "100.83.179.121"
         const val DEFAULT_KEY = "105403"
         const val DEFAULT_QUICK = "네,아니요,알겠어요,지금 갈게요,조금 있다가요,지금은 못 해요"
+        const val DEFAULT_GROUPS = "아이들=첫째,둘째,셋째;부모님=엄마,아빠"
 
         /** "192.168.0.10", "192.168.0.10:8765", "wss://xxx.synology.me" 등을 WebSocket 주소로 */
         fun toWsUrl(addr: String): String {

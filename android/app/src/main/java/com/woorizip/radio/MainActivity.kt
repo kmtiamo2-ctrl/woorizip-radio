@@ -90,6 +90,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var quickRow: LinearLayout
     private lateinit var input: TextInputEditText
     private lateinit var msgCard: MaterialCardView
+    private lateinit var msgHead: TextView
     private lateinit var msgList: LinearLayout
     private lateinit var standbySwitch: MaterialSwitch
     private lateinit var settingsBox: LinearLayout
@@ -243,7 +244,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(incomingCard, lp(top = 16))
 
         // 누구에게
-        root.addView(sectionTitle("누구에게  ·  여러 명 고를 수 있어요"), lp(top = 22))
+        root.addView(sectionTitle("대화방  ·  누르면 그 방  ·  길게 누르면 몇 명만 묶기"), lp(top = 22))
         memberGroup = ChipGroup(this).apply { chipSpacingHorizontal = dp(8); chipSpacingVertical = dp(6) }
         root.addView(memberGroup, lp(top = 8))
 
@@ -289,7 +290,8 @@ class MainActivity : AppCompatActivity() {
         // 메시지
         val (mc, mi) = card(pad = 14)
         msgCard = mc
-        mi.addView(sectionTitle("메시지").apply { setPadding(dp(4), 0, 0, 0) })
+        msgHead = sectionTitle("메시지").apply { setPadding(dp(4), 0, 0, 0) }
+        mi.addView(msgHead)
         msgList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         mi.addView(msgList, lp(top = 6))
         msgCard.visibility = View.GONE
@@ -325,6 +327,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun circle(color: Int) = android.graphics.drawable.GradientDrawable().apply { shape = android.graphics.drawable.GradientDrawable.OVAL; setColor(color) }
+    private fun roundRect(color: Int, radiusDp: Int) = android.graphics.drawable.GradientDrawable().apply { cornerRadius = dpf(radiusDp); setColor(color) }
 
     private fun toggleSettings() {
         if (settingsBox.visibility == View.VISIBLE) { settingsBox.visibility = View.GONE; return }
@@ -336,23 +339,25 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- 가족 칩 / 빠른 답장 칩 ----------
 
-    private fun memberChip(text: String, value: String, isOnline: Boolean, selected: Boolean): Chip {
-        val place = when {
-            value == "all" || !isOnline -> ""
-            Radio.memberWhere[value] == "out" -> " · 밖"
-            else -> " · 집"
-        }
+    private fun roomChip(room: Room, selected: Boolean, unread: Int): Chip {
+        val m = room.members
+        val base = if (m == null) "${Radio.online.size}명 접속"
+            else if (m.size == 1) (if (m[0] in Radio.online) (if (Radio.memberWhere[m[0]] == "out") "밖" else "집") else "꺼짐")
+            else "${m.size}명"
+        val sub = base + (if (unread > 0) " · 새 글 $unread" else "")
+        val dim = m != null && m.size == 1 && m[0] !in Radio.online
         return Chip(this).apply {
-            this.text = if (value == "all") text else "${if (isOnline) "●" else "○"} $text$place"
+            text = "${room.icon} ${room.label} · $sub"
             isCheckable = true; isChecked = selected; isCheckedIconVisible = false
             textSize = 14f
             chipCornerRadius = dpf(18)
             chipStrokeWidth = dpf(1)
-            chipStrokeColor = ColorStateList.valueOf(if (selected) cAmber else cOutline)
-            chipBackgroundColor = ColorStateList.valueOf(if (selected) cAmber else cCard)
-            setTextColor(if (selected) cOnAmber else if (isOnline || value == "all") cText else cSub)
+            chipStrokeColor = ColorStateList.valueOf(if (selected) room.color else cOutline)
+            chipBackgroundColor = ColorStateList.valueOf(if (selected) room.color else cCard)
+            setTextColor(if (selected) Color.parseColor("#101418") else if (dim) cSub else room.color)
             setEnsureMinTouchTargetSize(false)
-            setOnClickListener { Radio.toggleTarget(value); render() }
+            setOnClickListener { Radio.selectRoom(room.key); render() }
+            if (m != null && m.size == 1) setOnLongClickListener { Radio.toggleTarget(m[0]); render(); true }   // 몇 명만 묶기
         }
     }
 
@@ -363,12 +368,14 @@ class MainActivity : AppCompatActivity() {
             val kept = prefs.targetList.filter { it in others }
             if (kept.size != prefs.targetList.size) prefs.target = if (kept.isEmpty()) "all" else kept.joinToString(",")
         }
-        val sig = listOf(others.joinToString(), Radio.online.joinToString(), Radio.target, Radio.memberWhere.toString()).joinToString("|")
+        val rooms = Radio.rooms()
+        val cur = Radio.currentRoom()
+        val unread = rooms.associate { it.key to Radio.unreadCount(it) }
+        val sig = listOf(rooms.joinToString { it.key }, Radio.online.joinToString(), Radio.target, Radio.memberWhere.toString(), unread.toString()).joinToString("|")
         if (sig == memberSig) return
         memberSig = sig
         memberGroup.removeAllViews()
-        memberGroup.addView(memberChip("전체", "all", true, Radio.target == "all"))
-        others.forEach { memberGroup.addView(memberChip(it, it, it in Radio.online, it in prefs.targetList)) }
+        rooms.forEach { memberGroup.addView(roomChip(it, it.key == cur.key, unread[it.key] ?: 0)) }
     }
 
     private fun renderQuick() {
@@ -433,6 +440,9 @@ class MainActivity : AppCompatActivity() {
         normal.addView(label("이 폰: ${prefs.name}", 16f, cText, true))
         val (quickTil, quick) = inputField("빠른 답장 문구 (쉼표로 구분)", prefs.quickReplies.joinToString(", "))
         normal.addView(quickTil, lp(top = 12))
+        val (groupsTil, groupsEt) = inputField("대화방 묶음 (이름=가족,가족 · ;로 구분)", prefs.groups)
+        normal.addView(groupsTil, lp(top = 10))
+        normal.addView(label("예: 아이들=첫째,둘째,셋째;부모님=엄마,아빠;큰애들=첫째,둘째", 12f, cSub), lp(top = 4))
         normal.addView(sectionTitle("화면 꺼짐 상태 볼륨 버튼"), lp(top = 14))
         val modes = MaterialButtonToggleGroup(this).apply { isSingleSelection = true; isSelectionRequired = true }
         val hold = MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply { text = "길게 누르는 동안"; isAllCaps = false; id = View.generateViewId() }
@@ -443,6 +453,8 @@ class MainActivity : AppCompatActivity() {
         normal.addView(label("길게 누르기가 화면 꺼진 상태에서 잘 안 되는 기종이면 두 번 누르기로 바꿔 주세요.", 12f, cSub), lp(top = 4))
         normal.addView(pill("저장", true) {
             prefs.quickReplies = quick.text.toString().split(",").map { it.trim() }.filter { it.isNotEmpty() }.ifEmpty { Prefs.DEFAULT_QUICK.split(",") }
+            prefs.groups = groupsEt.text.toString().ifBlank { Prefs.DEFAULT_GROUPS }
+            memberSig = ""
             prefs.keyMode = if (modes.checkedButtonId == dbl.id) "double" else "hold"
             renderQuick()
             settingsBox.visibility = View.GONE
@@ -589,35 +601,46 @@ class MainActivity : AppCompatActivity() {
             incomingText.text = if (Radio.incomingMode == "all") "🔊  ${from}님 전체 방송 중" else "🔊  ${from}님이 나에게 말하는 중"
         } else incomingCard.visibility = View.GONE
 
-        val who = Radio.targetLabel()
+        val room = Radio.currentRoom()
+        val onRoom = Color.parseColor("#101418")
         when {
-            Radio.talking -> { talkTitle.text = "말하는 중…"; talkSub.text = "손을 떼면 끝"; talkCard.setCardBackgroundColor(cRed); talkTitle.setTextColor(Color.WHITE); talkSub.setTextColor(Color.WHITE) }
+            Radio.talking -> { talkTitle.text = "${room.label}에게 말하는 중…"; talkSub.text = "손을 떼면 끝"; talkCard.setCardBackgroundColor(cRed); talkTitle.setTextColor(Color.WHITE); talkSub.setTextColor(Color.WHITE) }
             Radio.requesting -> { talkTitle.text = "잠깐만요…"; talkSub.text = ""; talkCard.setCardBackgroundColor(cAmberDark); talkTitle.setTextColor(cOnAmber); talkSub.setTextColor(cOnAmber) }
             !Radio.connected -> { talkTitle.text = "연결 대기 중"; talkSub.text = Radio.status; talkCard.setCardBackgroundColor(cCard2); talkTitle.setTextColor(cSub); talkSub.setTextColor(cSub) }
-            else -> { talkTitle.text = "누르고 말하기"; talkSub.text = who; talkCard.setCardBackgroundColor(cAmber); talkTitle.setTextColor(cOnAmber); talkSub.setTextColor(cOnAmber) }
+            else -> { talkTitle.text = "${room.icon} ${room.label}에게 말하기"; talkSub.text = "누르고 있는 동안 말해요"; talkCard.setCardBackgroundColor(room.color); talkTitle.setTextColor(onRoom); talkSub.setTextColor(onRoom) }
         }
+        msgHead.text = "${room.icon} ${if (room.key == "all") "모두의 대화" else room.label + "와의 대화"}"
+        msgHead.setTextColor(room.color)
         noticeText.text = Radio.notice
         standbySwitch.isChecked = RadioService.running
     }
 
     private fun renderMessages() {
-        val clips = Radio.clips
-        msgCard.visibility = if (clips.isEmpty()) View.GONE else View.VISIBLE
-        val sig = clips.take(12).joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}" }
+        val room = Radio.currentRoom()
+        val clips = Radio.roomClips(room)
+        msgCard.visibility = if (Radio.clips.isEmpty()) View.GONE else View.VISIBLE
+        val sig = room.key + "|" + clips.take(12).joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}" }
         if (sig == msgSig) return
         msgSig = sig
         msgList.removeAllViews()
+        if (clips.isEmpty()) msgList.addView(label("이 방에는 아직 메시지가 없어요", 13f, cSub).apply { setPadding(dp(4), dp(16), dp(4), dp(16)) })
         clips.take(12).forEachIndexed { i, c ->
             val playing = Radio.playingClip === c
-            val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(4), dp(10), dp(4), dp(8)) }
+            val whoColor = if (c.mine) cSub else Family.color(c.from)
+            // 보낸 사람 색은 왼쪽 가는 띠와 이름에만 — 글 내용은 밝은 글씨 그대로
+            val outer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            outer.addView(View(this).apply { background = roundRect(whoColor, 3) }, LinearLayout.LayoutParams(dp(4), ViewGroup.LayoutParams.MATCH_PARENT).apply { setMargins(0, dp(10), dp(10), dp(8)) })
+            val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(10), dp(4), dp(8)) }
+            outer.addView(row, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-            top.addView(label(c.title, 13f, if (c.mine) cSub else cAmber, true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            val name = if (c.mine) c.title else "${Family.icon(c.from)} ${c.title}"
+            top.addView(label(name, 13f, whoColor, true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             top.addView(label(fmt.format(Date(c.ts * 1000)), 11f, cSub))
             row.addView(top)
             when {
-                c.isText -> row.addView(label(c.text ?: "", 16f, cText), lp(top = 2))
+                c.isText -> row.addView(label(c.text ?: "", 19f, cText), lp(top = 4))
                 c.voiceSent -> {}
-                else -> row.addView(label("${if (playing) "🔊 재생 중" else "🎙 음성"} · ${c.seconds.toInt().coerceAtLeast(1)}초", 15f, cText), lp(top = 2))
+                else -> row.addView(label("${if (playing) "🔊 재생 중" else "🎙 음성"} · ${c.seconds.toInt().coerceAtLeast(1)}초", 16f, cText), lp(top = 4))
             }
             if (c.mine) {
                 val rt = Radio.receiptText(c)
@@ -630,7 +653,7 @@ class MainActivity : AppCompatActivity() {
             if (!c.mine) btns.addView(textButton("답장") { Radio.target = c.from; input.requestFocus(); toast("${c.from}님에게 보내기로 바뀌었어요") })
             btns.addView(textButton("삭제", cSub) { Radio.deleteClip(c) })
             row.addView(btns, lp(top = 2))
-            msgList.addView(row)
+            msgList.addView(outer)
             if (i < clips.take(12).size - 1) msgList.addView(View(this).apply { setBackgroundColor(cOutline) }, lp(h = dp(1)))
         }
     }

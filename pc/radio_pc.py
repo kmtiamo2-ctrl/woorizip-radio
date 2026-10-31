@@ -37,6 +37,28 @@ RATE = 16000
 FRAME_BYTES = 640  # 20ms, 16비트 모노
 LIVE, CLIP = 1, 2
 DEFAULT_MEMBERS = ["엄마", "아빠", "첫째", "둘째", "셋째"]
+# 가족별 고정 아이콘·색 (방 버튼, 말하기 버튼, 받은 메시지 이름에 똑같이 씀)
+MEMBER_STYLE = {"엄마": ("👩", "#F472B6"), "아빠": ("👨", "#60A5FA"), "첫째": ("🧒", "#34D399"),
+                "둘째": ("🧒", "#FB923C"), "셋째": ("🧒", "#A78BFA")}
+GROUP_STYLE = {"아이들": ("👧", "#2DD4BF"), "부모님": ("👫", "#818CF8")}
+ALL_STYLE = ("🏠", "#F5B301")
+DEFAULT_GROUPS = "아이들=첫째,둘째,셋째;부모님=엄마,아빠"
+
+
+def member_style(name):
+    return MEMBER_STYLE.get(name, ("🙂", "#9AA6BC"))
+
+
+def parse_groups(text):
+    """'아이들=첫째,둘째;부모님=엄마,아빠' → [(이름, [멤버...]), ...]"""
+    out = []
+    for part in str(text or "").split(";"):
+        if "=" in part:
+            name, mem = part.split("=", 1)
+            members = [m.strip() for m in mem.split(",") if m.strip()]
+            if name.strip() and members:
+                out.append((name.strip(), members))
+    return out
 
 try:
     import sounddevice as sd
@@ -71,7 +93,7 @@ class Config:
     # 우리 집 기본값 (가족 전용 빌드). 설정 창에서 바꿀 수 있음
     DEFAULTS = {"host": "192.168.0.6", "out_host": "100.83.179.121", "name": "", "key": "105403", "hotkey": "",
                 "quick": "네,아니요,알겠어요,지금 갈게요,조금 있다가요,지금은 못 해요",
-                "target": "all", "dnd": False, "autostart": True}
+                "target": "all", "dnd": False, "autostart": True, "groups": DEFAULT_GROUPS}
 
     def __init__(self):
         self.data = dict(self.DEFAULTS)
@@ -503,7 +525,63 @@ class Radio:
         return "all" if self.target == "all" else self.target_list
 
     def target_label(self):
-        return "전체" if self.target == "all" else ", ".join(self.target_list)
+        return "모두" if self.target == "all" else ", ".join(self.target_list)
+
+    # ---- 대화방: 모두 / 가족 한 명 / 묶음(아이들·부모님) ----
+
+    def rooms(self):
+        """[(키, 이름, 멤버 목록 또는 None=모두, 아이콘, 색)]"""
+        me = self.cfg.name
+        others = [m for m in self.members if m != me]
+        out = [("all", "모두", None, ALL_STYLE[0], ALL_STYLE[1])]
+        for m in others:
+            ic, col = member_style(m)
+            out.append((m, m, [m], ic, col))
+        for name, members in parse_groups(self.cfg.groups):
+            members = [m for m in members if m in others]
+            if len(members) >= 2:   # 나를 빼고 한 명뿐이면 그 사람 방과 같으니 생략
+                ic, col = GROUP_STYLE.get(name, ("👪", "#9AA6BC"))
+                out.append(("g:" + name, name, members, ic, col))
+        return out
+
+    def current_room(self):
+        """지금 고른 상대에 해당하는 방. 방에 없는 조합이면 ('custom', '엄마, 첫째', [...], '👥', 회색)"""
+        tl = self.target_list
+        for room in self.rooms():
+            if room[2] is None:
+                if self.target == "all":
+                    return room
+            elif set(room[2]) == set(tl):
+                return room
+        return ("custom", ", ".join(tl), tl, "👥", "#9AA6BC")
+
+    def select_room(self, key):
+        with self.lock:
+            if self.talking:
+                return
+            for k, _, members, _, _ in self.rooms():
+                if k == key:
+                    self.cfg.set(target="all" if members is None else ",".join(members))
+                    return
+
+    def room_clips(self, room):
+        """그 방에 보이는 메시지: 모두 방은 전부, 나머지는 그 사람(들)과 주고받은 것"""
+        members = room[2]
+        if members is None:
+            return list(self.clips)
+        ms = set(members)
+        out = []
+        for c in self.clips:
+            if c.get("mine"):
+                if c.get("mode") != "all" and ms & set(str(c.get("from", "")).split(", ")):
+                    out.append(c)
+            elif c.get("from") in ms:
+                out.append(c)
+        return out
+
+    def unread_count(self, room):
+        return sum(1 for c in self.room_clips(room)
+                   if not c.get("mine") and c.get("kind") in ("text", "clip") and (c.get("mid") or 0) and c.get("mid") not in self.seen_sent)
 
     def set_target(self, t):
         """한 명으로 지정 (답장 등)"""
@@ -1151,10 +1229,10 @@ def run_ui(start_minimized, selftest=False):
     incoming = ctk.CTkLabel(body, text="", font=font(15, True), text_color=ON_AMBER, fg_color=AMBER, corner_radius=16, height=46)
 
     # 가족 선택
-    section(body, "누구에게  ·  여러 명 고를 수 있어요").pack(anchor="w", pady=(20, 6))
+    section(body, "대화방  ·  누르면 그 방  ·  우클릭하면 몇 명만 골라 묶기").pack(anchor="w", pady=(20, 6))
     grid = ctk.CTkFrame(body, fg_color="transparent")
     grid.pack(fill="x")
-    for c in range(3):
+    for c in range(4):
         grid.columnconfigure(c, weight=1, uniform="fam")
 
     # 말하기 버튼
@@ -1211,7 +1289,8 @@ def run_ui(start_minimized, selftest=False):
     # 메시지 목록
     msg_card, msg_inner = card(body, pad=12)
     msg_card.pack(fill="both", expand=True, pady=(14, 0))
-    section(msg_inner, "메시지  ·  최근 것이 위").pack(anchor="w", padx=4)
+    msg_head = section(msg_inner, "메시지  ·  최근 것이 위")
+    msg_head.pack(anchor="w", padx=4)
     msg_list = ctk.CTkScrollableFrame(msg_inner, fg_color="transparent", scrollbar_button_color=CARD2, scrollbar_button_hover_color=OUTLINE)
     msg_list.pack(fill="both", expand=True, pady=(4, 0))
 
@@ -1320,17 +1399,17 @@ def run_ui(start_minimized, selftest=False):
             flash()   # 답장을 쓰는 중이면 팝업을 바꾸지 않음 (새 메시지는 목록에 있음)
             return
         close_popup()
-        pw = ctk.CTkToplevel(root, fg_color=AMBER)
+        pw = ctk.CTkToplevel(root, fg_color=(member_style(reply_to)[1] if reply_to else AMBER))
         pw.overrideredirect(True)
         pw.attributes("-topmost", True)
         inner = ctk.CTkFrame(pw, fg_color=CARD, corner_radius=14)
         inner.pack(padx=2, pady=2, fill="both", expand=True)
         head_ = ctk.CTkFrame(inner, fg_color="transparent")
         head_.pack(fill="x", padx=14, pady=(12, 0))
-        ctk.CTkLabel(head_, text=title, font=font(13, True), text_color=TXT, anchor="w").pack(side="left")
+        ctk.CTkLabel(head_, text=title, font=font(13, True), text_color=(member_style(reply_to)[1] if reply_to else TXT), anchor="w").pack(side="left")
         ctk.CTkButton(head_, text="✕", width=26, height=26, fg_color="transparent", hover_color=CARD2, text_color=SUB, command=close_popup).pack(side="right")
         if text:
-            ctk.CTkLabel(inner, text=text, font=font(13), text_color=TXT, wraplength=300, justify="left", anchor="w").pack(fill="x", padx=14, pady=(4, 0))
+            ctk.CTkLabel(inner, text=text, font=font(17), text_color=TXT, wraplength=380, justify="left", anchor="w").pack(fill="x", padx=14, pady=(6, 0))
         hint = ctk.CTkLabel(inner, text="클릭하면 바로 답장" if reply_to else "", font=font(10), text_color=SUB, anchor="w")
         hint.pack(fill="x", padx=14, pady=(2, 10))
         reply_box = ctk.CTkFrame(inner, fg_color="transparent")
@@ -1382,7 +1461,7 @@ def run_ui(start_minimized, selftest=False):
             # winfo_* 는 실제 픽셀, geometry()의 크기는 배율 적용 전 값이라 나눠서 넣음 (125%·150% 화면에서 잘리지 않게)
             pw.update_idletasks()
             sc = scaling(pw)
-            w_, h_ = max(pw.winfo_reqwidth(), int(330 * sc)), pw.winfo_reqheight()
+            w_, h_ = max(pw.winfo_reqwidth(), int(420 * sc)), pw.winfo_reqheight()
             sw, sh = pw.winfo_screenwidth(), pw.winfo_screenheight()
             pw.geometry("%dx%d+%d+%d" % (round(w_ / sc), round(h_ / sc), sw - w_ - 16, sh - h_ - 60))
         place()
@@ -1501,6 +1580,12 @@ def run_ui(start_minimized, selftest=False):
         q_entry.insert(0, cfg.quick)
         q_entry.pack(fill="x", padx=12)
 
+        section(box, "대화방 묶음 (이름=가족,가족 · 묶음은 ;로 구분)").pack(anchor="w", padx=12, pady=(12, 4))
+        g_entry = ctk.CTkEntry(box, font=font(13), height=36, corner_radius=12, fg_color=CARD, border_color=OUTLINE)
+        g_entry.insert(0, cfg.groups)
+        g_entry.pack(fill="x", padx=12)
+        ctk.CTkLabel(box, text="예: 아이들=첫째,둘째,셋째;부모님=엄마,아빠;큰애들=첫째,둘째", font=font(10), text_color=SUB, anchor="w", wraplength=420, justify="left").pack(anchor="w", padx=12)
+
         auto_var = tk.BooleanVar(value=cfg.autostart)
         ctk.CTkSwitch(box, text="Windows 시작 시 자동 실행 (트레이에 조용히 켜짐)", variable=auto_var, font=font(13),
                       text_color=TXT, progress_color=AMBER).pack(anchor="w", padx=12, pady=(14, 0))
@@ -1515,7 +1600,8 @@ def run_ui(start_minimized, selftest=False):
             hk_ = hk_entry.get().strip()
             if hk_.startswith("키를"):
                 hk_ = cfg.hotkey
-            cfg.set(hotkey=hk_, quick=q_entry.get().strip() or Config.DEFAULTS["quick"], autostart=auto_var.get())
+            cfg.set(hotkey=hk_, quick=q_entry.get().strip() or Config.DEFAULTS["quick"], autostart=auto_var.get(),
+                    groups=g_entry.get().strip() or DEFAULT_GROUPS)
             try:
                 set_autostart(cfg.autostart)
             except Exception as e:
@@ -1675,7 +1761,7 @@ def run_ui(start_minimized, selftest=False):
         if kind == "incoming":
             flash()
             who = info.get("from")
-            show_popup("🔊 %s님이 말해요" % who, "전체 방송" if info.get("mode") == "all" else "나에게", reply_to=who, seconds=8)
+            show_popup("%s %s님이 말해요" % (member_style(who)[0], who), "전체 방송" if info.get("mode") == "all" else "나에게", reply_to=who, seconds=8)
         elif kind == "clip":
             c = info["clip"]
             flash()
@@ -1685,7 +1771,7 @@ def run_ui(start_minimized, selftest=False):
                 events.put(("show", None))
         elif kind == "text":
             flash()
-            show_popup("💬 " + radio.clip_title(info), info.get("text", ""), reply_to=info["from"], clip=info)
+            show_popup("%s %s" % (member_style(info["from"])[0], radio.clip_title(info)), info.get("text", ""), reply_to=info["from"], clip=info)
         elif kind == "state":
             set_tray(radio.connected, radio.where)
         elif kind == "schedules":
@@ -1719,15 +1805,25 @@ def run_ui(start_minimized, selftest=False):
     # ---- 화면 갱신 ----
     cache = {"buttons": None, "clips": None, "tray_tip": False}
 
-    def member_button(parent, label, value, on, sel):
-        place_ = ""
-        if value != "all" and on:
-            place_ = "  ·  " + ("밖" if radio.member_where.get(value) == "out" else "집")
-        text = label if value == "all" else ("● " if on else "○ ") + label + place_
-        return ctk.CTkButton(parent, text=text, command=lambda v=value: radio.toggle_target(v), font=font(13, sel), height=42, corner_radius=16,
-                             fg_color=AMBER if sel else CARD, hover_color=AMBER_D if sel else CARD2,
-                             text_color=ON_AMBER if sel else (TXT if (on or value == "all") else SUB),
-                             border_width=0 if sel else 1, border_color=OUTLINE)
+    def room_button(parent, room, sel, unread):
+        key, label, members, icon, color = room
+        if members is None:
+            sub = "%d명 접속" % len(radio.online)
+        elif len(members) == 1:
+            on = members[0] in radio.online
+            sub = ("밖" if radio.member_where.get(members[0]) == "out" else "집") if on else "꺼짐"
+        else:
+            sub = "%d명" % len(members)
+        if unread:
+            sub += " · 새 글 %d" % unread
+        b = ctk.CTkButton(parent, text="%s %s\n%s" % (icon, label, sub), command=lambda k=key: radio.select_room(k),
+                          font=font(13, sel), height=56, corner_radius=16,
+                          fg_color=color if sel else CARD, hover_color=color if sel else CARD2,
+                          text_color="#101418" if sel else (color if (members is None or len(members) > 1 or members[0] in radio.online) else SUB),
+                          border_width=0 if sel else 1, border_color=OUTLINE)
+        if members is not None and len(members) == 1:   # 우클릭: 이 사람을 지금 고른 상대에 추가/제외 (몇 명만 묶기)
+            b.bind("<Button-3>", lambda e, m=members[0]: radio.toggle_target(m))
+        return b
 
     busy = {"refresh": False}
 
@@ -1766,15 +1862,16 @@ def run_ui(start_minimized, selftest=False):
                 kept = [t for t in radio.target_list if t in others]
                 if len(kept) != len(radio.target_list):
                     cfg.set(target=",".join(kept) if kept else "all")
-            sig = (tuple(others), tuple(radio.online), radio.target, tuple(sorted(radio.member_where.items())))
+            rooms = radio.rooms()
+            cur = radio.current_room()
+            unread = {r[0]: radio.unread_count(r) for r in rooms}
+            sig = (tuple(r[0] for r in rooms), tuple(radio.online), radio.target, tuple(sorted(radio.member_where.items())), tuple(sorted(unread.items())))
             if sig != cache["buttons"]:
                 cache["buttons"] = sig
                 for c in grid.winfo_children():
                     c.destroy()
-                items = [("전체", "all", True)] + [(m, m, m in radio.online) for m in others]
-                for i, (label, value, on) in enumerate(items):
-                    sel = (radio.target == "all") if value == "all" else (value in radio.target_list)
-                    member_button(grid, label, value, on, sel).grid(row=i // 3, column=i % 3, sticky="nsew", padx=4, pady=4)
+                for i, room in enumerate(rooms):
+                    room_button(grid, room, room[0] == cur[0], unread[room[0]]).grid(row=i // 4, column=i % 4, sticky="nsew", padx=3, pady=3)
 
             if radio.connected:
                 status.configure(text="●  %s · 지금 %s · 가족 %d명 접속 중" % (me, "집" if radio.where == "home" else "밖", len(radio.online)), text_color=GREEN)
@@ -1788,48 +1885,56 @@ def run_ui(start_minimized, selftest=False):
             elif incoming.winfo_ismapped():
                 incoming.pack_forget()
 
-            who = radio.target_label()
+            room_color, room_icon, room_name = cur[4], cur[3], cur[1]
             if radio.talking:
-                talk.configure(fg_color=RED); talk_title.configure(text="말하는 중…", text_color="white"); talk_sub.configure(text="손을 떼면 끝", text_color="white")
+                talk.configure(fg_color=RED); talk_title.configure(text="%s에게 말하는 중…" % room_name, text_color="white"); talk_sub.configure(text="손을 떼면 끝", text_color="white")
             elif radio.requesting:
                 talk.configure(fg_color=AMBER_D); talk_title.configure(text="잠깐만요…", text_color=ON_AMBER); talk_sub.configure(text="", text_color=ON_AMBER)
             elif not radio.connected:
                 talk.configure(fg_color=CARD2); talk_title.configure(text="연결 대기 중", text_color=SUB); talk_sub.configure(text=radio.status, text_color=SUB)
             else:
-                talk.configure(fg_color=AMBER); talk_title.configure(text="누르고 말하기", text_color=ON_AMBER); talk_sub.configure(text=who, text_color=ON_AMBER)
+                talk.configure(fg_color=room_color); talk_title.configure(text="%s %s에게 말하기" % (room_icon, room_name), text_color="#101418"); talk_sub.configure(text="누르고 있는 동안 말해요", text_color="#101418")
             notice.configure(text=radio.notice)
+            msg_head.configure(text="%s %s  ·  최근 것이 위" % (room_icon, "모두의 대화" if cur[0] == "all" else room_name + "와의 대화"), text_color=room_color)
 
             window_visible = root.state() in ("normal", "zoomed")   # 최대화된 창도 보이는 것
-            csig = tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
-                          window_visible and c.get("kind") == "text" and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent)
-                         for c in radio.clips[:20])
+            shown = radio.room_clips(cur)[:20]
+            csig = (cur[0],) + tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
+                                      window_visible and c.get("kind") == "text" and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent)
+                                     for c in shown)
             if csig != cache["clips"]:
                 cache["clips"] = csig
                 for c in msg_list.winfo_children():
                     c.destroy()
-                if not radio.clips:
+                if not shown:
                     ctk.CTkLabel(msg_list, text="아직 메시지가 없어요", font=font(12), text_color=SUB).pack(pady=24)
                 else:
-                    for c in radio.clips[:20]:
+                    for c in shown:
                         playing = radio.playing is c
+                        who_color = SUB if c.get("mine") else member_style(c.get("from"))[1]
                         row = ctk.CTkFrame(msg_list, fg_color=CARD2, corner_radius=12)
                         row.pack(fill="x", pady=3)
+                        # 보낸 사람 색은 왼쪽 가는 띠와 이름에만 — 글 내용은 밝은 글씨 그대로
+                        ctk.CTkFrame(row, fg_color=who_color, width=5, corner_radius=3).pack(side="left", fill="y", padx=(6, 0), pady=6)
+                        body_ = ctk.CTkFrame(row, fg_color="transparent")
+                        body_.pack(side="left", fill="both", expand=True)
                         when_ = time.strftime("%m/%d %H:%M", time.localtime(c["ts"]))
-                        top = ctk.CTkFrame(row, fg_color="transparent")
+                        top = ctk.CTkFrame(body_, fg_color="transparent")
                         top.pack(fill="x", padx=10, pady=(8, 0))
-                        ctk.CTkLabel(top, text=radio.clip_title(c), font=font(11, True), text_color=SUB if c.get("mine") else AMBER, anchor="w").pack(side="left")
+                        name_ = radio.clip_title(c) if c.get("mine") else "%s %s" % (member_style(c.get("from"))[0], radio.clip_title(c))
+                        ctk.CTkLabel(top, text=name_, font=font(12, True), text_color=who_color, anchor="w").pack(side="left")
                         ctk.CTkLabel(top, text=when_, font=font(10), text_color=SUB).pack(side="right")
                         if c.get("kind") == "text":
-                            ctk.CTkLabel(row, text=c.get("text", ""), font=font(14), text_color=TXT, anchor="w", wraplength=330, justify="left").pack(fill="x", padx=10)
+                            ctk.CTkLabel(body_, text=c.get("text", ""), font=font(17), text_color=TXT, anchor="w", wraplength=330, justify="left").pack(fill="x", padx=10, pady=(2, 0))
                         elif c.get("kind") == "clip":
-                            ctk.CTkLabel(row, text="%s · %d초" % ("🔊 재생 중" if playing else "🎙 음성", max(1, int(c["seconds"]))), font=font(13), text_color=TXT, anchor="w").pack(fill="x", padx=10)
+                            ctk.CTkLabel(body_, text="%s · %d초" % ("🔊 재생 중" if playing else "🎙 음성", max(1, int(c["seconds"]))), font=font(15), text_color=TXT, anchor="w").pack(fill="x", padx=10, pady=(2, 0))
                         if c.get("mine"):
                             rt = radio.receipt_text(c)
                             if rt:
-                                ctk.CTkLabel(row, text=rt, font=font(11), text_color=AMBER, anchor="w").pack(fill="x", padx=10)
+                                ctk.CTkLabel(body_, text=rt, font=font(11), text_color=AMBER, anchor="w").pack(fill="x", padx=10)
                         elif c.get("kind") == "text" and window_visible:
                             radio.mark_seen(c)
-                        btns = ctk.CTkFrame(row, fg_color="transparent")
+                        btns = ctk.CTkFrame(body_, fg_color="transparent")
                         btns.pack(fill="x", padx=6, pady=(0, 4))
                         small(btns, "삭제", lambda c=c: radio.delete_clip(c), color=SUB).pack(side="right")
                         if not c.get("mine"):
@@ -2140,10 +2245,12 @@ def _selftest_start(ctx):
     step("서버 연결", until=lambda: radio.connected, timeout=20)
     step("가상 가족(엄마) 접속", until=lambda: helper.connected and "엄마" in radio.online, timeout=20)
     step("가족 버튼 표시", until=lambda: any("엄마" in (txt(b) or "") for b in widgets(ctx["grid"], ctk.CTkButton)))
-    step("엄마 고르기 (버튼 색 바뀜)", lambda: radio.toggle_target("엄마"),
-         until=lambda: radio.target_list == ["엄마"] and any((txt(b) or "").startswith("● 엄마") and b.cget("fg_color") == "#F5B301"
+    step("엄마 방 고르기 (버튼이 엄마 색으로)", lambda: radio.select_room("엄마"),
+         until=lambda: radio.target_list == ["엄마"] and any("엄마" in (txt(b) or "") and b.cget("fg_color") == member_style("엄마")[1]
                                                             for b in widgets(ctx["grid"], ctk.CTkButton)))
-    step("다시 전체로", lambda: radio.toggle_target("엄마"), until=lambda: radio.target == "all")
+    step("우클릭으로 첫째 추가 → 두 명 묶음", lambda: radio.toggle_target("첫째"), until=lambda: set(radio.target_list) == {"엄마", "첫째"} and radio.current_room()[0] == "custom")
+    step("아이들 방", lambda: radio.select_room("g:아이들"), until=lambda: set(radio.target_list) == {"첫째", "둘째", "셋째"})
+    step("다시 모두로", lambda: radio.select_room("all"), until=lambda: radio.target == "all")
 
     # 2. 문자 보내기 / 받음·봄 표시
     def type_and_send():

@@ -33,6 +33,35 @@ data class Clip(
     }
 }
 
+/** 대화방: 모두 / 가족 한 명 / 묶음. members == null 이면 모두 */
+data class Room(val key: String, val label: String, val members: List<String>?, val icon: String, val color: Int)
+
+/** 가족별 고정 아이콘·색 (PC와 동일) */
+object Family {
+    private val style = mapOf(
+        "엄마" to ("👩" to 0xFFF472B6.toInt()), "아빠" to ("👨" to 0xFF60A5FA.toInt()), "첫째" to ("🧒" to 0xFF34D399.toInt()),
+        "둘째" to ("🧒" to 0xFFFB923C.toInt()), "셋째" to ("🧒" to 0xFFA78BFA.toInt())
+    )
+    private val groupStyle = mapOf("아이들" to ("👧" to 0xFF2DD4BF.toInt()), "부모님" to ("👫" to 0xFF818CF8.toInt()))
+    const val ALL_ICON = "🏠"
+    const val ALL_COLOR = 0xFFF5B301.toInt()
+    const val GREY = 0xFF9AA6BC.toInt()
+    fun icon(name: String?) = style[name]?.first ?: "🙂"
+    fun color(name: String?) = style[name]?.second ?: GREY
+    fun groupIcon(name: String) = groupStyle[name]?.first ?: "👪"
+    fun groupColor(name: String) = groupStyle[name]?.second ?: GREY
+
+    /** "아이들=첫째,둘째;부모님=엄마,아빠" → [(이름, 멤버)] */
+    fun parseGroups(text: String): List<Pair<String, List<String>>> = text.split(";").mapNotNull { part ->
+        val i = part.indexOf('=')
+        if (i <= 0) null else {
+            val name = part.substring(0, i).trim()
+            val members = part.substring(i + 1).split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            if (name.isEmpty() || members.isEmpty()) null else name to members
+        }
+    }
+}
+
 /** 예약 메시지 (서버가 보관하고 시간이 되면 내 이름으로 보냄) */
 data class Schedule(val sid: Int, val to: String, val text: String, val at: Long, val repeat: String)
 
@@ -93,8 +122,49 @@ object Radio : RadioClient.Listener {
     private fun targetJson(t: String = target): Any =
         if (t == "all") "all" else JSONArray().also { arr -> t.split(",").filter { it.isNotBlank() }.forEach { arr.put(it) } }
 
-    /** 화면 표시용: "전체" 또는 "엄마, 아빠" */
-    fun targetLabel(t: String = target): String = if (t == "all") "전체" else t.split(",").filter { it.isNotBlank() }.joinToString(", ")
+    /** 화면 표시용: "모두" 또는 "엄마, 아빠" */
+    fun targetLabel(t: String = target): String = if (t == "all") "모두" else t.split(",").filter { it.isNotBlank() }.joinToString(", ")
+
+    // ---- 대화방 ----
+
+    fun rooms(): List<Room> {
+        val others = members.filter { it != me }
+        val out = ArrayList<Room>()
+        out.add(Room("all", "모두", null, Family.ALL_ICON, Family.ALL_COLOR))
+        others.forEach { out.add(Room(it, it, listOf(it), Family.icon(it), Family.color(it))) }
+        Family.parseGroups(Prefs(app).groups).forEach { (name, mem) ->
+            val m = mem.filter { it in others }
+            if (m.size >= 2) out.add(Room("g:$name", name, m, Family.groupIcon(name), Family.groupColor(name)))
+        }
+        return out
+    }
+
+    /** 지금 고른 상대에 해당하는 방 (방에 없는 조합이면 custom) */
+    fun currentRoom(): Room {
+        val tl = Prefs(app).targetList
+        for (r in rooms()) {
+            if (r.members == null) { if (target == "all") return r }
+            else if (r.members.toSet() == tl.toSet()) return r
+        }
+        return Room("custom", tl.joinToString(", "), tl, "👥", Family.GREY)
+    }
+
+    fun selectRoom(key: String) {
+        if (talking) return
+        val r = rooms().firstOrNull { it.key == key } ?: return
+        target = r.members?.joinToString(",") ?: "all"
+    }
+
+    /** 그 방에 보이는 메시지: 모두 방은 전부, 나머지는 그 사람(들)과 주고받은 것 */
+    fun roomClips(room: Room): List<Clip> {
+        val ms = room.members?.toSet() ?: return clips.toList()
+        return clips.filter { c ->
+            if (c.mine) c.mode != "all" && c.from.split(", ").any { it in ms }
+            else c.from in ms
+        }
+    }
+
+    fun unreadCount(room: Room): Int = roomClips(room).count { !it.mine && !it.voiceSent && it.mid != 0 && it.mid !in seenSent }
 
     /** 가족 버튼 눌렀을 때: 선택/해제 토글 (여러 명 가능) */
     fun toggleTarget(name: String) {

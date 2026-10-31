@@ -1299,6 +1299,21 @@ def run_ui(start_minimized, selftest=False):
         wdg.bind("<ButtonPress-1>", lambda e: radio.start_talk())
         wdg.bind("<ButtonRelease-1>", lambda e: radio.stop_talk())
         wdg.configure(cursor="hand2")
+    # '모두' 방일 때 버튼 아래 가족 5명 색을 이어 붙인 띠 (모두 = 가족 전부의 색)
+    family_strip = tk.Canvas(body, height=5, highlightthickness=0, bd=0, bg=BG)
+    family_colors = [member_style(m)[1] for m in MEMBER_STYLE]
+
+    def draw_strip(e=None):
+        w = family_strip.winfo_width()
+        if w < 10:
+            return
+        family_strip.delete("all")
+        n = len(family_colors) - 1
+        for x in range(0, w, 2):
+            t = x / max(1, w - 1) * n
+            i = min(int(t), n - 1)
+            family_strip.create_rectangle(x, 0, x + 2, 5, fill=blend(family_colors[i + 1], family_colors[i], t - i), outline="")
+    family_strip.bind("<Configure>", draw_strip)
     notice = ctk.CTkLabel(body, text="", font=font(12), text_color=AMBER, wraplength=400)
     notice.pack(pady=(6, 0))
 
@@ -2045,6 +2060,10 @@ def run_ui(start_minimized, selftest=False):
             msg_head.configure(text="%s %s" % (room_icon, "모두의 대화" if cur[0] == "all" else room_name + "와의 대화"), text_color=room_color)
             if chat.get("entry_room") != cur[0]:   # 입력칸 테두리·보내기 버튼·안내 글을 고른 방 색으로 — 누구에게 보내는지 입력줄만 봐도 보이게
                 chat["entry_room"] = cur[0]
+                if cur[0] == "all":
+                    family_strip.pack(fill="x", padx=28, pady=(3, 0), after=talk)
+                else:
+                    family_strip.pack_forget()
                 entry.configure(border_color=room_color, placeholder_text="%s에게 메시지  (Enter로 보내기)" % ("모두" if cur[0] == "all" else room_name))
                 send_btn.configure(fg_color=room_color, hover_color=blend(room_color, "#000000", 0.85), text_color="#101418")
 

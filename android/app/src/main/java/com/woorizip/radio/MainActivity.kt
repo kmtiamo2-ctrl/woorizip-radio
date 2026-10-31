@@ -92,6 +92,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var memberScroll: HorizontalScrollView // 키패드 열림: 한 줄로 접어 옆으로 넘김
     private lateinit var roomsGuide: TextView
     private lateinit var talkCard: MaterialCardView
+    private lateinit var talkWrap: FrameLayout
+    private val familyGradient by lazy {
+        android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.LEFT_RIGHT, Family.colors()).apply { cornerRadius = dpf(29) }
+    }
     private lateinit var talkTitle: TextView
     private lateinit var talkSub: TextView
     private lateinit var noticeText: TextView
@@ -296,7 +300,10 @@ class MainActivity : AppCompatActivity() {
         talkSub = label("", 13f, cOnAmber).apply { alpha = 0.8f }
         talkInner.addView(talkTitle); talkInner.addView(talkSub, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 2))
         talkCard.addView(talkInner)
-        root.addView(talkCard, lp(top = 12))
+        // '모두' 방일 때는 카드 둘레에 가족 5명 색을 이어 붙인 테두리 (모두 = 가족 전부의 색)
+        talkWrap = FrameLayout(this).apply { setPadding(dp(3), dp(3), dp(3), dp(3)); background = roundRect(cBg, 29) }
+        talkWrap.addView(talkCard, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(talkWrap, lp(top = 12))
         noticeText = label("", 13f, cAmber).apply { gravity = Gravity.CENTER }
         root.addView(noticeText, lp(top = 6, bottom = 6))
         outer.addView(root)
@@ -373,7 +380,7 @@ class MainActivity : AppCompatActivity() {
         compactMode = compact
         val shown = if (compact) View.GONE else View.VISIBLE
         roomsGuide.visibility = shown
-        talkCard.visibility = shown
+        talkWrap.visibility = shown
         noticeText.visibility = shown
         (memberGroup.parent as? ViewGroup)?.removeView(memberGroup)
         memberGroup.isSingleLine = compact
@@ -453,6 +460,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** '모두' 방 버튼은 가족 5명 색 테두리로 감쌈 */
+    private fun wrapAllChip(chip: Chip): View = FrameLayout(this).apply {
+        setPadding(dp(2), dp(2), dp(2), dp(2))
+        background = android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.LEFT_RIGHT, Family.colors()).apply { cornerRadius = dpf(20) }
+        chip.chipStrokeWidth = 0f
+        addView(chip, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    }
+
     private fun renderMembers() {
         val me = prefs.name
         val others = Radio.members.filter { it != me }
@@ -467,7 +482,7 @@ class MainActivity : AppCompatActivity() {
         if (sig == memberSig) return
         memberSig = sig
         memberGroup.removeAllViews()
-        rooms.forEach { memberGroup.addView(roomChip(it, it.key == cur.key, unread[it.key] ?: 0)) }
+        rooms.forEach { r -> val chip = roomChip(r, r.key == cur.key, unread[r.key] ?: 0); memberGroup.addView(if (r.key == "all") wrapAllChip(chip) else chip) }
         if (compactMode) memberScroll.post { scrollToSelectedChip() }   // 한 줄로 접힌 상태면 선택한 방이 보이게 옆으로 맞춤
     }
 
@@ -716,6 +731,7 @@ class MainActivity : AppCompatActivity() {
         msgHead.setTextColor(room.color)
         if (inputRoomKey != room.key) {   // 입력칸 테두리·보내기 버튼·안내 글을 고른 방 색으로 — 키패드 위 입력줄만 봐도 누구에게 보내는지 보이게
             inputRoomKey = room.key
+            talkWrap.background = if (room.key == "all") familyGradient else roundRect(cBg, 29)
             inputTil.boxStrokeColor = room.color
             inputTil.hintTextColor = ColorStateList.valueOf(room.color)
             inputTil.defaultHintTextColor = ColorStateList.valueOf(room.color)

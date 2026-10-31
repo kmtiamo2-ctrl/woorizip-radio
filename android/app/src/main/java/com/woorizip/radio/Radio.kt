@@ -47,6 +47,8 @@ object Family {
     const val ALL_COLOR = 0xFFF5B301.toInt()
     const val GREY = 0xFF9AA6BC.toInt()
     fun icon(name: String?) = style[name]?.first ?: "🙂"
+    /** 가족 5명 색을 순서대로 — '모두' 버튼의 띠(모두 = 가족 전부의 색)에 사용 */
+    fun colors(): IntArray = style.values.map { it.second }.toIntArray()
     fun color(name: String?) = style[name]?.second ?: GREY
     fun groupIcon(name: String) = groupStyle[name]?.first ?: "👪"
     fun groupColor(name: String) = groupStyle[name]?.second ?: GREY

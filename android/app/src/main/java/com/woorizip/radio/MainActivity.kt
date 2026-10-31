@@ -80,6 +80,8 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- 화면 요소 ----------
     private lateinit var root: LinearLayout
+    private lateinit var outer: LinearLayout
+    private var settingsSheet: com.google.android.material.bottomsheet.BottomSheetDialog? = null
     private lateinit var statusDot: View
     private lateinit var statusText: TextView
     private lateinit var incomingCard: MaterialCardView
@@ -120,7 +122,7 @@ class MainActivity : AppCompatActivity() {
         Notifs.createChannels(this)
         volumeControlStream = AudioManager.STREAM_MUSIC
         setContentView(buildUi())
-        if (!prefs.isConfigured) settingsBox.visibility = View.VISIBLE
+        if (!prefs.isConfigured) openSettingsSheet()
         else if (prefs.standby && !RadioService.running) ensurePermissionsThenStart()
         showCrashReportIfAny()
     }
@@ -222,17 +224,19 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun buildUi(): View {
-        root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(16), dp(20), dp(28))
+        // 메신저처럼 3단: 위(머리글·대화방·말하기, 고정) / 가운데(대화만 스크롤) / 아래(입력칸, 화면 바닥 고정)
+        outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(cBg)
             isFocusableInTouchMode = true; descendantFocusability = ViewGroup.FOCUS_BEFORE_DESCENDANTS   // 켤 때 입력칸이 먼저 포커스를 잡아 키패드가 뜨지 않게
         }
+        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(12), dp(20), 0) }
 
-        // 머리글: 별 + 우리집 + 버전
+        // 머리글: 별 + 우리집 + 상태 + (설정·버전)
         val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         head.addView(ImageView(this).apply { setImageResource(R.mipmap.ic_launcher) }, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginEnd = dp(12) })
         val ver = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" }
         val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        titles.addView(label("우리집", 26f, cText, true))
+        titles.addView(label("우리집", 24f, cText, true))
         val statusRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         statusDot = View(this).apply { background = circle(cSub) }
         statusRow.addView(statusDot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(6) })
@@ -240,25 +244,33 @@ class MainActivity : AppCompatActivity() {
         statusRow.addView(statusText)
         titles.addView(statusRow, lp(top = 2))
         head.addView(titles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        head.addView(label(ver, 12f, cSub))
+        val right = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.END }
+        right.addView(MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+            text = "⚙ 설정"; isAllCaps = false; textSize = 13f; cornerRadius = dp(14); setTextColor(cText)
+            strokeColor = ColorStateList.valueOf(cOutline); minHeight = 0; minimumHeight = 0; insetTop = 0; insetBottom = 0
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setOnClickListener { openSettingsSheet() }
+        })
+        right.addView(label(ver, 11f, cSub).apply { gravity = Gravity.END }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 2))
+        head.addView(right)
         root.addView(head)
 
         // 지금 말하는 사람 배너
         incomingCard = MaterialCardView(this).apply {
             setCardBackgroundColor(cAmber); radius = dpf(18); cardElevation = 0f; visibility = View.GONE
         }
-        incomingText = label("", 16f, cOnAmber, true).apply { gravity = Gravity.CENTER; setPadding(dp(14), dp(14), dp(14), dp(14)) }
+        incomingText = label("", 16f, cOnAmber, true).apply { gravity = Gravity.CENTER; setPadding(dp(14), dp(12), dp(14), dp(12)) }
         incomingCard.addView(incomingText)
-        root.addView(incomingCard, lp(top = 16))
+        root.addView(incomingCard, lp(top = 12))
 
-        // 누구에게
-        root.addView(sectionTitle("대화방  ·  누르면 그 방  ·  길게 누르면 몇 명만 묶기"), lp(top = 22))
-        memberGroup = ChipGroup(this).apply { chipSpacingHorizontal = dp(8); chipSpacingVertical = dp(6) }
-        root.addView(memberGroup, lp(top = 8))
+        // 대화방
+        root.addView(sectionTitle("대화방  ·  누르면 그 방  ·  길게 누르면 몇 명만 묶기"), lp(top = 14))
+        memberGroup = ChipGroup(this).apply { chipSpacingHorizontal = dp(8); chipSpacingVertical = dp(4) }
+        root.addView(memberGroup, lp(top = 6))
 
         // 말하기 버튼
         talkCard = MaterialCardView(this).apply {
-            radius = dpf(30); cardElevation = dpf(6); setCardBackgroundColor(cAmber)
+            radius = dpf(26); cardElevation = dpf(6); setCardBackgroundColor(cAmber)
             isClickable = true
             setOnTouchListener { v, e ->
                 when (e.actionMasked) {
@@ -268,94 +280,95 @@ class MainActivity : AppCompatActivity() {
                 true
             }
         }
-        val talkInner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dp(16), dp(34), dp(16), dp(34)) }
-        talkTitle = label("", 24f, cOnAmber, true)
-        talkSub = label("", 14f, cOnAmber).apply { alpha = 0.8f }
-        talkInner.addView(talkTitle); talkInner.addView(talkSub, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 4))
+        val talkInner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dp(16), dp(22), dp(16), dp(22)) }
+        talkTitle = label("", 22f, cOnAmber, true)
+        talkSub = label("", 13f, cOnAmber).apply { alpha = 0.8f }
+        talkInner.addView(talkTitle); talkInner.addView(talkSub, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 2))
         talkCard.addView(talkInner)
-        root.addView(talkCard, lp(top = 18))
-        noticeText = label("", 14f, cAmber).apply { gravity = Gravity.CENTER }
-        root.addView(noticeText, lp(top = 10))
+        root.addView(talkCard, lp(top = 12))
+        noticeText = label("", 13f, cAmber).apply { gravity = Gravity.CENTER }
+        root.addView(noticeText, lp(top = 6, bottom = 6))
+        outer.addView(root)
 
-        // 대화 카드: 말풍선 목록(최신이 아래) + 빠른 답장 + 입력칸
+        // 가운데: 대화 (여기만 스크롤, 최신이 아래)
         val (mc, mi) = card(pad = 14)
         msgCard = mc
         msgHead = sectionTitle("대화").apply { setPadding(dp(4), 0, 0, 0) }
         mi.addView(msgHead)
         msgList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         mi.addView(msgList, lp(top = 6))
+        scrollRoot = NestedScrollView(this).apply { isFillViewport = true; clipToPadding = false }
+        scrollRoot.addView(msgCard, lp(top = 4, bottom = 8))
+        scrollRoot.setPadding(dp(14), 0, dp(14), 0)
+        outer.addView(scrollRoot, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // 아래: 빠른 답장 + 입력칸 (화면 바닥에 고정, 키패드가 올라오면 같이 올라옴)
+        val bottom = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(cCard); setPadding(dp(14), dp(8), dp(14), dp(10)) }
         val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         quickRow = LinearLayout(this)
         scroll.addView(quickRow)
-        mi.addView(scroll, lp(top = 12))
+        bottom.addView(scroll)
         inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val (til, et) = inputField("메시지 입력")
         input = et
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        input.setOnFocusChangeListener { _, has -> if (has) { scrollRoot.postDelayed({ revealInput() }, 350) } }
-        input.setOnClickListener { scrollRoot.postDelayed({ revealInput() }, 350) }
+        input.setOnFocusChangeListener { _, has -> if (has) scrollRoot.postDelayed({ scrollRoot.fullScroll(View.FOCUS_DOWN) }, 300) }
         inputRow.addView(pill("보내기", true) { val t = input.text.toString(); if (t.isNotBlank() && Radio.sendText(t)) { input.setText(""); stickBottom = true } },
             lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
         inputRow.addView(pill("⏰", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
-        mi.addView(inputRow, lp(top = 8))
-        root.addView(msgCard, lp(top = 14))
+        bottom.addView(inputRow, lp(top = 6))
+        outer.addView(bottom)
 
-        // 수신 대기 / 배터리 / 설정
-        val (ctrlCard, ctrl) = card(pad = 14)
-        standbySwitch = MaterialSwitch(this).apply {
-            text = "수신 대기 — 화면이 꺼져도 듣고, 볼륨키로 말하기"; setTextColor(cText); textSize = 14f
-            setPadding(dp(6), dp(6), dp(6), dp(6))
-            setOnClickListener {
-                if (isChecked) ensurePermissionsThenStart() else { prefs.standby = false; RadioService.stop(this@MainActivity) }
-                h.postDelayed({ render() }, 300)
-            }
-        }
-        ctrl.addView(standbySwitch)
-        val ctrlBtns = LinearLayout(this)
-        ctrlBtns.addView(textButton("배터리 최적화 제외") { requestBatteryExemption() })
-        ctrlBtns.addView(textButton("설정") { toggleSettings() })
-        ctrl.addView(ctrlBtns, lp(top = 4))
-        root.addView(ctrlCard, lp(top = 14))
-
-        settingsBox = buildSettings().apply { visibility = View.GONE }
-        root.addView(settingsBox, lp(top = 14))
-
-        scrollRoot = NestedScrollView(this).apply { setBackgroundColor(cBg); addView(root); isFillViewport = true }
-        // 키패드 대응 두 가지를 모두 지원:
-        //  - 시스템이 창을 줄여 주는 기기(adjustResize): 창 높이가 줄면 입력칸까지 스크롤
-        //  - 가장자리까지 그리는 기기(Android 15 이상): 키패드 높이만큼 아래 여백을 두고 입력칸까지 스크롤
-        scrollRoot.addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
-            if (bottom < oldBottom && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
-        }
-        ViewCompat.setOnApplyWindowInsetsListener(scrollRoot) { _, insets ->
+        // 키패드: 시스템이 창을 줄여 주면 아래 줄이 자연히 올라오고(adjustResize), 가장자리까지 그리는 기기(Android 15+)는 키패드 높이만큼 아래 여백을 줌.
+        // 어느 쪽이든 실제로 보이는 영역을 재서 가린 높이를 보정함.
+        ViewCompat.setOnApplyWindowInsetsListener(outer) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             insetPad = intArrayOf(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
             applyKeyboardPadding()
             insets
         }
-        // 창이 어떻게 알려 주든 상관없이, 실제로 보이는 영역을 재서 키패드에 가린 높이를 구함
-        scrollRoot.viewTreeObserver.addOnGlobalLayoutListener {
+        outer.viewTreeObserver.addOnGlobalLayoutListener {
             val r = android.graphics.Rect()
-            scrollRoot.getWindowVisibleDisplayFrame(r)
-            val loc = IntArray(2); scrollRoot.getLocationOnScreen(loc)
-            val covered = (loc[1] + scrollRoot.height) - r.bottom      // 스크롤 뷰 아래쪽이 가려진 높이 (키패드 + 아래 막대)
-            val kb = (covered - insetPad[3].coerceAtLeast(0)).coerceAtLeast(0)
+            outer.getWindowVisibleDisplayFrame(r)
+            val loc = IntArray(2); outer.getLocationOnScreen(loc)
+            val covered = (loc[1] + outer.height) - r.bottom
+            val kb = (covered - insetPad[3]).coerceAtLeast(0)
             if (kb != keyboardOverlap) { keyboardOverlap = kb; applyKeyboardPadding() }
         }
-        return scrollRoot
+        return outer
     }
 
     private fun circle(color: Int) = android.graphics.drawable.GradientDrawable().apply { shape = android.graphics.drawable.GradientDrawable.OVAL; setColor(color) }
     private fun roundRect(color: Int, radiusDp: Int) = android.graphics.drawable.GradientDrawable().apply { cornerRadius = dpf(radiusDp); setColor(color) }
 
-    private fun toggleSettings() {
-        if (settingsBox.visibility == View.VISIBLE) { settingsBox.visibility = View.GONE; return }
-        val idx = root.indexOfChild(settingsBox)
-        root.removeView(settingsBox)
+    /** 설정 시트: 수신 대기 스위치 + 배터리 + 설정 항목 (첫 실행이면 누구 폰인지 고를 때까지 닫히지 않음) */
+    private fun openSettingsSheet() {
+        settingsSheet?.dismiss()
+        val sheet = com.google.android.material.bottomsheet.BottomSheetDialog(this)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(cBg); setPadding(dp(20), dp(16), dp(20), dp(28)) }
+        standbySwitch = MaterialSwitch(this).apply {
+            text = "수신 대기 — 화면이 꺼져도 듣고, 볼륨키로 말하기"; setTextColor(cText); textSize = 14f
+            isChecked = RadioService.running
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setOnClickListener {
+                if (isChecked) ensurePermissionsThenStart() else { prefs.standby = false; RadioService.stop(this@MainActivity) }
+                h.postDelayed({ render() }, 300)
+            }
+        }
+        box.addView(standbySwitch)
+        box.addView(textButton("배터리 최적화 제외") { requestBatteryExemption() }, lp(top = 2))
         settingsBox = buildSettings()
-        root.addView(settingsBox, idx, lp(top = 14))
+        box.addView(settingsBox, lp(top = 10))
+        sheet.setContentView(NestedScrollView(this).apply { addView(box) })
+        sheet.setCancelable(prefs.isConfigured)
+        sheet.behavior.skipCollapsed = true
+        sheet.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+        settingsSheet = sheet
+        sheet.show()
     }
+
+    private fun closeSettings() { settingsSheet?.dismiss(); settingsSheet = null }
 
     // ---------- 가족 칩 / 빠른 답장 칩 ----------
 
@@ -449,7 +462,7 @@ class MainActivity : AppCompatActivity() {
             val n = pickedName(who0)
             if (n.isBlank()) { toast("누구 것인지 골라 주세요"); return@pill }
             prefs.name = n
-            settingsBox.visibility = View.GONE
+            closeSettings()
             ensurePermissionsThenStart()
             render()
         }, lp(top = 14))
@@ -477,7 +490,7 @@ class MainActivity : AppCompatActivity() {
             memberSig = ""
             prefs.keyMode = if (modes.checkedButtonId == dbl.id) "double" else "hold"
             renderQuick()
-            settingsBox.visibility = View.GONE
+            closeSettings()
             toast("저장했어요")
         }, lp(top = 14))
 
@@ -492,7 +505,7 @@ class MainActivity : AppCompatActivity() {
             val n = pickedName(who)
             if (n.isBlank() || host.text.isNullOrBlank() || key.text.isNullOrBlank()) { toast("사용자·집 주소·암호는 비울 수 없어요"); return@pill }
             prefs.name = n; prefs.host = host.text.toString(); prefs.outHost = outHost.text.toString(); prefs.key = key.text.toString()
-            settingsBox.visibility = View.GONE
+            closeSettings()
             if (RadioService.running) Radio.reconnect() else ensurePermissionsThenStart()
             render()
         }, lp(top = 12))
@@ -632,33 +645,19 @@ class MainActivity : AppCompatActivity() {
         msgHead.text = "${room.icon} ${if (room.key == "all") "모두의 대화" else room.label + "와의 대화"}"
         msgHead.setTextColor(room.color)
         noticeText.text = Radio.notice
-        standbySwitch.isChecked = RadioService.running
+        if (::standbySwitch.isInitialized) standbySwitch.isChecked = RadioService.running
     }
 
     private var insetPad = intArrayOf(0, 0, 0, 0)
     private var keyboardOverlap = 0
 
     private fun applyKeyboardPadding() {
-        if (!::scrollRoot.isInitialized) return
-        val bottom = maxOf(insetPad[3], insetPad[3] + keyboardOverlap)
-        if (scrollRoot.paddingBottom != bottom || scrollRoot.paddingTop != insetPad[1])
-            scrollRoot.setPadding(insetPad[0], insetPad[1], insetPad[2], bottom)
-        if ((keyboardOverlap > 0 || insetPad[3] > dp(100)) && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
-    }
-
-    /** 입력칸 줄이 (키패드 위) 보이는 영역 안에 오도록 스크롤. 아래 여백(padding)까지 감안해서 직접 계산 */
-    private fun revealInput() {
-        if (!::input.isInitialized || !::scrollRoot.isInitialized) return
-        var y = 0
-        var v: View = inputRow
-        while (v !== scrollRoot) {
-            y += v.top
-            v = (v.parent as? View) ?: return
-        }
-        val rowBottom = y + inputRow.height + dp(16)
-        val visibleH = scrollRoot.height - scrollRoot.paddingTop - scrollRoot.paddingBottom
-        val target = rowBottom - visibleH
-        if (target > scrollRoot.scrollY) scrollRoot.smoothScrollTo(0, target)
+        if (!::outer.isInitialized) return
+        val bottom = insetPad[3] + keyboardOverlap
+        if (outer.paddingBottom != bottom || outer.paddingTop != insetPad[1] || outer.paddingLeft != insetPad[0])
+            outer.setPadding(insetPad[0], insetPad[1], insetPad[2], bottom)
+        if ((keyboardOverlap > 0 || insetPad[3] > dp(100)) && ::input.isInitialized && input.hasFocus())
+            scrollRoot.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }   // 키패드가 뜨면 대화는 맨 아래(최신)로
     }
 
     private fun dayLabel(ts: Long): String {
@@ -782,7 +781,7 @@ class MainActivity : AppCompatActivity() {
     private fun hasMic() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
     private fun ensurePermissionsThenStart() {
-        if (!prefs.isConfigured) { settingsBox.visibility = View.VISIBLE; toast("먼저 이 폰이 누구 것인지 골라 주세요"); render(); return }
+        if (!prefs.isConfigured) { openSettingsSheet(); toast("먼저 이 폰이 누구 것인지 골라 주세요"); render(); return }
         val need = mutableListOf<String>()
         if (!hasMic()) need += Manifest.permission.RECORD_AUDIO
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)

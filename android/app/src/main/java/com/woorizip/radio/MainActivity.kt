@@ -222,7 +222,10 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun buildUi(): View {
-        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(16), dp(20), dp(28)) }
+        root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(16), dp(20), dp(28))
+            isFocusableInTouchMode = true; descendantFocusability = ViewGroup.FOCUS_BEFORE_DESCENDANTS   // 켤 때 입력칸이 먼저 포커스를 잡아 키패드가 뜨지 않게
+        }
 
         // 머리글: 별 + 우리집 + 버전
         val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
@@ -324,11 +327,21 @@ class MainActivity : AppCompatActivity() {
         scrollRoot.addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
             if (bottom < oldBottom && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
         }
-        ViewCompat.setOnApplyWindowInsetsListener(scrollRoot) { v, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
-            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-            if (insets.isVisible(WindowInsetsCompat.Type.ime()) && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
+        ViewCompat.setOnApplyWindowInsetsListener(scrollRoot) { _, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            insetPad = intArrayOf(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
+            applyKeyboardPadding()
             insets
+        }
+        // 창이 어떻게 알려 주든 상관없이, 실제로 보이는 영역을 재서 키패드에 가린 높이를 구함
+        scrollRoot.viewTreeObserver.addOnGlobalLayoutListener {
+            val r = android.graphics.Rect()
+            scrollRoot.getWindowVisibleDisplayFrame(r)
+            val loc = IntArray(2); scrollRoot.getLocationOnScreen(loc)
+            val covered = (loc[1] + scrollRoot.height) - r.bottom      // 스크롤 뷰 아래쪽이 가려진 높이 (키패드 + 아래 막대)
+            val kb = (covered - insetPad[3].coerceAtLeast(0)).coerceAtLeast(0)
+            if (kb != keyboardOverlap) { keyboardOverlap = kb; applyKeyboardPadding() }
         }
         return scrollRoot
     }
@@ -620,6 +633,17 @@ class MainActivity : AppCompatActivity() {
         msgHead.setTextColor(room.color)
         noticeText.text = Radio.notice
         standbySwitch.isChecked = RadioService.running
+    }
+
+    private var insetPad = intArrayOf(0, 0, 0, 0)
+    private var keyboardOverlap = 0
+
+    private fun applyKeyboardPadding() {
+        if (!::scrollRoot.isInitialized) return
+        val bottom = maxOf(insetPad[3], insetPad[3] + keyboardOverlap)
+        if (scrollRoot.paddingBottom != bottom || scrollRoot.paddingTop != insetPad[1])
+            scrollRoot.setPadding(insetPad[0], insetPad[1], insetPad[2], bottom)
+        if ((keyboardOverlap > 0 || insetPad[3] > dp(100)) && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
     }
 
     /** 입력칸 줄이 (키패드 위) 보이는 영역 안에 오도록 스크롤. 아래 여백(padding)까지 감안해서 직접 계산 */

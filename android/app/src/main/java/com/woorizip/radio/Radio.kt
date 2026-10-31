@@ -279,6 +279,14 @@ object Radio : RadioClient.Listener {
                 Feedback.denied(app)
                 notice = if (msg.optString("reason") == "too_long") "1분이 지나 자동으로 끝났어요" else "송신이 끝났어요"
             }
+            "talk_live" -> Feedback.live(app)   // 서버가 말소리를 확인해 지금부터 가족에게 나감: 짧은 진동
+            "talk_silent" -> {                  // 말소리가 없어 가족에게 아무것도 안 나감 (버튼만 스친 경우 등)
+                talking = false
+                requesting = false
+                recorder.stop()
+                Feedback.vibrate(app, longArrayOf(0, 40, 60, 40))
+                notice = "소리가 안 들려 보내지 않았어요"
+            }
             "incoming" -> onIncoming(msg.optString("from"), msg.optString("mode"))
             "incoming_end" -> endIncoming()
             "clip" -> pendingClips[msg.optInt("id")] = msg

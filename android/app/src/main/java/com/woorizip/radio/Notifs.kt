@@ -13,7 +13,9 @@ import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 
 object Notifs {
-    const val CH_STANDBY = "standby"
+    const val CH_STANDBY = "standby_quiet"   // 예전 "standby"(보통 등급)는 지우고 최소 등급으로 새로 만듦 — 안드로이드는 만들어진 종류의 등급을 앱이 못 내리므로
+    const val CH_STANDBY_OLD = "standby"
+    const val CH_INFO = "info"
     const val CH_INCOMING = "incoming"
     const val ID_STANDBY = 1
     const val ID_INCOMING = 2
@@ -24,9 +26,17 @@ object Notifs {
     fun createChannels(ctx: Context) {
         Updater.createChannel(ctx)
         val nm = ctx.getSystemService(NotificationManager::class.java)
+        try { nm.deleteNotificationChannel(CH_STANDBY_OLD) } catch (_: Exception) {}
         nm.createNotificationChannel(
-            NotificationChannel(CH_STANDBY, "수신 대기", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "무전기 수신 대기 중 표시"
+            // 최소 등급: 상단 줄에 아이콘이 안 뜨고, 알림창을 내렸을 때 맨 아래에 작게만 보임 (수신은 그대로)
+            NotificationChannel(CH_STANDBY, "수신 대기 (조용히 표시)", NotificationManager.IMPORTANCE_MIN).apply {
+                description = "뒤에서 듣고 있다는 표시. 안드로이드 규칙상 완전히 없앨 수는 없어 가장 작게 보여줌"
+                setShowBadge(false)
+            }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CH_INFO, "안내", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                description = "재부팅 후 수신 대기를 다시 켜 달라는 안내 등"
                 setShowBadge(false)
             }
         )
@@ -54,7 +64,7 @@ object Notifs {
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
     )
 
-    /** 상단에 계속 떠 있는 수신 대기 알림 (말하기 시작/끝 버튼 포함) */
+    /** 수신 대기 알림 (최소 등급이라 알림창 맨 아래에 작게 보임, 말하기 시작/끝 버튼 포함). '수신 끄기'는 아이들이 눌러 버리지 않게 앱 설정에서만 */
     fun standby(ctx: Context): Notification {
         val who = Radio.targetLabel()
         val place = if (Radio.where == "out") " · 밖" else ""
@@ -82,7 +92,6 @@ object Notifs {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)   // 잠금 화면에서도 버튼 사용
             .setContentIntent(openApp(ctx))
             .addAction(0, talkLabel, serviceAction(ctx, RadioService.ACTION_TOGGLE, 1))
-            .addAction(0, "수신 끄기", serviceAction(ctx, RadioService.ACTION_STOP, 2))
             .build()
     }
 
@@ -155,7 +164,7 @@ object Notifs {
     /** 재부팅 후: 안드로이드 정책상 마이크 서비스를 자동으로 켤 수 없어서 한 번 눌러 달라고 안내 */
     fun showBootReminder(ctx: Context) {
         if (!canNotify(ctx)) return
-        val n = NotificationCompat.Builder(ctx, CH_STANDBY)
+        val n = NotificationCompat.Builder(ctx, CH_INFO)
             .setSmallIcon(R.drawable.ic_star)
             .setContentTitle("우리집")
             .setContentText("눌러서 수신 대기를 다시 켜 주세요")
@@ -163,6 +172,25 @@ object Notifs {
             .setContentIntent(openApp(ctx))
             .build()
         ctx.getSystemService(NotificationManager::class.java).notify(ID_BOOT, n)
+    }
+
+    /** 수신 대기 알림이 이 폰에서 아예 꺼져(숨겨져) 있는지 */
+    fun standbyHidden(ctx: Context): Boolean = try {
+        ctx.getSystemService(NotificationManager::class.java).getNotificationChannel(CH_STANDBY)?.importance == NotificationManager.IMPORTANCE_NONE
+    } catch (_: Exception) { false }
+
+    /** 기종에 따라 최소 등급으로도 상단 아이콘이 남을 때: 시스템의 '수신 대기' 알림 설정 화면을 바로 열어 줌 (거기서 끄면 알림만 사라지고 수신은 계속됨) */
+    fun openStandbyChannelSettings(ctx: Context) {
+        val i = Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+            .putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, CH_STANDBY)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try { ctx.startActivity(i) } catch (_: Exception) {
+            try {
+                ctx.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (_: Exception) {}
+        }
     }
 
     private fun canNotify(ctx: Context): Boolean =

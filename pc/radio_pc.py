@@ -679,6 +679,10 @@ class Radio:
                 self.audio.stop_mic()
                 self.audio.effect(BEEP_NO)
                 self.notice = "1분이 지나 자동으로 끝났어요" if msg.get("reason") == "too_long" else "송신이 끝났어요"
+            elif t == "talk_silent":   # 말소리가 없어서 가족에게 아무것도 안 나감 (버튼만 스친 경우 등)
+                self.talking = self.requesting = False
+                self.audio.stop_mic()
+                self.notice = "소리가 안 들려 보내지 않았어요"
             elif t == "incoming":
                 self.incoming_from, self.incoming_mode = msg.get("from"), msg.get("mode")
                 self.stop_clip()
@@ -2427,13 +2431,28 @@ def _selftest_start(ctx):
         root.after(400, lambda: root.event_generate("<FocusIn>"))
     step("  → 답장칸 열고 본 창에 포커스", open_reply_then_focus_main, until=lambda: ctx["popup"]["win"] is None, timeout=10)
 
-    # 4. 실시간 말하기 수신 배너
-    step("엄마 말하기 → 배너", lambda: helper.send({"type": "talk_start", "to": "all"}),
-         until=lambda: radio.incoming_from == "엄마" and ctx["incoming"].winfo_ismapped())
+    # 4. 실시간 말하기 수신 배너 (+ 음성 감지: 말소리 없이 누른 건 아무 신호도 안 옴)
+    silence = bytes(640)                                                       # 20ms 무음
+    voice = struct.pack("<320h", *[3000 if (i // 18) % 2 else -3000 for i in range(320)])   # 20ms 또렷한 소리
+
+    def mom_touch_only():
+        helper.send({"type": "talk_start", "to": "all"})
+        for _ in range(40):
+            helper.client.send_bytes(silence)   # 0.8초 무음 (버튼만 스친 경우)
+        helper.send({"type": "talk_end"})
+    step("엄마가 말 없이 눌렀다 뗌 → 나에겐 아무 신호 없음", mom_touch_only,
+         until=lambda: helper.find("talk_silent") and radio.incoming_from is None and not ctx["incoming"].winfo_ismapped() and not helper.find("talk_sent"))
+
+    def mom_talk():
+        helper.send({"type": "talk_start", "to": "all"})
+        for _ in range(20):
+            helper.client.send_bytes(voice)     # 0.4초 말소리 → 감지되어 배너가 떠야 함
+    step("엄마 말하기(말소리) → 배너", mom_talk,
+         until=lambda: radio.incoming_from == "엄마" and ctx["incoming"].winfo_ismapped() and helper.find("talk_live"))
 
     def mom_audio_end():
-        for _ in range(40):
-            helper.client.send_bytes(bytes(640))   # 0.8초 무음
+        for _ in range(20):
+            helper.client.send_bytes(voice)
         helper.send({"type": "talk_end"})
     step("엄마 말 끝 → 배너 사라짐", mom_audio_end, until=lambda: radio.incoming_from is None and not ctx["incoming"].winfo_ismapped())
     step("엄마 쪽 talk_sent(들음 확인)", until=lambda: helper.find("talk_sent"))

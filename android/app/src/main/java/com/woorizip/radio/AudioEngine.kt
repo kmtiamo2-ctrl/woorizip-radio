@@ -156,6 +156,11 @@ object Feedback {
         vibrate(ctx, longArrayOf(0, 60))
     }
 
+    /** 말소리가 확인되어 지금부터 가족에게 나감: 아주 짧은 진동 한 번 (소리는 내지 않음 — 마이크에 들어가므로) */
+    fun live(ctx: Context) {
+        vibrate(ctx, longArrayOf(0, 30))
+    }
+
     /** 송신 불가 (다른 가족이 말하는 중 등): 낮은 음 + 두 번 진동 */
     fun denied(ctx: Context) {
         tone?.startTone(ToneGenerator.TONE_PROP_NACK, 250)

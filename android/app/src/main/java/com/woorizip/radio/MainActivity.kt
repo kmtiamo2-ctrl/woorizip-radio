@@ -568,6 +568,12 @@ class MainActivity : AppCompatActivity() {
             toast("확인 중…")
             Updater.checkNow(this) { r -> runOnUiThread { toast(r) } }
         }, lp(top = 4))
+        normal.addView(textButton(if (Notifs.standbyHidden(this)) "상단 '수신 대기' 알림: 숨김 (설정 열기)" else "상단 '수신 대기' 알림 숨기기…", cSub) {
+            MaterialAlertDialogBuilder(this).setTitle("수신 대기 알림")
+                .setMessage("뒤에서 듣고 있다는 표시라 안드로이드가 붙이는 알림이에요. 이 앱은 가장 작게(상단 아이콘 없이) 보이도록 해 두었지만, 기종에 따라 남을 수 있어요.\n\n열리는 화면에서 '알림 표시'를 끄면 이 표시만 사라지고 수신·메시지 알림은 그대로 돼요.")
+                .setPositiveButton("설정 열기") { _, _ -> Notifs.openStandbyChannelSettings(this) }
+                .setNegativeButton("닫기", null).show()
+        }, lp(top = 4))
         normal.addView(textButton("사용자·주소 변경 (가족 암호 필요)", cSub) {
             val pw = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD; hint = "가족 암호" }
             val wrap = FrameLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(pw) }

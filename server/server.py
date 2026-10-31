@@ -16,6 +16,10 @@
   MAX_TALK_SEC 한 번에 말할 수 있는 최대 시간(초) (기본: 60)
   KEEP_HOURS   보관한 음성·문자를 몇 시간까지 전달 시도할지 (기본: 24)
   DATA_DIR     예약 메시지 저장 폴더 (기본: /app — 컨테이너를 다시 만들어도 남도록 NAS 폴더에 저장)
+  VOICE_GATE   음성 감지 기준 음량(RMS, 기본 400, 0이면 끔). 버튼을 눌러도 이 크기의 말소리가
+               VOICE_NEED_SEC(0.1초) 이상 들어와야 가족에게 "말하는 중" 신호와 소리가 나감.
+               말소리 없이 손을 떼면 아무것도 보내지 않고 보낸 사람에게만 {"type":"talk_silent"}
+               신호가 열리는 순간 보낸 사람에게 {"type":"talk_live"} (폰은 짧게 진동)
 
 읽음·들음 확인
   보낸 메시지마다 mid(메시지 번호)가 있고, 받는 사람별 상태가 sent → received → seen 으로 바뀜
@@ -35,14 +39,17 @@
   첫 바이트 1 = 실시간 음성 (뒤에 PCM 16kHz 모노 16비트)
   첫 바이트 2 = 보관 음성 클립 (뒤에 4바이트 클립 번호, 그 뒤 PCM 전체)
 """
+import array
 import asyncio
 import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import struct
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +59,12 @@ MEMBERS = [m.strip() for m in os.environ.get("MEMBERS", "엄마,아빠,첫째,�
 PORT = int(os.environ.get("PORT", "8765"))
 PARENTS = {m.strip() for m in os.environ.get("PARENTS", "엄마,아빠").split(",") if m.strip()}
 MAX_TALK_SEC = float(os.environ.get("MAX_TALK_SEC", "60"))
+# 음성 감지: 실제 말소리가 들어와야 가족에게 신호를 보냄 (버튼을 스치거나 말 없이 누른 건 아무 일도 안 생김)
+VOICE_GATE = int(os.environ.get("VOICE_GATE", "400"))          # 말소리로 보는 음량(RMS, 0~32767). 0이면 끔
+VOICE_MIN_SEC = float(os.environ.get("VOICE_MIN_SEC", "0.25"))  # 최소 이만큼 녹음이 쌓인 뒤에
+VOICE_NEED_SEC = float(os.environ.get("VOICE_NEED_SEC", "0.1")) # 그중 말소리가 이만큼 있어야 열림
+VOICE_SKIP_SEC = float(os.environ.get("VOICE_SKIP_SEC", "0.2")) # 맨 앞 이만큼은 음량을 세지 않음 (기기가 내는 '삐' 시작음이 마이크에 들어와도 무시)
+VOICE_PRE_SEC = 1.0                                             # 열릴 때 앞부분을 이만큼까지 같이 보냄 (앞 글자 안 잘리게)
 KEEP_HOURS = float(os.environ.get("KEEP_HOURS", "24"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 SCHEDULE_FILE = os.path.join(DATA_DIR, "schedules.json")
@@ -65,6 +78,21 @@ QUIET_BEFORE_PING = 150 # 이만큼 조용한 연결에만 서버가 ping (평�
 IDLE_TIMEOUT = 330      # 이만큼 아무 신호가 없으면 끊긴 것으로 정리
 MAX_FRAME = 64 * 1024
 LIVE, CLIP = 1, 2
+BYTES_PER_SEC = 32000   # 16kHz 16비트 모노
+
+
+def pcm_rms(data):
+    """16비트 PCM 조각의 음량(RMS). 표준 라이브러리만 사용 (audioop은 3.13에서 빠짐)"""
+    n = len(data) // 2
+    if n == 0:
+        return 0
+    step = max(1, n // 400)                 # 조각당 최대 400개 샘플만 봐도 음량 판단엔 충분
+    samples = array.array("h")
+    samples.frombytes(data[: n * 2])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    sub = samples[::step]
+    return int(math.sqrt(sum(s * s for s in sub) / len(sub)))
 
 # ---- 자동 업데이트: GitHub 릴리스에서 새 설치 파일을 받아 두고(updates/), 가족 기기들이 여기서 받아감 ----
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "kmtiamo2-ctrl/woorizip-radio")   # 비우면 자동 받기 안 함
@@ -235,6 +263,9 @@ class Hub:
         self.mode = None
         self.talk_started = 0.0
         self.record = bytearray()
+        self.gate_open = True    # 음성 감지: 말소리가 확인되어 가족에게 신호·소리가 나가는 중인지
+        self.gate_voiced = 0     # 지금까지 말소리로 판단된 바이트 수
+        self.gate_peak = 0       # 이번 송신의 최대 음량 (로그용 — 기준값 조정 근거)
         self.queue = {m: [] for m in MEMBERS}   # 이름 -> [클립...]
         self.clip_seq = 0
         self.receipts = {}       # mid -> {"from","kind","ts","status":{이름: sent|received|seen}}
@@ -297,11 +328,35 @@ class Hub:
         self.speaker, self.speaker_ws, self.targets, self.live, self.mode = name, ws, targets, live, mode
         self.talk_started = time.monotonic()
         self.record = bytearray()
-        log("송신 시작: %s -> %s (실시간 %d대)", name, "전체" if mode == "all" else ",".join(targets), len(live))
+        self.gate_open = VOICE_GATE <= 0   # 음성 감지를 켜 두면 말소리가 확인될 때까지 가족에게 아무 신호도 안 보냄
+        self.gate_voiced = 0
+        self.gate_peak = 0
+        log("송신 시작: %s -> %s (실시간 %d대%s)", name, "전체" if mode == "all" else ",".join(targets), len(live),
+            "" if self.gate_open else ", 말소리 기다리는 중")
         await ws.send_json({"type": "talk_granted", "to": to,
                             "listeners": [m for m in targets if self.conns.get(m)]})
-        for w in live:
+        if self.gate_open:
+            await self.open_gate(ws)
+        else:
+            await self.broadcast_presence()
+
+    async def open_gate(self, ws):
+        """말소리가 확인됨: 이제 가족에게 '말하는 중' 신호를 보내고, 모아 둔 앞부분부터 이어서 들려줌"""
+        self.gate_open = True
+        name, mode = self.speaker, self.mode
+        for w in self.live:
             await w.send_json({"type": "incoming", "from": name, "mode": mode})
+        # 열리기 전에 쌓인 소리 중 최근 VOICE_PRE_SEC 만큼만 남겨서(긴 침묵은 버림) 먼저 보냄
+        keep = int(VOICE_PRE_SEC * BYTES_PER_SEC)
+        if len(self.record) > keep:
+            del self.record[: len(self.record) - keep]
+        pre = bytes(self.record)
+        for i in range(0, len(pre), 3200):
+            frame = bytes([LIVE]) + pre[i:i + 3200]
+            for w in self.live:
+                await w.send_bytes(frame)
+        if not ws.closed:
+            await ws.send_json({"type": "talk_live"})   # 보낸 사람 폰: 지금부터 나간다고 짧게 진동
         await self.broadcast_presence()
 
     async def end_talk(self, ws, reason="done"):
@@ -309,9 +364,18 @@ class Hub:
             return
         name, targets, live, mode = self.speaker, self.targets, self.live, self.mode
         pcm = bytes(self.record)
+        gate_open, peak = self.gate_open, self.gate_peak
         self.speaker = self.speaker_ws = None
         self.targets, self.live, self.mode, self.record = [], [], None, bytearray()
-        log("송신 종료: %s (%s, %.1f초)", name, reason, len(pcm) / 32000)
+        self.gate_open = True
+        if not gate_open:
+            # 말소리 없이 끝남(스친 터치 등): 가족에게는 아무 신호도 가지 않았고 녹음도 버림
+            log("송신 취소: %s (%s, %.1f초, 말소리 없음 · 최대 음량 %d)", name, reason, len(pcm) / BYTES_PER_SEC, peak)
+            if not ws.closed:
+                await ws.send_json({"type": "talk_silent", "seconds": round(len(pcm) / BYTES_PER_SEC, 1), "peak": peak})
+            await self.broadcast_presence()
+            return
+        log("송신 종료: %s (%s, %.1f초, 최대 음량 %d)", name, reason, len(pcm) / BYTES_PER_SEC, peak)
         for w in live:
             await w.send_json({"type": "incoming_end", "from": name})
         if reason != "done" and not ws.closed:
@@ -330,8 +394,22 @@ class Hub:
     async def relay_audio(self, ws, data):
         if self.speaker_ws is not ws:
             return
-        if len(self.record) < int(MAX_TALK_SEC * 32000) + 64000:
+        if len(self.record) < int(MAX_TALK_SEC * BYTES_PER_SEC) + 64000:
             self.record += data
+        if not self.gate_open:
+            # 아직 말소리 확인 전: 모아 두기만 하고, 기준 음량이 충분히 쌓이면 그때 가족에게 보내기 시작
+            rms = pcm_rms(data)
+            if rms > self.gate_peak:
+                self.gate_peak = rms
+            if rms >= VOICE_GATE and len(self.record) > VOICE_SKIP_SEC * BYTES_PER_SEC:
+                self.gate_voiced += len(data)
+            if len(self.record) >= VOICE_MIN_SEC * BYTES_PER_SEC and self.gate_voiced >= VOICE_NEED_SEC * BYTES_PER_SEC:
+                await self.open_gate(ws)
+            return
+        if self.gate_peak < 32767:
+            r = pcm_rms(data)
+            if r > self.gate_peak:
+                self.gate_peak = r
         frame = bytes([LIVE]) + data
         for w in self.live:
             await w.send_bytes(frame)

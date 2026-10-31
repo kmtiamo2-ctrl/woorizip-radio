@@ -289,6 +289,8 @@ class MainActivity : AppCompatActivity() {
         val (til, et) = inputField("메시지 입력")
         input = et
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        input.setOnFocusChangeListener { _, has -> if (has) { scrollRoot.postDelayed({ revealInput() }, 350) } }
+        input.setOnClickListener { scrollRoot.postDelayed({ revealInput() }, 350) }
         inputRow.addView(pill("보내기", true) { val t = input.text.toString(); if (t.isNotBlank() && Radio.sendText(t)) { input.setText(""); stickBottom = true } },
             lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
         inputRow.addView(pill("⏰", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
@@ -319,6 +321,8 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.setOnApplyWindowInsetsListener(scrollRoot) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            // 키패드가 올라오면 입력칸이 가려지지 않게 그 자리까지 스크롤
+            if (insets.isVisible(WindowInsetsCompat.Type.ime()) && ::input.isInitialized && input.hasFocus()) scrollRoot.post { revealInput() }
             insets
         }
         return scrollRoot
@@ -611,6 +615,13 @@ class MainActivity : AppCompatActivity() {
         msgHead.setTextColor(room.color)
         noticeText.text = Radio.notice
         standbySwitch.isChecked = RadioService.running
+    }
+
+    /** 입력칸(과 그 아래 보내기 줄)이 화면 안에 보이도록 스크롤 */
+    private fun revealInput() {
+        if (!::input.isInitialized || !::scrollRoot.isInitialized) return
+        val r = android.graphics.Rect(0, 0, input.width, input.height + dp(72))
+        input.requestRectangleOnScreen(r, true)
     }
 
     private fun dayLabel(ts: Long): String {

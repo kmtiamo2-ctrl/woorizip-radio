@@ -1627,7 +1627,7 @@ def run_ui(start_minimized, selftest=False):
             w.grab_set()
             return
 
-        ctk.CTkLabel(box, text="이 PC: %s" % cfg.name, font=font(16, True), text_color=TXT, anchor="w").pack(anchor="w", padx=12, pady=(10, 0))
+        ctk.CTkLabel(box, text="이 PC: %s  ·  %s" % (cfg.name, __version__), font=font(16, True), text_color=TXT, anchor="w").pack(anchor="w", padx=12, pady=(10, 0))
 
         section(box, "말하기 단축키 (비우면 없음)").pack(anchor="w", padx=12, pady=(14, 4))
         row = ctk.CTkFrame(box, fg_color="transparent")
@@ -1679,7 +1679,26 @@ def run_ui(start_minimized, selftest=False):
             ok, msg = make_desktop_shortcut()
             (messagebox.showinfo if ok else messagebox.showwarning)(
                 "바로가기", msg + ("\n\n작업 표시줄에 두고 싶으면 그 바로가기를 작업 표시줄로 끌어다 놓으세요." if ok else ""), parent=w)
-        pill(box, "바탕화면에 바로가기 만들기", shortcut, filled=False, width=200).pack(anchor="w", padx=12, pady=(10, 0))
+        row2 = ctk.CTkFrame(box, fg_color="transparent")
+        row2.pack(fill="x", padx=12, pady=(10, 0))
+        pill(row2, "바탕화면에 바로가기 만들기", shortcut, filled=False, width=200).pack(side="left")
+
+        def check_update_now():
+            if not radio.connected:
+                messagebox.showinfo("업데이트", "서버에 연결된 뒤에 확인할 수 있어요", parent=w)
+                return
+            upd_btn.configure(text="확인 중…", state="disabled")
+
+            def worker():
+                try:
+                    found = updater.check()
+                    events.put(("update_checked", (found, None)))
+                except Exception as e:
+                    events.put(("update_checked", (False, str(e))))
+            threading.Thread(target=worker, daemon=True).start()
+        upd_btn = pill(row2, "지금 업데이트 확인", check_update_now, filled=False, width=150)
+        upd_btn.pack(side="left", padx=(8, 0))
+        wins["upd_btn"] = upd_btn
 
         def save():
             hk_ = hk_entry.get().strip()
@@ -1861,6 +1880,24 @@ def run_ui(start_minimized, selftest=False):
             set_tray(radio.connected, radio.where)
         elif kind == "schedules":
             render_schedules()
+        elif kind == "update_checked":
+            found, err = info
+            try:
+                b = wins.get("upd_btn")
+                if b and b.winfo_exists():
+                    b.configure(text="지금 업데이트 확인", state="normal")
+            except Exception:
+                pass
+            parent = wins["settings"] if wins.get("settings") and wins["settings"].winfo_exists() else root
+            if err:
+                messagebox.showwarning("업데이트", "확인하지 못했어요: %s" % err, parent=parent)
+            elif found and updater.ready:
+                if updater.enabled and messagebox.askyesno("업데이트", "새 버전 v%d 을 받았어요.\n지금 바로 설치할까요? (프로그램이 잠깐 꺼졌다 트레이로 다시 켜져요)" % updater.ready[1], parent=parent):
+                    updater.apply()
+                elif not updater.enabled:
+                    messagebox.showinfo("업데이트", "새 버전 v%d 을 받아 두었어요" % updater.ready[1], parent=parent)
+            else:
+                messagebox.showinfo("업데이트", "지금이 최신 버전이에요 (%s)" % __version__, parent=parent)
         elif kind == "hotkey_captured":
             ent, combo = info
             try:

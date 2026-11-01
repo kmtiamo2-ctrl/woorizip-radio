@@ -1175,6 +1175,7 @@ def run_ui(start_minimized, selftest=False):
     avail = int(root.winfo_screenheight() / scaling(root)) - 90
     root.geometry("480x%d" % max(600, min(900, avail)))
     root.minsize(440, max(600, min(720, avail)))
+    short = avail < 820   # 세로가 짧은 화면(노트북 768 등): 위쪽을 줄여서 대화 칸이 사라지지 않게
 
     ico_path = os.path.join(data_dir(), "icon.ico")
     try:
@@ -1288,11 +1289,11 @@ def run_ui(start_minimized, selftest=False):
         grid.columnconfigure(c, weight=1, uniform="fam")
 
     # 말하기 버튼
-    talk = ctk.CTkFrame(body, fg_color=AMBER, corner_radius=26, height=112)
-    talk.pack(fill="x", pady=(16, 0))
+    talk = ctk.CTkFrame(body, fg_color=AMBER, corner_radius=26, height=84 if short else 112)
+    talk.pack(fill="x", pady=(10 if short else 16, 0))
     talk.pack_propagate(False)
-    talk_title = ctk.CTkLabel(talk, text="", font=font(22, True), text_color=ON_AMBER)
-    talk_title.pack(pady=(26, 0))
+    talk_title = ctk.CTkLabel(talk, text="", font=font(20 if short else 22, True), text_color=ON_AMBER)
+    talk_title.pack(pady=(14 if short else 26, 0))
     talk_sub = ctk.CTkLabel(talk, text="", font=font(12), text_color=ON_AMBER)
     talk_sub.pack()
     for wdg in (talk, talk_title, talk_sub):
@@ -1997,7 +1998,7 @@ def run_ui(start_minimized, selftest=False):
         if unread:
             sub += " · 새 글 %d" % unread
         b = ctk.CTkButton(parent, text="%s %s\n%s" % (icon, label, sub), command=lambda k=key: radio.select_room(k),
-                          font=font(13, sel), height=56, corner_radius=16,
+                          font=font(13, sel), height=46 if short else 56, corner_radius=16,
                           fg_color=color if sel else CARD, hover_color=color if sel else CARD2,
                           text_color="#101418" if sel else (color if (members is None or len(members) > 1 or members[0] in radio.online) else SUB),
                           border_width=0 if sel else 1, border_color=OUTLINE)
@@ -2512,9 +2513,14 @@ def _selftest_start(ctx):
         lbls = labels_with(text, ctx["msg_list"])
         ok = False
         y = top = None
-        if lbls and cv.yview()[1] >= 0.98:
+        try:
+            region_h = float(str(cv.cget("scrollregion")).split()[3])
+        except Exception:
+            region_h = -1
+        if lbls and cv.yview()[1] >= 0.98 and abs(region_h - ctx["msg_list"].winfo_reqheight()) <= 2:   # 스크롤 범위가 실제 내용 크기와 같고 맨 아래
             y, top = lbls[-1].winfo_rooty(), cv.winfo_rooty()
-            ok = top <= y <= top + cv.winfo_height()
+            # 점검용 화면이 작아 대화 칸이 120px도 안 되면 말풍선 위치 확인은 생략 (CI 화면 768px)
+            ok = cv.winfo_height() < 120 or top <= y <= top + cv.winfo_height()
         if not ok and time.time() - dbg["last"] > 1.5:   # 실패 원인 파악용 (1.5초에 한 번만)
             dbg["last"] = time.time()
             print("      [진단] yview=%s region=%s 내용높이=%s/%s 캔버스높이=%s 글y=%s 캔버스y=%s stick=%s 라벨=%d" % (

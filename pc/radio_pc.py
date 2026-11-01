@@ -2200,7 +2200,7 @@ def run_ui(start_minimized, selftest=False):
         _selftest_ctx.update(root=root, ctk=ctk, cfg=cfg, radio=radio, events=events, popup=popup, sched=sched, entry=entry,
                              grid=grid, msg_list=msg_list, incoming=incoming, tray=tray, messagebox=messagebox,
                              open_settings=open_settings, open_schedule=open_schedule, handle_event=handle_event, on_close=on_close,
-                             quit_app=quit_app, updater=updater)
+                             quit_app=quit_app, updater=updater, chat=chat)
         root.after(800, _selftest_start, _selftest_ctx)
     root.mainloop()
 
@@ -2505,13 +2505,22 @@ def _selftest_start(ctx):
     step("엄마 쪽에 '봄' 확인 도착", until=lambda: any((m.get("status") or {}).get("아빠") == "seen" for m in helper.find("receipt")))
     step("1:1 글은 '엄마와의 대화' 상자로 묶임", until=lambda: labels_with("엄마와의 대화", ctx["msg_list"]))
 
+    dbg = {"last": 0.0}
+
     def chat_at_bottom(text="알겠어요"):   # 스크롤이 맨 아래이고, 그 글의 말풍선이 실제로 보이는 영역 안에 있는지
         cv = ctx["msg_list"]._parent_canvas
         lbls = labels_with(text, ctx["msg_list"])
-        if not lbls or cv.yview()[1] < 0.98:
-            return False
-        y, top = lbls[-1].winfo_rooty(), cv.winfo_rooty()
-        return top <= y <= top + cv.winfo_height()
+        ok = False
+        y = top = None
+        if lbls and cv.yview()[1] >= 0.98:
+            y, top = lbls[-1].winfo_rooty(), cv.winfo_rooty()
+            ok = top <= y <= top + cv.winfo_height()
+        if not ok and time.time() - dbg["last"] > 1.5:   # 실패 원인 파악용 (1.5초에 한 번만)
+            dbg["last"] = time.time()
+            print("      [진단] yview=%s region=%s 내용높이=%s/%s 캔버스높이=%s 글y=%s 캔버스y=%s stick=%s 라벨=%d" % (
+                tuple(round(v, 3) for v in cv.yview()), cv.cget("scrollregion"), ctx["msg_list"].winfo_height(), ctx["msg_list"].winfo_reqheight(),
+                cv.winfo_height(), y, top, ctx["chat"].get("stick"), len(lbls)), flush=True)
+        return ok
     step("대화가 맨 아래에 붙고 최신 글이 보임", until=chat_at_bottom)
     step("엄마 방으로 바꿔도 맨 아래·글 보임", lambda: radio.select_room("엄마"), until=lambda: radio.current_room()[0] == "엄마" and chat_at_bottom())
     step("모두 방으로 복귀해도 맨 아래·글 보임", lambda: radio.select_room("all"), until=lambda: radio.current_room()[0] == "all" and chat_at_bottom())

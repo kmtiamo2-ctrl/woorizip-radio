@@ -319,6 +319,14 @@ class MainActivity : AppCompatActivity() {
         scrollRoot.addView(msgCard, lp(top = 4, bottom = 8))
         scrollRoot.setPadding(dp(14), 0, dp(14), 0)
         outer.addView(scrollRoot, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        // 대화 칸 크기가 바뀔 때(키패드 열림/닫힘, 말하기 버튼 접힘/펼침) 바닥 근처를 보고 있었으면 바닥으로 다시 붙임 — 옛 글을 보던 중이면 그대로 둠
+        scrollRoot.setOnScrollChangeListener(NestedScrollView.OnScrollChangeListener { v, _, _, _, _ ->
+            val c = v.getChildAt(0) ?: return@OnScrollChangeListener
+            chatNearBottom = c.bottom - (v.height + v.scrollY) < dp(160)
+        })
+        scrollRoot.addOnLayoutChangeListener { v, _, top, _, bottom, _, oldTop, _, oldBottom ->
+            if ((bottom - top) != (oldBottom - oldTop) && chatNearBottom) v.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }
+        }
 
         // 아래: 빠른 답장 + 입력칸 (화면 바닥에 고정, 키패드가 올라오면 같이 올라옴)
         val bottom = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(cCard); setPadding(dp(14), dp(8), dp(14), dp(10)) }
@@ -744,6 +752,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var inputRoomKey: String? = null
+    private var chatNearBottom = true   // 대화 칸을 바닥 근처에서 보고 있는지 (크기가 바뀔 때 바닥으로 다시 붙일지 판단)
     private var insetPad = intArrayOf(0, 0, 0, 0)
     private var keyboardOverlap = 0   // 창이 안 줄어드는 기기에서 키패드가 가린 높이 (아래 여백으로 보정)
     private var keyboardTaken = 0     // 키패드가 차지한 높이 (열림/닫힘 판단용)

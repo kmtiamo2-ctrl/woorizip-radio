@@ -1372,14 +1372,32 @@ def run_ui(start_minimized, selftest=False):
         except Exception:
             return True
 
+    def fix_region():
+        """스크롤 범위를 지금 내용 크기에 맞춤. (크기 변경 이벤트가 늦게 처리되면 옛 범위 기준으로 엉뚱한 곳에 멈추므로 직접 맞춤)"""
+        cv = chat_canvas()
+        box = cv.bbox("all")
+        if box:
+            cv.configure(scrollregion=box)
+
     def scroll_bottom(*_):
         chat["stick"] = True
         try:
             msg_list.update_idletasks()
+            fix_region()
             chat_canvas().yview_moveto(1.0)
         except Exception:
             pass
         new_btn.place_forget()
+
+        def again():   # 상자 안 말풍선들의 크기 계산이 조금 늦게 끝나는 경우를 위해 잠시 뒤 한 번 더
+            if chat["stick"]:
+                try:
+                    fix_region()
+                    chat_canvas().yview_moveto(1.0)
+                except Exception:
+                    pass
+        root.after(120, again)
+        root.after(400, again)
 
     new_btn = ctk.CTkButton(msg_wrap, text="새 메시지 ↓", command=scroll_bottom, font=font(12, True), height=30, corner_radius=15,
                             fg_color=AMBER, hover_color=AMBER_D, text_color=ON_AMBER, width=110)
@@ -2141,6 +2159,13 @@ def run_ui(start_minimized, selftest=False):
                     root.after(30, scroll_bottom)
                 elif newest_changed:
                     new_btn.place(relx=0.5, rely=1.0, anchor="s", y=-6)
+            elif chat["stick"]:   # 맨 아래를 따라가는 중인데 내용 크기가 바뀌어 밀렸으면 다시 맨 아래로 (0.15초마다 확인)
+                try:
+                    fix_region()
+                    if not at_bottom():
+                        chat_canvas().yview_moveto(1.0)
+                except Exception:
+                    pass
 
     def on_close():
         if tray["icon"]:
@@ -2479,6 +2504,17 @@ def _selftest_start(ctx):
     step("'보냈어요' 팝업은 저절로 닫힘", until=lambda: ctx["popup"]["win"] is None, timeout=8)
     step("엄마 쪽에 '봄' 확인 도착", until=lambda: any((m.get("status") or {}).get("아빠") == "seen" for m in helper.find("receipt")))
     step("1:1 글은 '엄마와의 대화' 상자로 묶임", until=lambda: labels_with("엄마와의 대화", ctx["msg_list"]))
+
+    def chat_at_bottom(text="알겠어요"):   # 스크롤이 맨 아래이고, 그 글의 말풍선이 실제로 보이는 영역 안에 있는지
+        cv = ctx["msg_list"]._parent_canvas
+        lbls = labels_with(text, ctx["msg_list"])
+        if not lbls or cv.yview()[1] < 0.98:
+            return False
+        y, top = lbls[-1].winfo_rooty(), cv.winfo_rooty()
+        return top <= y <= top + cv.winfo_height()
+    step("대화가 맨 아래에 붙고 최신 글이 보임", until=chat_at_bottom)
+    step("엄마 방으로 바꿔도 맨 아래·글 보임", lambda: radio.select_room("엄마"), until=lambda: radio.current_room()[0] == "엄마" and chat_at_bottom())
+    step("모두 방으로 복귀해도 맨 아래·글 보임", lambda: radio.select_room("all"), until=lambda: radio.current_room()[0] == "all" and chat_at_bottom())
     step("답장칸 열어 두고 본 창 클릭 → 닫힘", lambda: (helper.send({"type": "text", "to": "아빠", "text": "밥은?"}), None)[1],
          until=lambda: ctx["popup"]["win"] is not None and labels_with("밥은?", ctx["popup"]["win"]))
 

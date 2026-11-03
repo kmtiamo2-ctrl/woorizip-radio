@@ -499,6 +499,8 @@ class Radio:
         self.outbox = []         # 연결이 끊겨 있을 때 보낸 문자: 연결되면 자동 전송
         self.receipts = {}       # 내가 보낸 메시지 mid -> {이름: sent|received|seen}
         self.seen_sent = set()   # 내가 '봤어요/들었어요'라고 알린 mid
+        self.uploads = {}        # 보내는 중인 첨부: 경로 -> {name, done, total, error, finished}
+        self.fetching = set()    # 내려받는 중인 (종류, fid)
         self.schedules = []      # 내 예약 메시지 목록 (서버가 줌)
         self._load_outbox()
         self.quick_replies = [q.strip() for q in cfg.quick.split(",") if q.strip()]
@@ -601,7 +603,7 @@ class Radio:
 
     def unread_count(self, room):
         return sum(1 for c in self.room_clips(room)
-                   if not c.get("mine") and c.get("kind") in ("text", "clip") and (c.get("mid") or 0) and c.get("mid") not in self.seen_sent)
+                   if not c.get("mine") and c.get("kind") in ("text", "clip", "file") and (c.get("mid") or 0) and c.get("mid") not in self.seen_sent)
 
     def set_target(self, t):
         """한 명으로 지정 (답장 등)"""
@@ -717,6 +719,18 @@ class Radio:
                 self.pending[int(msg.get("id", 0))] = msg
             elif t == "text":
                 self._on_text_msg(msg)
+            elif t == "file":        # 가족이 보낸 첨부 (사진·파일)
+                self._on_file_msg(msg)
+            elif t == "file_echo":   # 내가 (이 기기 또는 다른 기기에서) 보낸 첨부
+                mid = int(msg.get("mid", 0))
+                if not any(c.get("mid") == mid for c in self.clips):
+                    self._add_clip(self._file_clip(msg, True))
+            elif t == "file_expired":
+                gone = set(msg.get("fids") or [])
+                for c in self.clips:
+                    if c.get("kind") == "file" and c.get("fid") in gone:
+                        c["expired"] = True
+                self._save_texts()
             elif t == "text_sent":
                 to = msg.get("to")
                 if isinstance(to, list):
@@ -817,7 +831,7 @@ class Radio:
     def _save_texts(self):
         try:
             with open(os.path.join(data_dir(), "texts.json"), "w", encoding="utf-8") as f:
-                json.dump([c for c in self.clips if c.get("kind") in ("text", "voice_sent")][:120], f, ensure_ascii=False)
+                json.dump([c for c in self.clips if c.get("kind") in ("text", "voice_sent", "file")][:120], f, ensure_ascii=False)
         except Exception:
             pass
 
@@ -831,7 +845,7 @@ class Radio:
                 except Exception:
                     pass
         del self.clips[self.MAX_CLIPS:]
-        if clip.get("kind") in ("text", "voice_sent"):
+        if clip.get("kind") in ("text", "voice_sent", "file"):
             self._save_texts()
 
     def _merge_history(self, items):
@@ -844,9 +858,12 @@ class Radio:
                 continue
             mine = it.get("from") == self.cfg.name
             to = it.get("to") or []
-            clip = {"kind": "text", "id": mid, "mid": mid, "ts": int(it.get("ts") or 0), "text": str(it.get("text", "")),
-                    "mode": it.get("mode") or "direct",
-                    "from": (self.cfg.name if it.get("mode") == "all" else ", ".join(to)) if mine else it.get("from")}
+            if it.get("kind") == "file":
+                clip = self._file_clip(it, mine)
+            else:
+                clip = {"kind": "text", "id": mid, "mid": mid, "ts": int(it.get("ts") or 0), "text": str(it.get("text", "")),
+                        "mode": it.get("mode") or "direct",
+                        "from": (self.cfg.name if it.get("mode") == "all" else ", ".join(to)) if mine else it.get("from")}
             if mine:
                 clip["mine"] = True
             self.clips.append(clip)
@@ -927,6 +944,210 @@ class Radio:
             self.audio.effect(BEEP_IN)
             self._emit("text", clip)
 
+    # ---- 첨부파일 (사진·파일): NAS에 HTTP로 올리고 내려받음 ----
+
+    def _file_clip(self, m, mine):
+        to = m.get("to") or []
+        if isinstance(to, str):
+            to = [to] if to and to != "all" else []
+        clip = {"kind": "file", "id": int(m.get("id") or m.get("mid") or 0), "mid": int(m.get("mid") or 0), "ts": int(m.get("ts") or time.time()),
+                "mode": m.get("mode") or "direct", "fid": m.get("fid"), "name": str(m.get("name") or "file"), "size": int(m.get("size") or 0),
+                "mime": m.get("mime") or "", "thumb": bool(m.get("thumb")), "expired": bool(m.get("expired")),
+                "from": (self.cfg.name if m.get("mode") == "all" else ", ".join(to)) if mine else m.get("from")}
+        if mine:
+            clip["mine"] = True
+        return clip
+
+    def _on_file_msg(self, msg):
+        cid = int(msg.get("id", 0))
+        self.client.send_json({"type": "clip_ack", "id": cid})
+        mid = int(msg.get("mid", 0))
+        if any(c.get("mid") == mid for c in self.clips):
+            return
+        clip = self._file_clip(msg, False)
+        self._add_clip(clip)
+        if not self.cfg.dnd:
+            self.audio.effect(BEEP_IN)
+            self._emit("file", clip)
+
+    def files_dir(self):
+        d = os.path.join(app_root(), "files")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def http_base(self):
+        addr = self.cfg.out_host if self.where == "out" else self.cfg.host
+        host, port, tls, _ = parse_addr(addr)
+        return "%s://%s:%d" % ("https" if tls else "http", host, port)
+
+    def _http_conn(self):
+        import http.client
+        addr = self.cfg.out_host if self.where == "out" else self.cfg.host
+        host, port, tls, _ = parse_addr(addr)
+        if tls:
+            return http.client.HTTPSConnection(host, port, timeout=60, context=ssl.create_default_context())
+        return http.client.HTTPConnection(host, port, timeout=60)
+
+    @staticmethod
+    def is_image_name(name):
+        return os.path.splitext(str(name).lower())[1] in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic")
+
+    @staticmethod
+    def make_thumb(path, max_px=360):
+        """사진이면 작은 JPEG 미리보기 바이트를 만들어 줌 (Pillow는 customtkinter와 함께 들어 있음). 아니면 None"""
+        try:
+            from PIL import Image, ImageOps
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)
+                im.thumbnail((max_px, max_px))
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                import io
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=78)
+                return buf.getvalue()
+        except Exception:
+            return None
+
+    def send_file(self, path, to=None, display_name=None):
+        """파일을 NAS에 올림 (백그라운드). 진행 상황은 self.uploads[path] 에, 끝나면 내 말풍선 추가"""
+        if not self.connected:
+            self.notice = "지금 연결이 없어서 보낼 수 없어요"
+            return False
+        if not os.path.isfile(path):
+            self.notice = "파일을 찾을 수 없어요"
+            return False
+        name = display_name or os.path.basename(path)
+        info = {"name": name, "done": 0, "total": os.path.getsize(path), "error": None, "finished": False}
+        self.uploads[path] = info
+
+        def run():
+            try:
+                thumb = self.make_thumb(path) if self.is_image_name(name) else None
+                import urllib.parse
+                import mimetypes
+                mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+                if to is None:
+                    to_q = "all" if self.target == "all" else ",".join(self.target_list)
+                elif isinstance(to, str):
+                    to_q = to
+                else:
+                    to_q = ",".join(to)
+                q = {"from": self.cfg.name, "to": to_q, "name": name[:100], "mime": mime}
+                size = os.path.getsize(path)
+                conn = self._http_conn()
+                conn.putrequest("POST", "/file?" + urllib.parse.urlencode(q))
+                conn.putheader("X-Key", self.cfg.key)
+                conn.putheader("X-Thumb-Length", str(len(thumb or b"")))
+                conn.putheader("Content-Type", "application/octet-stream")
+                conn.putheader("Content-Length", str(size + len(thumb or b"")))
+                conn.endheaders()
+                if thumb:
+                    conn.send(thumb)
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(256 * 1024)
+                        if not chunk:
+                            break
+                        conn.send(chunk)
+                        info["done"] += len(chunk)
+                r = conn.getresponse()
+                body = r.read()
+                if r.status != 200:
+                    try:
+                        err = json.loads(body).get("error", "")
+                    except Exception:
+                        err = str(r.status)
+                    raise RuntimeError({"too_large": "파일이 너무 커요 (최대 4GB)", "disk_full": "NAS 저장 공간이 부족해요",
+                                        "no_target": "받을 사람이 없어요", "auth": "암호가 달라요"}.get(err, "보내지 못했어요 (%s)" % err))
+                m = json.loads(body)
+                with self.lock:
+                    if not any(c.get("mid") == int(m.get("mid") or 0) for c in self.clips):
+                        self._add_clip(self._file_clip(m, True))
+                    self.notice = "보냈어요"
+                info["finished"] = True
+                log("첨부 보냄: %s (%.1fMB)" % (name, size / 1048576))
+            except Exception as e:
+                info["error"] = str(e.args[0]) if e.args else str(e)
+                info["finished"] = True
+                with self.lock:
+                    self.notice = "📎 %s: %s" % (name, info["error"])
+                log("첨부 보내기 실패: %s %r" % (name, e))
+            finally:
+                self._emit("upload", info)
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def thumb_path(self, clip):
+        return os.path.join(self.files_dir(), "%s.thumb.jpg" % clip.get("fid"))
+
+    def file_path(self, clip):
+        base, ext = os.path.splitext(clip.get("name") or "file")
+        return os.path.join(self.files_dir(), "%s_%s%s" % (base[:60], str(clip.get("fid"))[:8], ext[:10]))
+
+    def fetch(self, kind, clip, dest, on_done=None):
+        """NAS에서 미리보기(thumb) 또는 원본(file)을 내려받음 (백그라운드, 같은 것은 한 번만)"""
+        key = (kind, clip.get("fid"))
+        if key in self.fetching or clip.get("expired"):
+            return
+        self.fetching.add(key)
+
+        def run():
+            tmp = dest + ".part"
+            try:
+                conn = self._http_conn()
+                conn.request("GET", "/%s/%s" % (kind, clip["fid"]), headers={"X-Key": self.cfg.key})
+                r = conn.getresponse()
+                if r.status == 410:
+                    clip["expired"] = True
+                    raise RuntimeError("expired")
+                if r.status != 200:
+                    raise RuntimeError("HTTP %d" % r.status)
+                total = int(r.getheader("Content-Length") or 0)
+                got = 0
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if kind == "file" and total:
+                            clip["dl"] = got / total
+                os.replace(tmp, dest)
+                clip.pop("dl", None)
+                if on_done:
+                    on_done(dest)
+            except Exception as e:
+                clip.pop("dl", None)
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                if str(e) != "expired":
+                    with self.lock:
+                        self.notice = "📎 %s 내려받기 실패" % clip.get("name")
+                log("첨부 받기 실패: %s %r" % (clip.get("name"), e))
+            finally:
+                self.fetching.discard(key)
+                self._emit("fetched", clip)
+        threading.Thread(target=run, daemon=True).start()
+
+    def open_file(self, clip):
+        """원본을 내려받아(없으면) 기본 프로그램으로 열기"""
+        dest = self.file_path(clip)
+        if os.path.exists(dest):
+            self._start_file(dest)
+            return
+        self.fetch("file", clip, dest, on_done=self._start_file)
+
+    @staticmethod
+    def _start_file(path):
+        try:
+            os.startfile(path)
+        except Exception as e:
+            log("파일 열기 실패: %r" % e)
+
     def _on_clip(self, cid, pcm):
         with self.lock:
             meta = self.pending.pop(cid, None)
@@ -980,7 +1201,7 @@ class Radio:
 
     def clip_title(self, c):
         if c.get("mine"):
-            what = " (음성 %d초)" % max(1, int(c.get("seconds") or 0)) if c.get("kind") == "voice_sent" else ""
+            what = " (음성 %d초)" % max(1, int(c.get("seconds") or 0)) if c.get("kind") == "voice_sent" else (" (📎 %s)" % c.get("name") if c.get("kind") == "file" else "")
             return "내가 %s%s" % ("모두에게" if c["mode"] == "all" else "%s님에게" % c["from"], what)
         if c["mode"] == "all":
             return "%s님 전체 방송" % c["from"]
@@ -1360,6 +1581,9 @@ def run_ui(start_minimized, selftest=False):
     send_btn = pill(entry_row, "보내기", lambda: send_text(entry.get()), width=76)
     send_btn.pack(side="left", padx=(8, 0))
     pill(entry_row, "⏰", lambda: open_schedule(), filled=False, width=44).pack(side="left", padx=(6, 0))
+    pill(entry_row, "📎", lambda: attach_files(), filled=False, width=44).pack(side="left", padx=(6, 0))
+    entry.bind("<Control-v>", lambda e: paste_clipboard(e))   # 클립보드에 스크린샷이 있으면 사진으로 보냄 (아래에서 정의)
+    root.bind("<Control-v>", lambda e: paste_clipboard(e) if root.focus_get() is not entry._entry else None)
 
     chip_row = ctk.CTkFrame(msg_inner, fg_color="transparent")
     chip_row.pack(side="bottom", fill="x", pady=(8, 0))
@@ -1434,10 +1658,114 @@ def run_ui(start_minimized, selftest=False):
             return "어제"
         return time.strftime("%m/%d (%a)", d).replace("Mon", "월").replace("Tue", "화").replace("Wed", "수").replace("Thu", "목").replace("Fri", "금").replace("Sat", "토").replace("Sun", "일")
 
+    def human_size(n):
+        n = float(n or 0)
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024 or unit == "GB":
+                return ("%d %s" if unit == "B" else "%.1f %s") % (n, unit)
+            n /= 1024
+
+    thumb_cache = {}
+
+    def file_bubble(row, c):
+        """첨부 말풍선: 사진은 미리보기(누르면 원본 열기), 파일은 이름·크기 + [열기]"""
+        name, expired = c.get("name") or "file", c.get("expired")
+        if expired:
+            ctk.CTkLabel(row, text="📎 %s\n기간이 지나 삭제됐어요 (7일 보관)" % name, font=font(13), text_color=SUB, justify="left").pack(padx=12, pady=8)
+            return
+        if c.get("thumb"):
+            tp = radio.thumb_path(c)
+            if os.path.exists(tp):
+                img = thumb_cache.get(tp)
+                if img is None:
+                    try:
+                        from PIL import Image
+                        pil = Image.open(tp)
+                        pil.load()
+                        w, h = pil.size
+                        scale = min(1.0, 260.0 / max(1, w), 260.0 / max(1, h))
+                        img = ctk.CTkImage(light_image=pil, dark_image=pil, size=(max(1, int(w * scale)), max(1, int(h * scale))))
+                        thumb_cache[tp] = img
+                    except Exception:
+                        img = None
+                if img is not None:
+                    lb = ctk.CTkLabel(row, text="", image=img, cursor="hand2")
+                    lb.pack(padx=6, pady=6)
+                    lb.bind("<Button-1>", lambda e, c=c: radio.open_file(c))
+                    cap = "%s · %s" % (name, human_size(c.get("size")))
+                    if c.get("dl") is not None:
+                        cap = "내려받는 중 %d%%" % int(c["dl"] * 100)
+                    ctk.CTkLabel(row, text=cap, font=font(10), text_color=SUB).pack(padx=10, pady=(0, 6))
+                    return
+            else:
+                radio.fetch("thumb", c, tp)   # 미리보기를 받아 오면 fetched 이벤트로 다시 그림
+        txt = "📎 %s\n%s" % (name, human_size(c.get("size")))
+        if c.get("dl") is not None:
+            txt = "📎 %s\n내려받는 중 %d%%" % (name, int(c["dl"] * 100))
+        ctk.CTkButton(row, text=txt, font=font(14), fg_color="transparent", hover_color=OUTLINE, text_color=TXT, anchor="w",
+                      height=48, corner_radius=12, command=lambda c=c: radio.open_file(c)).pack(padx=6, pady=4)
+
+    def save_file_as(c):
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(parent=root, initialfile=c.get("name") or "file", title="다른 이름으로 저장")
+        if not dest:
+            return
+        src = radio.file_path(c)
+
+        def copy(path):
+            try:
+                shutil.copyfile(path, dest)
+                radio.notice = "저장했어요: %s" % os.path.basename(dest)
+            except Exception as e:
+                radio.notice = "저장 실패: %s" % e
+        if os.path.exists(src):
+            copy(src)
+        else:
+            radio.fetch("file", c, src, on_done=copy)
+
+    def attach_files(paths=None):
+        """📎: 파일 고르기(여러 개 가능) 또는 주어진 경로들을 지금 고른 상대에게 보냄"""
+        if paths is None:
+            from tkinter import filedialog
+            paths = filedialog.askopenfilenames(parent=root, title="보낼 사진·파일 고르기")
+        sent = 0
+        for pth in paths or ():
+            if radio.send_file(pth):
+                sent += 1
+        if sent:
+            chat["stick"] = True
+
+    def paste_clipboard(_e=None):
+        """Ctrl+V: 클립보드에 스크린샷(그림)이 있으면 사진으로 보냄, 파일 목록이면 파일로 보냄. 글자면 평소처럼 붙여넣기"""
+        try:
+            from PIL import ImageGrab
+            data = ImageGrab.grabclipboard()
+        except Exception:
+            data = None
+        if data is None:
+            return None   # 기본 붙여넣기 진행
+        if isinstance(data, list):
+            files = [x for x in data if isinstance(x, str) and os.path.isfile(x)]
+            if files:
+                attach_files(files)
+                return "break"
+            return None
+        try:
+            os.makedirs(os.path.join(radio.files_dir(), "sent"), exist_ok=True)
+            pth = os.path.join(radio.files_dir(), "sent", time.strftime("스크린샷_%Y%m%d_%H%M%S") + ".png")
+            data.save(pth, "PNG")
+            attach_files([pth])
+        except Exception as e:
+            radio.notice = "붙여넣기 실패: %s" % e
+        return "break"
+
     def bubble_menu(event, c):
         m = tk.Menu(root, tearoff=0, bg=CARD2, fg=TXT, activebackground=OUTLINE, activeforeground=TXT, font=("Malgun Gothic", 11))
         if c.get("kind") == "text":
             m.add_command(label="복사", command=lambda: (root.clipboard_clear(), root.clipboard_append(c.get("text", ""))))
+        if c.get("kind") == "file" and not c.get("expired"):
+            m.add_command(label="열기", command=lambda: radio.open_file(c))
+            m.add_command(label="다른 이름으로 저장…", command=lambda: save_file_as(c))
         if not c.get("mine"):
             m.add_command(label="%s 방으로" % c["from"], command=lambda: radio.select_room(c["from"]))
         m.add_command(label="삭제", command=lambda: radio.delete_clip(c))
@@ -1950,6 +2278,12 @@ def run_ui(start_minimized, selftest=False):
         elif kind == "text":
             flash()
             show_popup("%s %s" % (member_style(info["from"])[0], radio.clip_title(info)), info.get("text", ""), reply_to=info["from"], clip=info)
+        elif kind == "file":
+            flash()
+            show_popup("%s %s" % (member_style(info["from"])[0], radio.clip_title(info)),
+                       "📎 %s (%s)" % (info.get("name"), human_size(info.get("size"))), reply_to=info["from"], clip=info)
+        elif kind in ("fetched", "upload"):
+            cache["clips"] = None   # 미리보기·내려받기·보내기 상태가 바뀜 → 대화 다시 그림
         elif kind == "state":
             set_tray(radio.connected, radio.where)
         elif kind == "schedules":
@@ -2090,7 +2424,13 @@ def run_ui(start_minimized, selftest=False):
                 talk.configure(fg_color=CARD2); talk_title.configure(text="연결 대기 중", text_color=SUB); talk_sub.configure(text=radio.status, text_color=SUB)
             else:
                 talk.configure(fg_color=room_color); talk_title.configure(text="%s %s에게 말하기" % (room_icon, room_name), text_color="#101418"); talk_sub.configure(text="누르고 있는 동안 말해요", text_color="#101418")
-            notice.configure(text=radio.notice)
+            ups = [u for u in radio.uploads.values() if not u["finished"]]
+            if ups:
+                u = ups[0]
+                pct = int(u["done"] * 100 / max(1, u["total"]))
+                notice.configure(text="📎 %s 보내는 중 %d%%%s" % (u["name"], pct, " (+%d개)" % (len(ups) - 1) if len(ups) > 1 else ""))
+            else:
+                notice.configure(text=radio.notice)
             msg_head.configure(text="%s %s" % (room_icon, "모두의 대화" if cur[0] == "all" else room_name + "와의 대화"), text_color=room_color)
             if chat.get("entry_room") != cur[0]:   # 입력칸 테두리·보내기 버튼·안내 글을 고른 방 색으로 — 누구에게 보내는지 입력줄만 봐도 보이게
                 chat["entry_room"] = cur[0]
@@ -2103,8 +2443,9 @@ def run_ui(start_minimized, selftest=False):
 
             window_visible = root.state() in ("normal", "zoomed")   # 최대화된 창도 보이는 것
             shown = list(reversed(radio.room_clips(cur)[:40]))   # 오래된 것 → 최신 (최신이 아래)
-            csig = (cur[0],) + tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
-                                      window_visible and c.get("kind") == "text" and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent)
+            csig = (cur[0], cache.get("thumb_gen", 0)) + tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
+                                      window_visible and c.get("kind") in ("text", "file") and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent,
+                                      round(c.get("dl") or 0, 2), c.get("expired", False))
                                      for c in shown)
             if csig != cache["clips"]:
                 prev_last = cache["clips"][-1] if (cache["clips"] and len(cache["clips"]) > 1) else None
@@ -2149,6 +2490,8 @@ def run_ui(start_minimized, selftest=False):
                     row.pack(anchor="e" if mine else "w")
                     if c.get("kind") == "text":
                         ctk.CTkLabel(row, text=c.get("text", ""), font=font(17), text_color=TXT, anchor="w", wraplength=300, justify="left").pack(padx=12, pady=(8, 8))
+                    elif c.get("kind") == "file":
+                        file_bubble(row, c)
                     else:
                         playing = radio.playing is c
                         secs = max(1, int(c.get("seconds") or 0))
@@ -2168,7 +2511,7 @@ def run_ui(start_minimized, selftest=False):
                         rt = radio.receipt_text(c)
                         if rt:
                             meta = rt + "  ·  " + meta
-                    elif c.get("kind") == "text" and window_visible:
+                    elif c.get("kind") in ("text", "file") and window_visible:
                         radio.mark_seen(c)
                     ctk.CTkLabel(col, text=meta, font=font(10), text_color=(AMBER if (mine and radio.receipt_text(c)) else SUB)).pack(anchor="e" if mine else "w", padx=6)
                 if was_bottom or not shown:
@@ -2216,7 +2559,7 @@ def run_ui(start_minimized, selftest=False):
         _selftest_ctx.update(root=root, ctk=ctk, cfg=cfg, radio=radio, events=events, popup=popup, sched=sched, entry=entry,
                              grid=grid, msg_list=msg_list, incoming=incoming, tray=tray, messagebox=messagebox,
                              open_settings=open_settings, open_schedule=open_schedule, handle_event=handle_event, on_close=on_close,
-                             quit_app=quit_app, updater=updater, chat=chat)
+                             quit_app=quit_app, updater=updater, chat=chat, attach_files=attach_files)
         root.after(800, _selftest_start, _selftest_ctx)
     root.mainloop()
 
@@ -2553,6 +2896,26 @@ def _selftest_start(ctx):
     step("내 폰에서 보낸 글 → PC에 내 말풍선", lambda: my["p"].send({"type": "text", "to": "엄마", "text": "폰에서 보냄"}),
          until=lambda: any(c.get("mine") and c.get("text") == "폰에서 보냄" for c in radio.clips) and labels_with("폰에서 보냄", ctx["msg_list"]))
     step("PC에서 보낸 글 → 내 폰에도(text_echo)", lambda: radio.send_text("PC에서 보냄", to="엄마"), until=lambda: my["p"].find("text_echo", text="PC에서 보냄"))
+
+    # 2-2. 첨부파일: 사진 보내기(미리보기 생성·표시), 가족이 보낸 파일 받기(말풍선·팝업)
+    def send_photo():
+        from PIL import Image
+        pth = os.path.join(data_dir(), "selftest_photo.png")
+        Image.new("RGB", (800, 600), (10, 120, 200)).save(pth)
+        ctx["attach_files"]([pth])
+    step("📎 사진 보내기 → 내 말풍선에 미리보기·이름", send_photo,
+         until=lambda: any(c.get("kind") == "file" and c.get("mine") and c.get("thumb") for c in radio.clips) and labels_with("selftest_photo.png", ctx["msg_list"])
+         and helper.find("file", name="selftest_photo.png"), timeout=20)
+
+    def mom_sends_file():
+        import urllib.request
+        body = b"%PDF-1.4 selftest " * 200
+        req = urllib.request.Request(radio.http_base() + "/file?from=%EC%97%84%EB%A7%88&to=%EC%95%84%EB%B9%A0&name=%EB%AC%B8%EC%84%9C.pdf&mime=application/pdf",
+                                     data=body, method="POST", headers={"X-Key": cfg.key, "X-Thumb-Length": "0"})
+        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10).read()
+    step("엄마가 파일 보냄 → [📎 문서.pdf] 말풍선 + 팝업", mom_sends_file,
+         until=lambda: any("문서.pdf" in (txt(b) or "") for b in widgets(ctx["msg_list"], ctk.CTkButton)) and ctx["popup"]["win"] is not None, timeout=15)
+    step("  → 팝업 닫힘", until=lambda: ctx["popup"]["win"] is None, timeout=12)
     step("답장칸 열어 두고 본 창 클릭 → 닫힘", lambda: (helper.send({"type": "text", "to": "아빠", "text": "밥은?"}), None)[1],
          until=lambda: ctx["popup"]["win"] is not None and labels_with("밥은?", ctx["popup"]["win"]))
 

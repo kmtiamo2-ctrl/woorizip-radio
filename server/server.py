@@ -48,10 +48,13 @@ import logging
 import math
 import os
 import re
+import secrets
+import shutil
 import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 FAMILY_KEY = os.environ.get("FAMILY_KEY", "")
@@ -101,6 +104,15 @@ TOKEN_FILE = os.path.join(DATA_DIR, "github_token.txt")                        #
 UPDATE_DIR = os.path.join(DATA_DIR, "updates")
 UPDATE_CHECK_MIN = float(os.environ.get("UPDATE_CHECK_MIN", "10"))             # 몇 분마다 확인
 
+# ---- 첨부파일: 폰·PC가 HTTP로 올리고(POST /file) 내려받음(GET /file/<id>, /thumb/<id>). 7일 뒤 자동 삭제 ----
+FILES_DIR = os.path.join(DATA_DIR, "files")
+FILE_KEEP_DAYS = float(os.environ.get("FILE_KEEP_DAYS", "7"))
+MAX_FILE_BYTES = int(float(os.environ.get("MAX_FILE_GB", "4")) * 1024 ** 3)      # 파일 하나 상한 (디스크 채우기 방지)
+FILES_TOTAL_BYTES = int(float(os.environ.get("FILES_TOTAL_GB", "50")) * 1024 ** 3)  # 전체 보관 상한 — 넘으면 오래된 것부터 삭제
+THUMB_MAX_BYTES = 512 * 1024
+DISK_RESERVE_BYTES = 2 * 1024 ** 3                                                # NAS 디스크 여유를 이만큼은 남김
+HUB = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%m-%d %H:%M:%S")
 log = logging.info
 
@@ -133,7 +145,11 @@ class WS:
                 headers[k.strip().lower()] = v.strip()
         key = headers.get("sec-websocket-key")
         if not key or "websocket" not in headers.get("upgrade", "").lower():
-            await self.serve_http(path)
+            method = parts[0].upper() if parts else "GET"
+            if path.split("?")[0].startswith(("/file", "/thumb")) and HUB is not None:
+                await HUB.handle_http(self, method, path, headers)
+            else:
+                await self.serve_http(path)
             raise Closed()
         accept = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
         self.w.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
@@ -165,6 +181,18 @@ class WS:
         self.w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
                      b"Connection: close\r\n\r\nwoorizip-radio ok\n")
         await self.w.drain()
+
+    async def http_reply(self, status, body=b"", ctype="application/json; charset=utf-8", extra=""):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, ensure_ascii=False).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.w.write(("HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: no-cache\r\n"
+                      "Connection: close\r\n%s\r\n" % (status, ctype, len(body), extra)).encode() + body)
+        try:
+            await self.w.drain()
+        except Exception:
+            pass
 
     async def _send(self, opcode, payload: bytes):
         if self.closed:
@@ -272,8 +300,9 @@ class Hub:
         self.schedules = []      # 예약 메시지 목록 (파일에 저장)
         self.sched_seq = 0
         self.load_schedules()
-        self.history = []        # 문자 기록 [{mid, from, mode, to, text, ts, status}]
+        self.history = []        # 문자·첨부 기록 [{kind?, mid, from, mode, to, text|fid.., ts, status}]
         self.load_history()
+        os.makedirs(FILES_DIR, exist_ok=True)
 
     # ---- 상태 ----
 
@@ -450,7 +479,7 @@ class Hub:
     async def echo_others(self, name, ws, msg):
         """내가 한 기기에서 보낸 것을 내 다른 기기들에도 알림 (보낸 기기 자신은 제외)"""
         for w in list(self.conns.get(name, ())):
-            if w is not ws and not w.closed:
+            if (ws is None or w is not ws) and not w.closed:
                 try:
                     await w.send_json(msg)
                 except Exception:
@@ -481,7 +510,7 @@ class Hub:
             self.history = []
         for it in self.history:   # 재시작 뒤에도 읽음 확인이 이어지게 복원
             if it.get("mid") and isinstance(it.get("status"), dict):
-                self.receipts[it["mid"]] = {"from": it["from"], "kind": "text", "ts": it["ts"], "status": it["status"]}
+                self.receipts[it["mid"]] = {"from": it["from"], "kind": it.get("kind", "text"), "ts": it["ts"], "status": it["status"]}
 
     def save_history(self):
         try:
@@ -495,9 +524,16 @@ class Hub:
     async def send_history(self, ws):
         """접속 직후: 내가 보냈거나 받은 최근 문자 기록"""
         name = ws.name
-        mine = [{"mid": it["mid"], "from": it["from"], "mode": it["mode"], "to": it["to"], "text": it["text"], "ts": it["ts"]}
-                for it in self.history if it["from"] == name or name in it.get("to", [])]
+        mine = [self.history_public(it) for it in self.history if it["from"] == name or name in it.get("to", [])]
         await ws.send_json({"type": "history", "items": mine[-HISTORY_SEND:]})
+
+    def history_public(self, it):
+        """기록 항목을 클라이언트에 보낼 모양으로 (문자 / 첨부파일)"""
+        if it.get("kind") == "file":
+            return {"kind": "file", "mid": it["mid"], "from": it["from"], "mode": it["mode"], "to": it["to"], "ts": it["ts"],
+                    "fid": it["fid"], "name": it["name"], "size": it["size"], "mime": it.get("mime", ""),
+                    "thumb": bool(it.get("thumb")), "expired": bool(it.get("expired"))}
+        return {"mid": it["mid"], "from": it["from"], "mode": it["mode"], "to": it["to"], "text": it["text"], "ts": it["ts"]}
 
     async def mark(self, mid, who, state):
         """받는 사람의 상태를 올림 (sent < received < seen). 바뀌면 보낸 사람에게 알림"""
@@ -650,6 +686,9 @@ class Hub:
                     await w.send_json({"type": "text", "id": c["id"], "mid": c.get("mid", 0), "from": c["from"], "mode": c["mode"],
                                        "ts": int(c["ts"]), "text": c["text"]})
                     continue
+                if c.get("kind") == "file":
+                    await w.send_json(dict(self.file_msg(c["item"]), type="file", id=c["id"]))
+                    continue
                 await w.send_json({"type": "clip", "id": c["id"], "mid": c.get("mid", 0), "from": c["from"], "mode": c["mode"],
                                    "ts": int(c["ts"]), "seconds": round(len(c["pcm"]) / 32000, 1)})
                 await w.send_bytes(bytes([CLIP]) + struct.pack("!I", c["id"]) + c["pcm"])
@@ -661,6 +700,221 @@ class Hub:
         for c in hit:
             if c.get("mid"):
                 await self.mark(c["mid"], name, "received")
+
+    # ---- 첨부파일 ----
+
+    def file_msg(self, it):
+        return {"mid": it["mid"], "from": it["from"], "mode": it["mode"], "to": it["to"], "ts": int(it["ts"]), "fid": it["fid"],
+                "name": it["name"], "size": it["size"], "mime": it.get("mime", ""), "thumb": bool(it.get("thumb")),
+                "expired": bool(it.get("expired"))}
+
+    def file_item(self, fid):
+        for it in self.history:
+            if it.get("kind") == "file" and it.get("fid") == fid:
+                return it
+        return None
+
+    def files_total(self):
+        try:
+            return sum(os.path.getsize(os.path.join(FILES_DIR, f)) for f in os.listdir(FILES_DIR))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def safe_name(name):
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(name or ""))
+        name = re.sub(r"\.{2,}", ".", name).strip(" ._")   # 경로 흉내(.., /) 제거 — 저장은 어차피 난수 id로 하고 이름은 표시용
+        return (name or "file")[:100]
+
+    async def handle_http(self, ws, method, path, headers):
+        """POST /file?from=..&to=..&name=..&mime=.. (헤더 X-Key, X-Thumb-Length) / GET /file/<id> / GET /thumb/<id>"""
+        url = urllib.parse.urlsplit(path)
+        q = dict(urllib.parse.parse_qsl(url.query))
+        if headers.get("x-key") != FAMILY_KEY:   # 가족 암호 없는 요청은 전부 거부
+            await ws.http_reply("403 Forbidden", {"error": "auth"})
+            return
+        if method == "POST" and url.path == "/file":
+            await self.upload_file(ws, headers, q)
+            return
+        m = re.fullmatch(r"/(file|thumb)/([A-Za-z0-9_-]{8,40})", url.path)
+        if method == "GET" and m:
+            await self.download_file(ws, headers, m.group(1), m.group(2))
+            return
+        await ws.http_reply("404 Not Found", {"error": "not_found"})
+
+    async def upload_file(self, ws, headers, q):
+        sender = q.get("from", "")   # 한글 이름은 HTTP 헤더에 못 넣으므로 주소의 from= (URL 인코딩)
+        if sender not in MEMBERS:
+            await ws.http_reply("403 Forbidden", {"error": "unknown_member", "got": sender})
+            return
+        to = q.get("to", "all")
+        if to != "all":
+            to = [t for t in to.split(",") if t]
+        targets, mode = self.resolve_targets(sender, to)
+        if targets is None:
+            await ws.http_reply("400 Bad Request", {"error": "no_target"})
+            return
+        try:
+            total = int(headers.get("content-length", "0"))
+            thumb_len = int(headers.get("x-thumb-length", "0") or 0)
+        except ValueError:
+            await ws.http_reply("400 Bad Request", {"error": "length"})
+            return
+        size = total - thumb_len
+        if size <= 0 or thumb_len < 0 or thumb_len > THUMB_MAX_BYTES:
+            await ws.http_reply("400 Bad Request", {"error": "length"})
+            return
+        if size > MAX_FILE_BYTES:
+            await ws.http_reply("413 Payload Too Large", {"error": "too_large", "max": MAX_FILE_BYTES})
+            return
+        try:
+            free = shutil.disk_usage(FILES_DIR).free
+        except Exception:
+            free = None
+        if free is not None and free - total < DISK_RESERVE_BYTES:
+            await ws.http_reply("507 Insufficient Storage", {"error": "disk_full"})
+            return
+        self.enforce_quota(extra=total)
+        name = self.safe_name(q.get("name", "file"))
+        mime = re.sub(r"[^A-Za-z0-9/.+-]", "", q.get("mime", ""))[:60]
+        fid = secrets.token_urlsafe(12)
+        fp = os.path.join(FILES_DIR, fid)
+        tmp = fp + ".part"
+        try:
+            thumb = b""
+            while len(thumb) < thumb_len:
+                chunk = await asyncio.wait_for(ws.r.read(min(65536, thumb_len - len(thumb))), 60)
+                if not chunk:
+                    raise ConnectionError("끊김")
+                thumb += chunk
+            got = 0
+            with open(tmp, "wb") as f:
+                while got < size:
+                    chunk = await asyncio.wait_for(ws.r.read(min(262144, size - got)), 120)
+                    if not chunk:
+                        raise ConnectionError("끊김")
+                    f.write(chunk)
+                    got += len(chunk)
+            os.replace(tmp, fp)
+            if thumb:
+                with open(fp + ".thumb", "wb") as f:
+                    f.write(thumb)
+        except Exception as e:
+            log("첨부 업로드 실패: %s %s (%r)", sender, name, e)
+            for x in (tmp, fp, fp + ".thumb"):
+                try:
+                    os.remove(x)
+                except Exception:
+                    pass
+            try:
+                await ws.http_reply("400 Bad Request", {"error": "upload_failed"})
+            except Exception:
+                pass
+            return
+        mid = self.new_receipt(sender, "file", targets)
+        self.clip_seq += 1
+        item = {"kind": "file", "id": self.clip_seq, "mid": mid, "from": sender, "mode": mode, "to": targets, "ts": time.time(),
+                "fid": fid, "name": name, "size": size, "mime": mime, "thumb": bool(thumb), "status": self.receipts[mid]["status"]}
+        self.history.append(item)
+        del self.history[:-HISTORY_KEEP]
+        self.save_history()
+        log("첨부: %s -> %s: %s (%.1fMB%s)", sender, "전체" if mode == "all" else ",".join(targets), name, size / 1048576, ", 미리보기" if thumb else "")
+        for t in targets:
+            qd = self.queue.setdefault(t, [])
+            qd.append({"kind": "file", "id": item["id"], "ts": item["ts"], "mid": mid, "item": item})
+            del qd[:-MAX_QUEUE]
+            await self.flush_queue(t)
+        # 보낸 사람의 기기들(올린 기기 포함)에도 내 말풍선으로 — 올린 기기는 mid로 중복을 거름
+        await self.echo_others(sender, None, dict(self.file_msg(item), type="file_echo", id=item["id"]))
+        await self.push_receipt(mid)
+        await ws.http_reply("200 OK", dict(self.file_msg(item), ok=True, id=item["id"]))
+
+    async def download_file(self, ws, headers, kind, fid):
+        it = self.file_item(fid)
+        fp = os.path.join(FILES_DIR, fid) + ("" if kind == "file" else ".thumb")
+        if it is None or it.get("expired") or not os.path.isfile(fp):
+            await ws.http_reply("410 Gone" if it is not None else "404 Not Found", {"error": "expired" if it is not None else "not_found"})
+            return
+        size = os.path.getsize(fp)
+        start = 0
+        m = re.fullmatch(r"bytes=(\d+)-", headers.get("range", "") or "")
+        if m and int(m.group(1)) < size:
+            start = int(m.group(1))
+        if kind == "thumb":
+            ctype = "image/jpeg"
+            disp = ""
+        else:
+            ctype = it.get("mime") or "application/octet-stream"
+            disp = "Content-Disposition: attachment; filename*=UTF-8''%s\r\n" % urllib.parse.quote(it["name"])
+        status = "206 Partial Content" if start else "200 OK"
+        extra = disp + "Accept-Ranges: bytes\r\n" + ("Content-Range: bytes %d-%d/%d\r\n" % (start, size - 1, size) if start else "")
+        ws.w.write(("HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: private, max-age=86400\r\n"
+                    "Connection: close\r\n%s\r\n" % (status, ctype, size - start, extra)).encode())
+        try:
+            with open(fp, "rb") as f:
+                f.seek(start)
+                while True:
+                    chunk = f.read(262144)
+                    if not chunk:
+                        break
+                    ws.w.write(chunk)
+                    await ws.w.drain()
+        except Exception:
+            pass
+
+    def expire_item(self, it, why):
+        it["expired"] = True
+        for x in (os.path.join(FILES_DIR, it["fid"]), os.path.join(FILES_DIR, it["fid"]) + ".thumb"):
+            try:
+                os.remove(x)
+            except Exception:
+                pass
+        log("첨부 삭제(%s): %s %s", why, it["from"], it["name"])
+
+    def enforce_quota(self, extra=0):
+        """전체 보관량이 상한을 넘으면 오래된 첨부부터 삭제 (NAS 디스크가 차는 사고 방지)"""
+        total = self.files_total() + extra
+        if total <= FILES_TOTAL_BYTES:
+            return
+        for it in self.history:
+            if it.get("kind") == "file" and not it.get("expired"):
+                total -= it.get("size", 0)
+                self.expire_item(it, "용량 초과")
+                if total <= FILES_TOTAL_BYTES:
+                    break
+        self.save_history()
+
+    async def files_janitor(self):
+        """한 시간마다: 7일 지난 첨부 삭제, 기록에 없는 고아 파일 삭제, 용량 상한 확인"""
+        while True:
+            try:
+                cutoff = time.time() - FILE_KEEP_DAYS * 86400
+                gone = []
+                for it in self.history:
+                    if it.get("kind") == "file" and not it.get("expired") and it["ts"] < cutoff:
+                        self.expire_item(it, "7일 경과")
+                        gone.append(it["fid"])
+                known = {it["fid"] for it in self.history if it.get("kind") == "file"}
+                for f in os.listdir(FILES_DIR):
+                    base = f.split(".")[0]
+                    if base not in known and not f.endswith(".part"):
+                        try:
+                            os.remove(os.path.join(FILES_DIR, f))
+                        except Exception:
+                            pass
+                    elif f.endswith(".part") and time.time() - os.path.getmtime(os.path.join(FILES_DIR, f)) > 86400:
+                        try:
+                            os.remove(os.path.join(FILES_DIR, f))
+                        except Exception:
+                            pass
+                self.enforce_quota()
+                if gone:
+                    self.save_history()
+                    for w in self.all_ws():
+                        await w.send_json({"type": "file_expired", "fids": gone})
+            except Exception as e:
+                log("첨부 정리 오류: %r", e)
+            await asyncio.sleep(3600)
 
     # ---- 연결 처리 ----
 
@@ -894,11 +1148,14 @@ async def update_poller():
 async def main():
     if not FAMILY_KEY:
         raise SystemExit("FAMILY_KEY 환경 변수를 설정하세요.")
+    global HUB
     hub = Hub()
+    HUB = hub
     server = await asyncio.start_server(hub.handle, "0.0.0.0", PORT)
     log("우리집 무전기 서버 시작: 포트 %d, 가족 %s, 부모 %s", PORT, ", ".join(MEMBERS), ", ".join(sorted(PARENTS)))
     asyncio.create_task(hub.watchdog())
     asyncio.create_task(update_poller())
+    asyncio.create_task(hub.files_janitor())
     async with server:
         await server.serve_forever()
 

@@ -2548,11 +2548,11 @@ def _selftest_start(ctx):
     step("모두 방으로 복귀해도 맨 아래·글 보임", lambda: radio.select_room("all"), until=lambda: radio.current_room()[0] == "all" and chat_at_bottom())
 
     # 2-1. 내 다른 기기(폰)와 동기화: 폰에서 보낸 글이 PC에도 내 말풍선으로, 폰에서 읽으면 PC도 읽음 처리
-    my_phone = _Helper(cfg, cfg.name)
-    step("내 폰(가상) 접속", until=lambda: my_phone.connected)
-    step("내 폰에서 보낸 글 → PC에 내 말풍선", lambda: my_phone.send({"type": "text", "to": "엄마", "text": "폰에서 보냄"}),
+    my = {}   # 내 이름은 1단계(첫 실행 설정)에서 정해지므로 그때 가서 만듦
+    step("내 폰(가상) 접속", lambda: my.__setitem__("p", _Helper(cfg, cfg.name)), until=lambda: my.get("p") is not None and my["p"].connected)
+    step("내 폰에서 보낸 글 → PC에 내 말풍선", lambda: my["p"].send({"type": "text", "to": "엄마", "text": "폰에서 보냄"}),
          until=lambda: any(c.get("mine") and c.get("text") == "폰에서 보냄" for c in radio.clips) and labels_with("폰에서 보냄", ctx["msg_list"]))
-    step("PC에서 보낸 글 → 내 폰에도(text_echo)", lambda: radio.send_text("PC에서 보냄", to="엄마"), until=lambda: my_phone.find("text_echo", text="PC에서 보냄"))
+    step("PC에서 보낸 글 → 내 폰에도(text_echo)", lambda: radio.send_text("PC에서 보냄", to="엄마"), until=lambda: my["p"].find("text_echo", text="PC에서 보냄"))
     step("답장칸 열어 두고 본 창 클릭 → 닫힘", lambda: (helper.send({"type": "text", "to": "아빠", "text": "밥은?"}), None)[1],
          until=lambda: ctx["popup"]["win"] is not None and labels_with("밥은?", ctx["popup"]["win"]))
 

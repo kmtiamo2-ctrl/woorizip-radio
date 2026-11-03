@@ -1063,6 +1063,7 @@ def _http_get(url, accept, stream_to=None, auth=True):
     with resp:
         if stream_to is None:
             return resp.read()
+        expect = int(resp.headers.get("Content-Length") or 0)
         h, n = hashlib.sha256(), 0
         with open(stream_to, "wb") as f:
             while True:
@@ -1072,7 +1073,24 @@ def _http_get(url, accept, stream_to=None, auth=True):
                 f.write(chunk)
                 h.update(chunk)
                 n += len(chunk)
+        if expect and n != expect:
+            raise RuntimeError("받다가 끊김 (%d/%d)" % (n, expect))
         return n, h.hexdigest()
+
+
+def latest_tag_web():
+    """API를 쓰지 않고 github.com/.../releases/latest 의 이동 주소(…/tag/v66)로 최신 태그를 알아냄 (API의 시간당 60회 제한을 안 받음)"""
+    req = urllib.request.Request("https://github.com/%s/releases/latest" % GITHUB_REPO, method="HEAD",
+                                 headers={"User-Agent": "woorizip-radio"})
+    try:
+        urllib.request.build_opener(_NoRedirect).open(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location", "") if e.code in (301, 302, 303, 307, 308) else ""
+        m = re.search(r"/releases/tag/([^/?#]+)$", loc)
+        if m:
+            return urllib.parse.unquote(m.group(1))
+        raise
+    raise RuntimeError("최신 버전 주소를 알 수 없음")
 
 
 def read_latest_info():
@@ -1086,26 +1104,33 @@ def read_latest_info():
 def fetch_latest_release():
     """GitHub의 최신 릴리스를 확인해 새 버전이면 PC·폰 설치 파일을 받아 두고 latest.json을 씀. 새로 받았으면 태그 이름"""
     os.makedirs(UPDATE_DIR, exist_ok=True)
-    data = json.loads(_http_get("https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO, "application/vnd.github+json"))
-    tag = str(data.get("tag_name") or "")
+    data = None
+    if github_token():   # 토큰이 있으면 API (비공개 저장소용)
+        data = json.loads(_http_get("https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO, "application/vnd.github+json"))
+        tag = str(data.get("tag_name") or "")
+    else:                # 공개 저장소: 웹 주소로 (시간당 60회 API 제한 없음)
+        tag = latest_tag_web()
     num = int(re.sub(r"\D", "", tag) or 0)
     if num <= 0:
         return None
     cur = read_latest_info()
     if cur.get("number") == num and all(os.path.isfile(os.path.join(UPDATE_DIR, cur[k]["file"])) for k in ("pc", "phone") if k in cur):
         return None
-    info = {"version": tag, "number": num, "ts": int(time.time()), "notes": str(data.get("body") or "")[:2000]}
-    for key, suffix in (("pc", ".exe"), ("phone", ".apk")):
-        asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).endswith(suffix)), None)
-        if not asset:
-            continue
-        name = os.path.basename(asset["name"])
+    info = {"version": tag, "number": num, "ts": int(time.time()), "notes": str((data or {}).get("body") or "")[:2000]}
+    for key, suffix, fname in (("pc", ".exe", "WoorizipRadio-PC-%s.exe" % tag), ("phone", ".apk", "WoorizipRadio-Phone-%s.apk" % tag)):
+        if data is not None:
+            asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).endswith(suffix)), None)
+            if not asset:
+                continue
+            name, url, want = os.path.basename(asset["name"]), asset["url"], asset.get("size")
+        else:
+            name, url, want = fname, "https://github.com/%s/releases/download/%s/%s" % (GITHUB_REPO, urllib.parse.quote(tag), fname), None
         dest = os.path.join(UPDATE_DIR, name)
         tmp = dest + ".part"
-        size, sha = _http_get(asset["url"], "application/octet-stream", stream_to=tmp)
-        if asset.get("size") and size != asset["size"]:
+        size, sha = _http_get(url, "application/octet-stream", stream_to=tmp)
+        if want and size != want:
             os.remove(tmp)
-            raise RuntimeError("%s 크기 불일치 (%d != %d)" % (name, size, asset["size"]))
+            raise RuntimeError("%s 크기 불일치 (%d != %d)" % (name, size, want))
         os.replace(tmp, dest)
         info[key] = {"file": name, "size": size, "sha256": sha}
     if "pc" not in info and "phone" not in info:

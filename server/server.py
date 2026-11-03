@@ -388,6 +388,8 @@ class Hub:
             if not ws.closed:
                 await ws.send_json({"type": "talk_sent", "mid": mid, "to": targets, "mode": mode,
                                     "seconds": round(len(pcm) / 32000, 1), "ts": int(time.time())})
+            await self.echo_others(name, ws, {"type": "talk_echo", "mid": mid, "to": targets, "mode": mode,
+                                              "seconds": round(len(pcm) / 32000, 1), "ts": int(time.time())})
             await self.push_receipt(mid)
         await self.broadcast_presence()
 
@@ -440,8 +442,19 @@ class Hub:
             await self.flush_queue(t)
         if ws is not None and not ws.closed:
             await ws.send_json({"type": "text_sent", "id": item["id"], "mid": mid, "to": to, "text": text, "ts": int(item["ts"])})
+        # 같은 사람의 다른 기기(폰↔PC)에도 내 말풍선이 바로 뜨게
+        await self.echo_others(name, ws, {"type": "text_echo", "id": item["id"], "mid": mid, "to": to, "mode": mode, "text": text, "ts": int(item["ts"])})
         await self.push_receipt(mid)
         return mid
+
+    async def echo_others(self, name, ws, msg):
+        """내가 한 기기에서 보낸 것을 내 다른 기기들에도 알림 (보낸 기기 자신은 제외)"""
+        for w in list(self.conns.get(name, ())):
+            if w is not ws and not w.closed:
+                try:
+                    await w.send_json(msg)
+                except Exception:
+                    pass
 
     # ---- 읽음·들음 확인 ----
 
@@ -712,6 +725,7 @@ class Hub:
                     await self.ack_clip(name, int(msg.get("id", 0)))
                 elif t == "seen":
                     await self.mark(int(msg.get("mid", 0)), name, "seen")
+                    await self.echo_others(name, ws, {"type": "seen_sync", "mid": int(msg.get("mid", 0))})   # 폰에서 읽으면 PC의 '새 글'도 같이 사라지게
                 elif t == "schedule_add":
                     await self.schedule_add(name, ws, msg)
                 elif t == "schedule_list":

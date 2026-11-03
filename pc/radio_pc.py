@@ -257,7 +257,7 @@ class WSClient:
                     self.sock = s
                     self.where = where
                     self.send_json({"type": "hello", "name": cfg.name, "key": cfg.key,
-                                    "device": "pc-" + socket.gethostname(), "where": where})
+                                    "device": getattr(cfg, "device", None) or ("pc-" + socket.gethostname()), "where": where})
                     backoff = 2
                     err = self._read_loop(s, where)
                 except Exception:
@@ -726,12 +726,27 @@ class Radio:
                                 "mode": "all" if to == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
                                 "text": msg.get("text", ""), "mine": True})
                 self.notice = "보냈어요"
-            elif t == "talk_sent":
+            elif t in ("talk_sent", "talk_echo"):   # talk_echo: 내 다른 기기(폰)에서 보낸 음성
                 to = msg.get("to") or []
-                self._add_clip({"kind": "voice_sent", "id": int(msg.get("mid", 0)), "mid": int(msg.get("mid", 0)),
+                mid = int(msg.get("mid", 0))
+                if t == "talk_echo" and any(c.get("mid") == mid for c in self.clips):
+                    return
+                self._add_clip({"kind": "voice_sent", "id": mid, "mid": mid,
                                 "from": self.cfg.name if msg.get("mode") == "all" else ", ".join(to),
                                 "mode": "all" if msg.get("mode") == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
                                 "seconds": float(msg.get("seconds") or 0), "mine": True})
+            elif t == "text_echo":   # 내 다른 기기(폰)에서 보낸 글 → 여기에도 내 말풍선으로
+                to = msg.get("to")
+                if isinstance(to, list):
+                    to = ", ".join(to)
+                mid = int(msg.get("mid", 0))
+                if not any(c.get("mid") == mid for c in self.clips):
+                    self._add_clip({"kind": "text", "id": int(msg.get("id", 0)), "mid": mid,
+                                    "from": self.cfg.name if to == "all" else to,
+                                    "mode": "all" if to == "all" else "direct", "ts": int(msg.get("ts") or time.time()),
+                                    "text": msg.get("text", ""), "mine": True})
+            elif t == "seen_sync":   # 내 다른 기기에서 읽음 → 여기서도 '새 글'에서 빼고 다시 알리지 않음
+                self.seen_sent.add(int(msg.get("mid", 0)))
             elif t == "history":
                 self._merge_history(msg.get("items") or [])
             elif t == "receipt":
@@ -2398,6 +2413,7 @@ class _Helper:
             pass
         c = C()
         c.host, c.out_host, c.name, c.key, c.configured = cfg.host, "", name, cfg.key, True
+        c.device = "helper-" + name   # 같은 PC에서 돌아도 다른 기기로 보이게 (같은 기기 id면 서버가 예전 연결을 정리함)
         self.name, self.msgs, self.connected = name, [], False
         self.client = WSClient(c, self._on_text, lambda b: None, self._on_state)
         self.client.start()
@@ -2530,6 +2546,13 @@ def _selftest_start(ctx):
     step("대화가 맨 아래에 붙고 최신 글이 보임", until=chat_at_bottom)
     step("엄마 방으로 바꿔도 맨 아래·글 보임", lambda: radio.select_room("엄마"), until=lambda: radio.current_room()[0] == "엄마" and chat_at_bottom())
     step("모두 방으로 복귀해도 맨 아래·글 보임", lambda: radio.select_room("all"), until=lambda: radio.current_room()[0] == "all" and chat_at_bottom())
+
+    # 2-1. 내 다른 기기(폰)와 동기화: 폰에서 보낸 글이 PC에도 내 말풍선으로, 폰에서 읽으면 PC도 읽음 처리
+    my_phone = _Helper(cfg, cfg.name)
+    step("내 폰(가상) 접속", until=lambda: my_phone.connected)
+    step("내 폰에서 보낸 글 → PC에 내 말풍선", lambda: my_phone.send({"type": "text", "to": "엄마", "text": "폰에서 보냄"}),
+         until=lambda: any(c.get("mine") and c.get("text") == "폰에서 보냄" for c in radio.clips) and labels_with("폰에서 보냄", ctx["msg_list"]))
+    step("PC에서 보낸 글 → 내 폰에도(text_echo)", lambda: radio.send_text("PC에서 보냄", to="엄마"), until=lambda: my_phone.find("text_echo", text="PC에서 보냄"))
     step("답장칸 열어 두고 본 창 클릭 → 닫힘", lambda: (helper.send({"type": "text", "to": "아빠", "text": "밥은?"}), None)[1],
          until=lambda: ctx["popup"]["win"] is not None and labels_with("밥은?", ctx["popup"]["win"]))
 

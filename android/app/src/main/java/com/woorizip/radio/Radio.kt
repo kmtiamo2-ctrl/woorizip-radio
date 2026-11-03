@@ -303,13 +303,22 @@ object Radio : RadioClient.Listener {
                     mid = msg.optInt("mid")))
                 notice = "보냈어요"
             }
-            "talk_sent" -> {
+            "talk_sent", "talk_echo" -> {   // talk_echo: 내 다른 기기(PC)에서 보낸 음성 → 여기에도 내 말풍선으로
                 val toAll = msg.optString("mode") == "all"
                 val names = msg.optJSONArray("to")?.toList() ?: emptyList()
-                addClip(Clip(msg.optInt("mid"), if (toAll) me else names.joinToString(", "), if (toAll) "all" else "direct",
+                val mid = msg.optInt("mid")
+                if (mid == 0 || clips.none { it.mid == mid }) addClip(Clip(mid, if (toAll) me else names.joinToString(", "), if (toAll) "all" else "direct",
                     msg.optLong("ts", System.currentTimeMillis() / 1000), msg.optDouble("seconds", 0.0), null, null,
-                    mine = true, mid = msg.optInt("mid"), voiceSent = true))
+                    mine = true, mid = mid, voiceSent = true))
             }
+            "text_echo" -> {   // 내 다른 기기(PC)에서 보낸 글 → 여기에도 내 말풍선으로
+                val toAll = msg.opt("to") == "all"
+                val names = msg.optJSONArray("to")?.toList() ?: listOfNotNull(msg.optString("to").takeIf { it.isNotBlank() && it != "all" })
+                val mid = msg.optInt("mid")
+                if (clips.none { it.mid == mid && mid != 0 }) addClip(Clip(msg.optInt("id"), if (toAll) me else names.joinToString(", "), if (toAll) "all" else "direct",
+                    msg.optLong("ts", System.currentTimeMillis() / 1000), 0.0, null, msg.optString("text"), mine = true, mid = mid))
+            }
+            "seen_sync" -> seenSent.add(msg.optInt("mid"))   // 내 다른 기기에서 읽음 → 여기서도 '새 글'에서 빼고 다시 알리지 않음
             "history" -> mergeHistory(msg.optJSONArray("items"))
             "receipt" -> {
                 val st = msg.optJSONObject("status") ?: JSONObject()

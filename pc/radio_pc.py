@@ -1759,6 +1759,28 @@ def run_ui(start_minimized, selftest=False):
             radio.notice = "붙여넣기 실패: %s" % e
         return "break"
 
+    def sched_in_room(sc, room):
+        if room[2] is None:
+            return True
+        to = sc.get("to")
+        if to == "all" or not to:
+            return False
+        names = to if isinstance(to, list) else [t.strip() for t in str(to).split(",")]
+        return set(names) == set(room[2])
+
+    def sched_when(sc):
+        at = int(sc.get("at") or 0)
+        d, today = time.localtime(at), time.localtime()
+        tm = time.localtime(time.time() + 86400)
+        day = "오늘" if (d.tm_year, d.tm_yday) == (today.tm_year, today.tm_yday) else "내일" if (d.tm_year, d.tm_yday) == (tm.tm_year, tm.tm_yday) else "%d/%d" % (d.tm_mon, d.tm_mday)
+        rep = {"daily": " (매일)", "weekdays": " (평일)", "weekends": " (주말)"}.get(sc.get("repeat"), "")
+        return "%s %s%s" % (day, time.strftime("%H:%M", d), rep)
+
+    def sched_menu(event, sc):
+        m = tk.Menu(root, tearoff=0, bg=CARD2, fg=TXT, activebackground=OUTLINE, activeforeground=TXT, font=("Malgun Gothic", 11))
+        m.add_command(label="예약 취소", command=lambda: radio.schedule_delete(sc["sid"]))
+        m.tk_popup(event.x_root, event.y_root)
+
     def bubble_menu(event, c):
         m = tk.Menu(root, tearoff=0, bg=CARD2, fg=TXT, activebackground=OUTLINE, activeforeground=TXT, font=("Malgun Gothic", 11))
         if c.get("kind") == "text":
@@ -2443,7 +2465,7 @@ def run_ui(start_minimized, selftest=False):
 
             window_visible = root.state() in ("normal", "zoomed")   # 최대화된 창도 보이는 것
             shown = list(reversed(radio.room_clips(cur)[:40]))   # 오래된 것 → 최신 (최신이 아래)
-            csig = (cur[0], cache.get("thumb_gen", 0)) + tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
+            csig = (cur[0], cache.get("thumb_gen", 0), tuple((x.get("sid"), x.get("at")) for x in radio.schedules)) + tuple((c["id"], c["ts"], radio.playing is c, radio.receipt_text(c) if c.get("mine") else "",
                                       window_visible and c.get("kind") in ("text", "file") and not c.get("mine") and (c.get("mid") or 0) not in radio.seen_sent,
                                       round(c.get("dl") or 0, 2), c.get("expired", False))
                                      for c in shown)
@@ -2514,6 +2536,21 @@ def run_ui(start_minimized, selftest=False):
                     elif c.get("kind") in ("text", "file") and window_visible:
                         radio.mark_seen(c)
                     ctk.CTkLabel(col, text=meta, font=font(10), text_color=(AMBER if (mine and radio.receipt_text(c)) else SUB)).pack(anchor="e" if mine else "w", padx=6)
+                # 보낼 예정인 예약: 이 방 대화 맨 아래에 흐린 말풍선 (우클릭으로 취소). 나가면 진짜 내 말풍선으로 바뀜
+                for sc in sorted((x for x in radio.schedules if sched_in_room(x, cur)), key=lambda x: x.get("at", 0)):
+                    line = ctk.CTkFrame(msg_list, fg_color="transparent")
+                    line.pack(fill="x", pady=(8, 1))
+                    col = ctk.CTkFrame(line, fg_color="transparent")
+                    col.pack(side="right", padx=(60, 4))
+                    row = ctk.CTkFrame(col, fg_color=CARD, corner_radius=16, border_width=1, border_color=SUB)
+                    row.pack(anchor="e")
+                    to = sc.get("to")
+                    to_txt = "" if (cur[0] != "all" or to == "all") else " · %s에게" % (", ".join(to) if isinstance(to, list) else to)
+                    ctk.CTkLabel(row, text="⏰ %s 보낼 예정%s" % (sched_when(sc), to_txt), font=font(10), text_color=AMBER, anchor="w").pack(anchor="w", padx=12, pady=(6, 0))
+                    ctk.CTkLabel(row, text=sc.get("text", ""), font=font(16), text_color=SUB, anchor="w", wraplength=280, justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+                    for wdg in [row] + row.winfo_children():
+                        wdg.bind("<Button-3>", lambda e, sc=sc: sched_menu(e, sc))
+                    ctk.CTkLabel(col, text="우클릭하면 취소", font=font(10), text_color=SUB).pack(anchor="e", padx=6)
                 if was_bottom or not shown:
                     root.after(30, scroll_bottom)
                 elif newest_changed:

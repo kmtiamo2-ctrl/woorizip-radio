@@ -397,7 +397,7 @@ class MainActivity : AppCompatActivity() {
         quickRow = LinearLayout(this)
         scroll.addView(quickRow)
         bottom.addView(scroll)
-        inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        inputRow = LinearLayout(this).apply { gravity = Gravity.BOTTOM }   // 입력칸 테두리(아래쪽)에 + 와 보내기를 맞춤
         val (til, et) = inputField("메시지 입력")
         input = et; inputTil = til
         // [+] 사진·파일·카메라·예약 — 작은 정사각형, 입력칸 왼쪽 (입력칸이 남는 폭을 다 쓰게)
@@ -407,13 +407,14 @@ class MainActivity : AppCompatActivity() {
             insetTop = 0; insetBottom = 0; setPadding(0, 0, 0, 0)
             contentDescription = "사진·파일·예약 보내기"
             setOnClickListener { openAttachMenu() }
-        }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { marginEnd = dp(8); topMargin = dp(6) })
+        }, LinearLayout.LayoutParams(dp(52), dp(56)).apply { marginEnd = dp(8) })
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         input.setOnFocusChangeListener { _, has -> if (has) scrollRoot.postDelayed({ scrollRoot.fullScroll(View.FOCUS_DOWN) }, 300) }
         input.imeOptions = EditorInfo.IME_ACTION_SEND   // 키패드의 '완료' 대신 '전송' — 치고 바로 보내고, 키패드는 그대로 열려 있음
         input.setOnEditorActionListener { _, action, _ -> if (action == EditorInfo.IME_ACTION_SEND) { sendTyped(); true } else false }
         sendBtn = pill("보내기", true) { sendTyped() }.apply { minWidth = 0; minimumWidth = 0; setPadding(dp(14), 0, dp(14), 0) }   // 글자 폭만큼만
-        inputRow.addView(sendBtn, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
+        sendBtn.apply { insetTop = 0; insetBottom = 0; minHeight = 0; minimumHeight = 0 }
+        inputRow.addView(sendBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(56)).apply { marginStart = dp(8) })
         uploadText = label("", 12f, cAmber).apply { visibility = View.GONE; setPadding(dp(6), 0, 0, 0) }
         bottom.addView(uploadText, lp(top = 4))
         bottom.addView(inputRow, lp(top = 6))
@@ -946,7 +947,7 @@ class MainActivity : AppCompatActivity() {
     private fun renderMessages() {
         val room = Radio.currentRoom()
         val shown = Radio.roomClips(room).take(40).reversed()   // 오래된 것 → 최신 (최신이 아래)
-        val sig = room.key + "|" + shown.joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}:${it.expired}:${if (it.thumb) Radio.thumbFile(it).exists() else ""}:${Radio.downloading[it.fid ?: ""] ?: ""}" }
+        val sig = room.key + "|" + Radio.schedules.joinToString(",") { "${it.sid}:${it.at}" } + "|" + shown.joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}:${it.expired}:${if (it.thumb) Radio.thumbFile(it).exists() else ""}:${Radio.downloading[it.fid ?: ""] ?: ""}" }
         if (sig == msgSig) return
         val newestKey = shown.lastOrNull()?.let { "${it.id}:${it.ts}" }
         val newestChanged = newestKey != null && newestKey != lastNewestKey
@@ -1025,8 +1026,49 @@ class MainActivity : AppCompatActivity() {
             col.addView(label(meta, 10f, metaColor).apply { setPadding(dp(6), dp(1), dp(6), 0) }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = if (c.mine) Gravity.END else Gravity.START })
             holder.addView(col, colLp)
         }
+        // 보낼 예정인 예약: 이 방 대화 맨 아래에 흐린 말풍선 (길게 누르면 취소). 시간이 되어 나가면 진짜 말풍선으로 바뀜
+        val pending = Radio.schedules.filter { sc -> scheduleInRoom(sc, room) }.sortedBy { it.at }
+        if (pending.isNotEmpty() && shown.isEmpty()) msgList.removeAllViews()
+        pending.forEach { sc ->
+            val whenTxt = scheduleWhen(sc)
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; alpha = 0.6f }
+            col.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dpf(16); setColor(cCard2); setStroke(dp(1), cSub, dpf(6), dpf(4))
+                }
+                setPadding(dp(14), dp(9), dp(14), dp(9))
+                addView(label("⏰ $whenTxt 보낼 예정" + (if (room.key == "all" && sc.to != "all") " · ${sc.to}에게" else ""), 11f, cAmber))
+                addView(label(sc.text, 17f, cText))
+                setOnLongClickListener {
+                    MaterialAlertDialogBuilder(this@MainActivity).setTitle("예약 취소할까요?").setMessage("$whenTxt · ${sc.text}")
+                        .setPositiveButton("예약 취소") { _, _ -> Radio.scheduleDelete(sc.sid); toast("예약을 취소했어요") }
+                        .setNegativeButton("닫기", null).show()
+                    true
+                }
+            }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END })
+            col.addView(label("길게 누르면 취소", 10f, cSub).apply { setPadding(dp(6), dp(1), dp(6), 0) },
+                lp(w = ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END })
+            msgList.addView(col, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 10).apply { gravity = Gravity.END; marginStart = dp(48) })
+        }
         if (stickBottom || (newestChanged && nearBottom)) scrollRoot.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }
         stickBottom = false
+    }
+
+    private fun scheduleInRoom(sc: Schedule, room: Room): Boolean {
+        if (room.members == null) return true   // 모두 방: 내 예약 전부
+        if (sc.to == "all") return false
+        return sc.to.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet() == room.members.toSet()
+    }
+
+    private fun scheduleWhen(sc: Schedule): String {
+        val d = Calendar.getInstance().apply { timeInMillis = sc.at * 1000 }
+        val today = Calendar.getInstance()
+        val tomorrow = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, 1) }
+        fun same(a: Calendar, b: Calendar) = a.get(Calendar.YEAR) == b.get(Calendar.YEAR) && a.get(Calendar.DAY_OF_YEAR) == b.get(Calendar.DAY_OF_YEAR)
+        val day = when { same(d, today) -> "오늘"; same(d, tomorrow) -> "내일"; else -> "%d/%d".format(d.get(Calendar.MONTH) + 1, d.get(Calendar.DAY_OF_MONTH)) }
+        val rep = when (sc.repeat) { "daily" -> " (매일)"; "weekdays" -> " (평일)"; "weekends" -> " (주말)"; else -> "" }
+        return "$day ${fmtTime.format(Date(sc.at * 1000))}$rep"
     }
 
     // ---------- 볼륨 버튼 (앱이 보일 때) ----------

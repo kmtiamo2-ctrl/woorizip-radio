@@ -21,11 +21,17 @@ import java.util.concurrent.CopyOnWriteArraySet
 data class Clip(
     val id: Int, val from: String, val mode: String, val ts: Long, val seconds: Double,
     val file: File?, val text: String? = null, val mine: Boolean = false,
-    val mid: Int = 0, val voiceSent: Boolean = false
+    val mid: Int = 0, val voiceSent: Boolean = false,
+    // 첨부파일 (fid 가 있으면 첨부)
+    val fid: String? = null, val name: String? = null, val size: Long = 0, val mime: String? = null,
+    val thumb: Boolean = false, val expired: Boolean = false
 ) {
-    val isText get() = text != null
+    val isText get() = text != null && fid == null
+    val isFile get() = fid != null
+    val isImage get() = isFile && FileXfer.isImage(mime, name)
     val title get() = when {
         mine && voiceSent -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"} (음성 ${seconds.toInt().coerceAtLeast(1)}초)"
+        mine && isFile -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"} (📎 ${name})"
         mine -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"}"
         mode == "all" -> "${from}님 전체 방송"
         mode == "group" -> "${from}님이 몇 명에게"
@@ -295,6 +301,18 @@ object Radio : RadioClient.Listener {
             "incoming_end" -> endIncoming()
             "clip" -> pendingClips[msg.optInt("id")] = msg
             "text" -> onTextArrived(msg)
+            "file" -> onFileArrived(msg)
+            "file_echo" -> {   // 내가 (이 폰 또는 다른 기기에서) 보낸 첨부
+                val mid = msg.optInt("mid")
+                if (mid != 0 && clips.none { it.mid == mid }) addClip(fileClip(msg, true))
+            }
+            "file_expired" -> {
+                val gone = msg.optJSONArray("fids").toList().toSet()
+                if (clips.any { it.fid in gone }) {
+                    clips = clips.map { if (it.fid in gone) it.copy(expired = true) else it }
+                    saveTextIndex()
+                }
+            }
             "text_sent" -> {
                 val toAll = msg.opt("to") == "all"
                 val names = msg.optJSONArray("to")?.toList() ?: listOfNotNull(msg.optString("to").takeIf { it.isNotBlank() && it != "all" })
@@ -427,6 +445,125 @@ object Radio : RadioClient.Listener {
         return true
     }
 
+    // ---- 첨부파일 (사진·파일) ----
+
+    @Volatile var uploads: List<FileXfer.Upload> = emptyList(); private set
+    private val fetching = HashSet<String>()
+
+    private fun fileClip(m: JSONObject, mine: Boolean): Clip {
+        val toArr = m.optJSONArray("to")?.toList() ?: listOfNotNull(m.optString("to").takeIf { it.isNotBlank() && it != "all" })
+        val mode = m.optString("mode", "direct")
+        return Clip(m.optInt("id", m.optInt("mid")), if (mine) (if (mode == "all") me else toArr.joinToString(", ")) else m.optString("from"), mode,
+            m.optLong("ts", System.currentTimeMillis() / 1000), 0.0, null, null, mine = mine, mid = m.optInt("mid"),
+            fid = m.optString("fid"), name = m.optString("name").ifBlank { "file" }, size = m.optLong("size"), mime = m.optString("mime"),
+            thumb = m.optBoolean("thumb"), expired = m.optBoolean("expired"))
+    }
+
+    private fun onFileArrived(msg: JSONObject) {
+        client.sendJson(JSONObject().put("type", "clip_ack").put("id", msg.optInt("id")))
+        val mid = msg.optInt("mid")
+        if (mid != 0 && clips.any { it.mid == mid }) return
+        val clip = fileClip(msg, false)
+        addClip(clip)
+        if (Prefs(app).dnd) return
+        Feedback.vibrate(app, if (atHome || isParent) longArrayOf(0, 120) else longArrayOf(0, 250, 150, 250))
+        if (atHome || isParent) Feedback.incoming()
+        Notifs.showClip(app, clip, autoPlayed = false)
+    }
+
+    fun attachDir(): File = File(app.filesDir, "attach").apply { mkdirs() }
+    fun thumbFile(clip: Clip): File = File(File(app.cacheDir, "thumbs").apply { mkdirs() }, "${clip.fid}.jpg")
+    fun attachFile(clip: Clip): File {
+        val n = clip.name ?: "file"
+        val base = n.substringBeforeLast('.', n).take(60)
+        val ext = if (n.contains('.')) "." + n.substringAfterLast('.').take(10) else ""
+        return File(attachDir(), "${base}_${(clip.fid ?: "").take(8)}$ext")
+    }
+
+    /** 고른 파일들을 지금 고른 상대(또는 to)에게 올림 — 백그라운드, 진행 상황은 uploads 에 */
+    fun sendFiles(picked: List<FileXfer.Picked>, to: String? = null) {
+        if (picked.isEmpty()) return
+        if (!connected) { notice = "지금 연결이 없어서 보낼 수 없어요"; changed(); return }
+        val base = client.httpBase ?: return
+        val net = client.currentNetwork
+        val toQ = to ?: (if (target == "all") "all" else target)
+        val key = Prefs(app).key
+        val from = me
+        for (p in picked) {
+            val up = FileXfer.Upload(p.name, if (p.size > 0) p.size else 0)
+            uploads = uploads + up
+            Thread {
+                try {
+                    val res = FileXfer.upload(app, base, net, key, from, toQ, p, up)
+                    main.post {
+                        val mid = res.optInt("mid")
+                        if (mid == 0 || clips.none { it.mid == mid }) addClip(fileClip(res, true))
+                        notice = "보냈어요"
+                        changed()
+                    }
+                } catch (e: Exception) {
+                    up.error = e.message ?: "보내지 못했어요"
+                    main.post { notice = "📎 ${p.name}: ${up.error}"; changed() }
+                } finally {
+                    up.finished = true
+                    main.postDelayed({ uploads = uploads.filter { !it.finished }; changed() }, 1500)
+                }
+            }.start()
+        }
+        changed()
+    }
+
+    /** 미리보기가 아직 없으면 받아 옴 (끝나면 화면 갱신) */
+    fun ensureThumb(clip: Clip) {
+        val fid = clip.fid ?: return
+        val f = thumbFile(clip)
+        if (f.exists() || clip.expired || !clip.thumb) return
+        val k = "thumb:$fid"
+        if (!fetching.add(k)) return
+        val base = client.httpBase ?: run { fetching.remove(k); return }
+        val net = client.currentNetwork
+        val key = Prefs(app).key
+        Thread {
+            try { FileXfer.download(base, net, key, "thumb", fid, f) } catch (e: Exception) { if (e.message == "expired") markExpired(fid) }
+            main.post { fetching.remove(k); changed() }
+        }.start()
+    }
+
+    @Volatile var downloading: Map<String, Float> = emptyMap(); private set
+
+    /** 원본을 받아서(없으면) done(파일) 호출 — 열기/저장/공유에 공통 */
+    fun withFile(clip: Clip, done: (File) -> Unit) {
+        val fid = clip.fid ?: return
+        val f = attachFile(clip)
+        if (f.exists()) { done(f); return }
+        if (clip.expired) { notice = "기간이 지나 삭제된 첨부예요"; changed(); return }
+        val k = "file:$fid"
+        if (!fetching.add(k)) return
+        val base = client.httpBase ?: run { fetching.remove(k); notice = "지금 연결이 없어요"; changed(); return }
+        val net = client.currentNetwork
+        val key = Prefs(app).key
+        downloading = downloading + (fid to 0f); changed()
+        Thread {
+            var ok = false
+            try {
+                FileXfer.download(base, net, key, "file", fid, f) { p -> downloading = downloading + (fid to p); changed() }
+                ok = true
+            } catch (e: Exception) {
+                main.post { if (e.message == "expired") markExpired(fid) else notice = "📎 내려받기 실패: ${e.message}"; changed() }
+            }
+            main.post {
+                fetching.remove(k); downloading = downloading - fid; changed()
+                if (ok) done(f)
+            }
+        }.start()
+    }
+
+    private fun markExpired(fid: String) {
+        clips = clips.map { if (it.fid == fid) it.copy(expired = true) else it }
+        notice = "기간이 지나 삭제된 첨부예요"
+        saveTextIndex()
+    }
+
     // ---- 읽음·들음 확인 ----
 
     /** 받은 메시지를 봤다/들었다고 보낸 사람에게 알림 (한 번만) */
@@ -453,10 +590,11 @@ object Radio : RadioClient.Listener {
 
     private fun saveTextIndex() {
         val arr = JSONArray()
-        clips.filter { it.isText || it.voiceSent }.take(120).forEach {
+        clips.filter { it.isText || it.voiceSent || it.isFile }.take(120).forEach {
             arr.put(JSONObject().put("id", it.id).put("from", it.from).put("mode", it.mode)
                 .put("ts", it.ts).put("text", it.text).put("mine", it.mine).put("mid", it.mid)
-                .put("voice", it.voiceSent).put("seconds", it.seconds))
+                .put("voice", it.voiceSent).put("seconds", it.seconds)
+                .put("fid", it.fid).put("name", it.name).put("size", it.size).put("mime", it.mime).put("thumb", it.thumb).put("expired", it.expired))
         }
         try { File(app.filesDir, "texts.json").writeText(arr.toString()) } catch (_: Exception) {}
     }
@@ -464,7 +602,7 @@ object Radio : RadioClient.Listener {
     private fun addClip(clip: Clip) {
         clips = (listOf(clip) + clips).sortedByDescending { it.ts }.take(MAX_CLIPS)
         clipDir().listFiles()?.forEach { f -> if (clips.none { it.file == f }) f.delete() }
-        if (clip.isText || clip.voiceSent) saveTextIndex()
+        if (clip.isText || clip.voiceSent || clip.isFile) saveTextIndex()
     }
 
     /** 서버가 보관한 문자 기록을 합침 (이미 있는 것은 mid로 건너뜀) → 폰·PC 어디서나 같은 대화 */
@@ -479,7 +617,8 @@ object Radio : RadioClient.Listener {
             val mine = it.optString("from") == me
             val to = it.optJSONArray("to").toList()
             val mode = it.optString("mode", "direct")
-            added.add(Clip(mid, if (mine) (if (mode == "all") me else to.joinToString(", ")) else it.optString("from"), mode,
+            if (it.optString("kind") == "file") added.add(fileClip(it, mine))
+            else added.add(Clip(mid, if (mine) (if (mode == "all") me else to.joinToString(", ")) else it.optString("from"), mode,
                 it.optLong("ts"), 0.0, null, it.optString("text"), mine = mine, mid = mid))
             have.add(mid)
         }
@@ -558,7 +697,10 @@ object Radio : RadioClient.Listener {
             (0 until arr.length()).map { arr.getJSONObject(it) }.map {
                 Clip(it.optInt("id"), it.optString("from"), it.optString("mode"), it.optLong("ts"), it.optDouble("seconds", 0.0), null,
                     if (it.isNull("text")) null else it.optString("text"), it.optBoolean("mine"),
-                    mid = it.optInt("mid"), voiceSent = it.optBoolean("voice"))
+                    mid = it.optInt("mid"), voiceSent = it.optBoolean("voice"),
+                    fid = if (it.isNull("fid")) null else it.optString("fid"), name = if (it.isNull("name")) null else it.optString("name"),
+                    size = it.optLong("size"), mime = if (it.isNull("mime")) null else it.optString("mime"),
+                    thumb = it.optBoolean("thumb"), expired = it.optBoolean("expired"))
             }
         } catch (_: Exception) { emptyList() }
         val voices = clipDir().listFiles()?.mapNotNull { f ->

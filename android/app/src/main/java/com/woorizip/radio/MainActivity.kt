@@ -104,6 +104,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var inputTil: TextInputLayout
     private lateinit var sendBtn: MaterialButton
     private lateinit var inputRow: LinearLayout
+    private lateinit var uploadText: TextView
     private lateinit var msgCard: MaterialCardView
     private lateinit var msgHead: TextView
     private lateinit var msgList: LinearLayout
@@ -125,6 +126,66 @@ class MainActivity : AppCompatActivity() {
         render()
     }
 
+    // ---- 첨부: 사진·파일 고르기, 카메라, 공유 시트 ----
+    private val pickMedia = registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(20)) { uris -> sendUris(uris) }
+    private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> sendUris(uris) }
+    private var cameraUri: Uri? = null
+    private val takePhoto = registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        val u = cameraUri; cameraUri = null
+        if (ok && u != null) sendUris(listOf(u))
+    }
+
+    private fun sendUris(uris: List<Uri>, to: String? = null) {
+        if (uris.isEmpty()) return
+        Thread {
+            val picked = uris.mapNotNull { u -> try { FileXfer.describe(this, u) } catch (_: Exception) { null } }
+            runOnUiThread { Radio.sendFiles(picked, to); stickBottom = true; render() }
+        }.start()
+    }
+
+    private fun openAttachMenu() {
+        val items = arrayOf("📷 사진·동영상 고르기", "📁 파일 고르기", "📸 카메라로 찍기")
+        MaterialAlertDialogBuilder(this).setTitle("${Radio.currentRoom().label}에게 보내기").setItems(items) { _, i ->
+            when (i) {
+                0 -> pickMedia.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                1 -> pickFiles.launch(arrayOf("*/*"))
+                2 -> {
+                    val dir = java.io.File(cacheDir, "camera").apply { mkdirs() }
+                    val f = java.io.File(dir, "IMG_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.KOREA).format(Date()) + ".jpg")
+                    cameraUri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.files", f)
+                    try { takePhoto.launch(cameraUri!!) } catch (_: Exception) { toast("카메라를 열 수 없어요") }
+                }
+            }
+        }.show()
+    }
+
+    /** 갤러리·파일 앱에서 "공유 → 우리집"으로 들어온 것: 누구에게 보낼지 고르고 올림 */
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent == null || (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE)) return
+        val uris = ArrayList<Uri>()
+        if (intent.action == Intent.ACTION_SEND) {
+            (if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java) else @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_STREAM))?.let { uris.add(it) }
+        } else {
+            (if (Build.VERSION.SDK_INT >= 33) intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java) else @Suppress("DEPRECATION") intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM))?.let { uris.addAll(it) }
+        }
+        intent.action = null   // 화면이 다시 만들어져도 두 번 묻지 않게
+        if (uris.isEmpty()) return
+        if (!prefs.isConfigured) { toast("먼저 설정에서 이 폰이 누구 것인지 골라 주세요"); return }
+        val rooms = Radio.rooms()
+        MaterialAlertDialogBuilder(this).setTitle("${uris.size}개를 누구에게 보낼까요?")
+            .setItems(rooms.map { "${it.icon} ${it.label}" }.toTypedArray()) { _, i ->
+                val r = rooms[i]
+                Radio.selectRoom(r.key)
+                sendUris(uris, if (r.members == null) "all" else r.members.joinToString(","))
+            }.setNegativeButton("취소", null).show()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
@@ -135,6 +196,7 @@ class MainActivity : AppCompatActivity() {
         if (!prefs.isConfigured) openSettingsSheet()
         else if (prefs.standby && !RadioService.running) ensurePermissionsThenStart()
         showCrashReportIfAny()
+        handleShareIntent(intent)
     }
 
     /** 지난번에 앱이 멈췄으면 원인을 보여 줌 (스크린샷으로 보내 주면 고칠 수 있음) */
@@ -343,7 +405,10 @@ class MainActivity : AppCompatActivity() {
         input.setOnEditorActionListener { _, action, _ -> if (action == EditorInfo.IME_ACTION_SEND) { sendTyped(); true } else false }
         sendBtn = pill("보내기", true) { sendTyped() }
         inputRow.addView(sendBtn, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
+        inputRow.addView(pill("📎", false) { openAttachMenu() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
         inputRow.addView(pill("⏰", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
+        uploadText = label("", 12f, cAmber).apply { visibility = View.GONE; setPadding(dp(6), 0, 0, 0) }
+        bottom.addView(uploadText, lp(top = 4))
         bottom.addView(inputRow, lp(top = 6))
         outer.addView(bottom)
 
@@ -712,6 +777,15 @@ class MainActivity : AppCompatActivity() {
         renderQuick()
         renderMessages()
 
+        val ups = Radio.uploads.filter { !it.finished }
+        if (ups.isNotEmpty()) {
+            val u = ups[0]
+            val pct = if (u.total > 0) (u.done * 100 / u.total).toInt() else 0
+            uploadText.text = "📎 ${u.name} 보내는 중 $pct%" + (if (ups.size > 1) " (+${ups.size - 1}개)" else "")
+            uploadText.visibility = View.VISIBLE
+            h.removeCallbacks(uploadTick); h.postDelayed(uploadTick, 400)
+        } else uploadText.visibility = View.GONE
+
         val me = prefs.name
         if (Radio.connected) {
             statusText.text = "$me · 연결됨 · 가족 ${Radio.online.size}명"   // 집/밖 구분은 동작(밖의 아이는 진동)에만 쓰고 글자로는 안 보여줌
@@ -752,6 +826,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var inputRoomKey: String? = null
+    private val uploadTick = Runnable { render() }   // 보내는 중 진행률 갱신
     private var chatNearBottom = true   // 대화 칸을 바닥 근처에서 보고 있는지 (크기가 바뀔 때 바닥으로 다시 붙일지 판단)
     private var insetPad = intArrayOf(0, 0, 0, 0)
     private var keyboardOverlap = 0   // 창이 안 줄어드는 기기에서 키패드가 가린 높이 (아래 여백으로 보정)
@@ -783,15 +858,64 @@ class MainActivity : AppCompatActivity() {
     private fun bubbleMenu(c: Clip) {
         val items = ArrayList<String>()
         if (c.isText) items.add("복사")
+        if (c.isFile && !c.expired) { items.add("열기"); if (c.isImage || (c.mime ?: "").startsWith("video/")) items.add("갤러리에 저장"); items.add("공유") }
         if (!c.mine) items.add("${c.from} 방으로")
         items.add("삭제")
         MaterialAlertDialogBuilder(this).setItems(items.toTypedArray()) { _, i ->
             when (items[i]) {
                 "복사" -> { (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("우리집", c.text ?: "")); toast("복사했어요") }
+                "열기" -> openAttachment(c)
+                "갤러리에 저장" -> Radio.withFile(c) { f ->
+                    if (FileXfer.saveToGallery(this, f, c.name ?: f.name, c.mime)) toast("갤러리(우리집 앨범)에 저장했어요")
+                    else try { startActivity(Intent.createChooser(FileXfer.shareIntent(this, f, c.mime), "저장할 앱 고르기")) } catch (_: Exception) { toast("저장할 수 없어요") }
+                }
+                "공유" -> Radio.withFile(c) { f -> try { startActivity(Intent.createChooser(FileXfer.shareIntent(this, f, c.mime), "공유")) } catch (_: Exception) { toast("공유할 수 없어요") } }
                 "삭제" -> Radio.deleteClip(c)
                 else -> { Radio.selectRoom(c.from); render() }
             }
         }.show()
+    }
+
+    private fun openAttachment(c: Clip) {
+        Radio.withFile(c) { f ->
+            try { startActivity(FileXfer.openIntent(this, f, c.mime)) } catch (_: Exception) {
+                try { startActivity(Intent.createChooser(FileXfer.shareIntent(this, f, c.mime), "열 앱 고르기")) } catch (_: Exception) { toast("열 수 있는 앱이 없어요") }
+            }
+        }
+    }
+
+    /** 첨부 말풍선: 사진은 미리보기(누르면 원본 열기), 파일은 📎 이름·크기 */
+    private fun fileBubble(bubble: LinearLayout, c: Clip) {
+        val name = c.name ?: "file"
+        if (c.expired) {
+            bubble.addView(label("📎 $name\n기간이 지나 삭제됐어요 (7일 보관)", 13f, cSub))
+            return
+        }
+        val dl = Radio.downloading[c.fid ?: ""]
+        val caption = if (dl != null) "내려받는 중 ${(dl * 100).toInt()}%" else "$name · ${Notifs.humanSize(c.size)}"
+        if (c.thumb) {
+            val tf = Radio.thumbFile(c)
+            if (tf.exists()) {
+                val bmp = try { android.graphics.BitmapFactory.decodeFile(tf.path) } catch (_: Throwable) { null }
+                if (bmp != null) {
+                    val maxW = dp(240)
+                    val scale = minOf(1f, maxW.toFloat() / bmp.width, dp(260).toFloat() / bmp.height)
+                    bubble.addView(ImageView(this).apply {
+                        setImageBitmap(bmp); adjustViewBounds = true; scaleType = ImageView.ScaleType.FIT_CENTER
+                        background = roundRect(cBg, 12); clipToOutline = true
+                        setOnClickListener { openAttachment(c) }
+                        setOnLongClickListener { bubbleMenu(c); true }
+                    }, LinearLayout.LayoutParams((bmp.width * scale).toInt(), (bmp.height * scale).toInt()))
+                    bubble.addView(label(caption, 11f, cSub).apply { setPadding(dp(2), dp(4), 0, 0) })
+                    return
+                }
+            } else Radio.ensureThumb(c)   // 받아 오면 changed()로 다시 그림
+        }
+        bubble.addView(TextView(this).apply {
+            text = "📎 $name\n$caption"; textSize = 15f; setTextColor(cText)
+            setOnClickListener { openAttachment(c) }
+            setOnLongClickListener { bubbleMenu(c); true }
+        })
     }
 
     private class Conv(val key: String, val label: String, val color: Int)
@@ -815,7 +939,7 @@ class MainActivity : AppCompatActivity() {
     private fun renderMessages() {
         val room = Radio.currentRoom()
         val shown = Radio.roomClips(room).take(40).reversed()   // 오래된 것 → 최신 (최신이 아래)
-        val sig = room.key + "|" + shown.joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}" }
+        val sig = room.key + "|" + shown.joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}:${it.expired}:${if (it.thumb) Radio.thumbFile(it).exists() else ""}:${Radio.downloading[it.fid ?: ""] ?: ""}" }
         if (sig == msgSig) return
         val newestKey = shown.lastOrNull()?.let { "${it.id}:${it.ts}" }
         val newestChanged = newestKey != null && newestKey != lastNewestKey
@@ -871,6 +995,7 @@ class MainActivity : AppCompatActivity() {
             }
             val playing = Radio.playingClip === c
             when {
+                c.isFile -> fileBubble(bubble, c)
                 c.isText -> bubble.addView(label(c.text ?: "", 19f, onDark).apply { setTextIsSelectable(false) })
                 c.voiceSent -> bubble.addView(label("🎙  음성 ${c.seconds.toInt().coerceAtLeast(1)}초 보냄", 15f, onDark))
                 else -> bubble.addView(MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
@@ -887,7 +1012,7 @@ class MainActivity : AppCompatActivity() {
             if (c.mine) {
                 val rt = Radio.receiptText(c)
                 if (rt.isNotBlank()) { meta = "$rt  ·  $meta"; metaColor = cAmber }
-            } else if (c.isText) {
+            } else if (c.isText || c.isFile) {
                 Radio.markSeen(c)   // 화면에 표시됨 = 봤음
             }
             col.addView(label(meta, 10f, metaColor).apply { setPadding(dp(6), dp(1), dp(6), 0) }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = if (c.mine) Gravity.END else Gravity.START })

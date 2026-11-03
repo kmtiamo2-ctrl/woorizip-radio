@@ -138,6 +138,7 @@ object Notifs {
             .build()
         val secs = clip.seconds.toInt().coerceAtLeast(1)
         val body = when {
+            clip.isFile -> "📎 ${clip.name} (${humanSize(clip.size)}) · 눌러서 보기"
             clip.isText -> clip.text ?: ""
             autoPlayed -> "${secs}초 · 방금 재생했어요"
             else -> "${secs}초 · 눌러서 들어 보세요"
@@ -150,8 +151,8 @@ object Notifs {
             .setAutoCancel(true)
             .setVibrate(longArrayOf(0, 250, 150, 250))
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            .setContentIntent(if (clip.isText) openApp(ctx) else play)
-        if (!clip.isText) b.addAction(0, if (autoPlayed) "다시 듣기" else "듣기", play)
+            .setContentIntent(if (clip.isText || clip.isFile) openApp(ctx) else play)
+        if (!clip.isText && !clip.isFile) b.addAction(0, if (autoPlayed) "다시 듣기" else "듣기", play)
         b.addAction(reply)
         b.addAction(0, "열기", openApp(ctx))
         ctx.getSystemService(NotificationManager::class.java).notify(ID_CLIP, b.build())
@@ -191,6 +192,11 @@ object Notifs {
                     .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             } catch (_: Exception) {}
         }
+    }
+
+    fun humanSize(n: Long): String = when {
+        n < 1024 -> "$n B"; n < 1024 * 1024 -> "%.1f KB".format(n / 1024.0)
+        n < 1024L * 1024 * 1024 -> "%.1f MB".format(n / 1048576.0); else -> "%.2f GB".format(n / 1073741824.0)
     }
 
     private fun canNotify(ctx: Context): Boolean =

@@ -144,7 +144,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openAttachMenu() {
-        val items = arrayOf("📷 사진·동영상 고르기", "📁 파일 고르기", "📸 카메라로 찍기")
+        val items = arrayOf("📷 사진·동영상 고르기", "📁 파일 고르기", "📸 카메라로 찍기", "⏰ 예약 보내기")
         MaterialAlertDialogBuilder(this).setTitle("${Radio.currentRoom().label}에게 보내기").setItems(items) { _, i ->
             when (i) {
                 0 -> pickMedia.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
@@ -155,6 +155,7 @@ class MainActivity : AppCompatActivity() {
                     cameraUri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.files", f)
                     try { takePhoto.launch(cameraUri!!) } catch (_: Exception) { toast("카메라를 열 수 없어요") }
                 }
+                3 -> openScheduleDialog()
             }
         }.show()
     }
@@ -399,14 +400,20 @@ class MainActivity : AppCompatActivity() {
         inputRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val (til, et) = inputField("메시지 입력")
         input = et; inputTil = til
+        // [+] 사진·파일·카메라·예약 — 작은 정사각형, 입력칸 왼쪽 (입력칸이 남는 폭을 다 쓰게)
+        inputRow.addView(MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+            text = "+"; textSize = 24f; isAllCaps = false; setTextColor(cText); cornerRadius = dp(14)
+            strokeColor = ColorStateList.valueOf(cOutline); minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
+            insetTop = 0; insetBottom = 0; setPadding(0, 0, 0, 0)
+            contentDescription = "사진·파일·예약 보내기"
+            setOnClickListener { openAttachMenu() }
+        }, LinearLayout.LayoutParams(dp(48), dp(48)).apply { marginEnd = dp(8); topMargin = dp(6) })
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         input.setOnFocusChangeListener { _, has -> if (has) scrollRoot.postDelayed({ scrollRoot.fullScroll(View.FOCUS_DOWN) }, 300) }
         input.imeOptions = EditorInfo.IME_ACTION_SEND   // 키패드의 '완료' 대신 '전송' — 치고 바로 보내고, 키패드는 그대로 열려 있음
         input.setOnEditorActionListener { _, action, _ -> if (action == EditorInfo.IME_ACTION_SEND) { sendTyped(); true } else false }
-        sendBtn = pill("보내기", true) { sendTyped() }
+        sendBtn = pill("보내기", true) { sendTyped() }.apply { minWidth = 0; minimumWidth = 0; setPadding(dp(14), 0, dp(14), 0) }   // 글자 폭만큼만
         inputRow.addView(sendBtn, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 8))
-        inputRow.addView(pill("📎", false) { openAttachMenu() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
-        inputRow.addView(pill("⏰", false) { openScheduleDialog() }, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, start = 6))
         uploadText = label("", 12f, cAmber).apply { visibility = View.GONE; setPadding(dp(6), 0, 0, 0) }
         bottom.addView(uploadText, lp(top = 4))
         bottom.addView(inputRow, lp(top = 6))

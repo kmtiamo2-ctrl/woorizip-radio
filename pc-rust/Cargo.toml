@@ -15,14 +15,19 @@ serde_json = "1"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hostname = "0.4"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+open = "5"
 eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.16"
+rfd = { version = "0.15", default-features = false }
+arboard = { version = "3", default-features = false }
 tray-icon = "0.21"
 rdev = "0.5"
 winreg = "0.55"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security_Cryptography", "Win32_System_Memory"] }
 
 [profile.release]
 opt-level = "s"

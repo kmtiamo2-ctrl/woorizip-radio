@@ -154,3 +154,141 @@ mod tests {
         assert!(c.starts_with('"'));
     }
 }
+
+// ---- 가족 암호 잠그기 (Windows DPAPI: 같은 Windows 계정에서만 풀림) ----
+
+#[cfg(windows)]
+pub fn protect(plain: &str) -> Option<String> {
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::System::Memory::LocalFree;
+    if plain.is_empty() {
+        return None;
+    }
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: plain.len() as u32,
+        pbData: plain.as_ptr() as *mut u8,
+    };
+    let mut out = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    // 안전: Windows API 에 올바른 구조체·포인터를 넘기고, 결과 메모리는 복사 후 LocalFree 로 돌려줌
+    let ok = unsafe {
+        CryptProtectData(
+            &mut input,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut out,
+        )
+    };
+    if ok == 0 || out.pbData.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec() };
+    unsafe { LocalFree(out.pbData as _) };
+    Some(b64_encode(&bytes))
+}
+
+#[cfg(windows)]
+pub fn unprotect(enc: &str) -> Option<String> {
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::System::Memory::LocalFree;
+    let bytes = b64_decode(enc)?;
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let mut out = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptUnprotectData(
+            &mut input,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            &mut out,
+        )
+    };
+    if ok == 0 || out.pbData.is_null() {
+        return None;
+    }
+    let plain = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec() };
+    unsafe { LocalFree(out.pbData as _) };
+    String::from_utf8(plain).ok()
+}
+
+#[cfg(not(windows))]
+pub fn protect(_plain: &str) -> Option<String> {
+    None
+}
+#[cfg(not(windows))]
+pub fn unprotect(_enc: &str) -> Option<String> {
+    None
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for ch in data.chunks(3) {
+        let b = [ch[0], *ch.get(1).unwrap_or(&0), *ch.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if ch.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if ch.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| B64.iter().position(|x| *x == c).map(|p| p as u32);
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for ch in bytes.chunks(4) {
+        let pad = ch.iter().filter(|c| **c == b'=').count();
+        let mut n = 0u32;
+        for c in ch {
+            n = (n << 6) | if *c == b'=' { 0 } else { val(*c)? };
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod b64_tests {
+    use super::*;
+    #[test]
+    fn roundtrip() {
+        for s in ["", "a", "ab", "abc", "가족 암호 105403"] {
+            assert_eq!(b64_decode(&b64_encode(s.as_bytes())).unwrap(), s.as_bytes());
+        }
+        assert_eq!(b64_encode(b"Man"), "TWFu");
+        assert!(b64_decode("abc").is_none());
+    }
+}

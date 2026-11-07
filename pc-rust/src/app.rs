@@ -8,6 +8,9 @@ use eframe::egui::{
     Vec2,
 };
 use std::sync::mpsc;
+
+mod extra;
+use extra::Extra;
 use std::sync::{Arc, Mutex};
 
 // 색 (Python판과 같음)
@@ -56,10 +59,15 @@ pub struct Inputs {
     pub start_minimized: bool,
 }
 
+/// 설정이 바뀌었을 때 통신 쪽에 새 설정을 넘기는 함수
+pub type Reconfigure = Box<dyn Fn(crate::config::Config) + Send>;
+
 pub struct App {
     pub state: Shared,
     pub pump: Box<dyn Fn(&mut State) + Send>, // state.outgoing → 서버
     inputs: Inputs,
+    reconfigure: Reconfigure,
+    extra: Extra,
     tray: Tray,
     visible: bool,
     allow_close: bool,
@@ -84,8 +92,10 @@ impl App {
         state: Shared,
         pump: Box<dyn Fn(&mut State) + Send>,
         inputs: Inputs,
+        reconfigure: Reconfigure,
     ) -> App {
         install_fonts(&cc.egui_ctx);
+        let configured = state.lock().unwrap().cfg.configured();
         let tray = Tray::new();
         let start_min = inputs.start_minimized;
         if start_min {
@@ -115,6 +125,8 @@ impl App {
             state,
             pump,
             inputs,
+            reconfigure,
+            extra: Extra::new(configured),
             tray,
             visible: !start_min,
             allow_close: false,
@@ -332,6 +344,11 @@ impl eframe::App for App {
         }
         self.draw_popup(ctx, now);
         self.draw_quit_dialog(ctx);
+        self.draw_setup(ctx);
+        self.draw_settings(ctx);
+        self.draw_schedule_dialog(ctx);
+        self.draw_viewer(ctx);
+        self.handle_drop_and_paste(ctx);
 
         let (room, connected, status, me, online_n, where_, notice, talking, requesting, incoming) =
             self.with_state(|s| {
@@ -395,8 +412,12 @@ impl eframe::App for App {
                                 self.search.clear();
                             }
                         }
-                        if ui.add(small_btn("⚙ 설정", false)).clicked() { /* 5일차 */ }
-                        if ui.add(small_btn("⏰ 예약", false)).clicked() { /* 5일차 */ }
+                        if ui.add(small_btn("⚙ 설정", false)).clicked() {
+                            self.open_settings();
+                        }
+                        if ui.add(small_btn("⏰ 예약", false)).clicked() {
+                            self.open_schedule();
+                        }
                     });
                 });
                 ui.add_space(6.0);
@@ -656,6 +677,40 @@ impl eframe::App for App {
                         }
                     }
                 });
+                // 보내는 중인 첨부 진행률
+                let ups: Vec<(String, u64, u64, bool, Option<String>)> = self.with_state(|s| {
+                    s.uploads.retain(|_, u| !(u.finished && u.error.is_none()));
+                    s.uploads
+                        .values()
+                        .map(|u| (u.name.clone(), u.done, u.total, u.finished, u.error.clone()))
+                        .collect()
+                });
+                for (name, done, total, finished, err) in ups {
+                    if let Some(e) = err {
+                        ui.label(
+                            RichText::new(format!("📎 {name}: {e}"))
+                                .color(RED)
+                                .size(11.5),
+                        );
+                    } else if !finished {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("📎 {name} 보내는 중"))
+                                    .color(SUB)
+                                    .size(11.5),
+                            );
+                            ui.add(
+                                egui::ProgressBar::new(if total > 0 {
+                                    done as f32 / total as f32
+                                } else {
+                                    0.0
+                                })
+                                .desired_width(140.0)
+                                .desired_height(6.0),
+                            );
+                        });
+                    }
+                }
                 let room_col = if room.key == "all" {
                     AMBER
                 } else {
@@ -667,7 +722,10 @@ impl eframe::App for App {
                         .stroke(Stroke::new(1.0_f32, OUTLINE))
                         .corner_radius(CornerRadius::same(10))
                         .min_size(Vec2::new(34.0, 34.0));
-                    let _ = ui.add(plus).on_hover_text("사진·파일·예약 (5일차)");
+                    let plus_resp = ui
+                        .add(plus)
+                        .on_hover_text("사진·파일 보내기 · 예약 (파일을 창에 끌어다 놓아도 돼요)");
+                    self.draw_plus_menu(ui, &plus_resp);
                     let send_w = 72.0;
                     let edit_w = ui.available_width() - send_w - 8.0;
                     let hint = if me_room {
@@ -933,6 +991,7 @@ impl App {
             ui.add_space(4.0);
             i = j;
         }
+        self.draw_pending_schedules(ui, room);
     }
 }
 
@@ -998,19 +1057,7 @@ fn draw_bubble(
                                     .size(13.0),
                                 );
                             } else {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "📎 {}  ({})",
-                                        c.name,
-                                        human_size(c.size)
-                                    ))
-                                    .size(13.5),
-                                );
-                                ui.label(
-                                    RichText::new("첨부 열기·미리보기는 5일차")
-                                        .color(SUB)
-                                        .size(10.5),
-                                );
+                                _app.draw_file_body(ui, c);
                             }
                         }
                         Kind::Clip => {
@@ -1045,6 +1092,9 @@ fn draw_bubble(
                 })
                 .response;
             resp.context_menu(|ui| {
+                if c.kind == Kind::File {
+                    _app.file_menu(ui, c);
+                }
                 if ui.button("복사").clicked() {
                     ui.ctx().copy_text(c.text.clone());
                     ui.close();

@@ -18,6 +18,9 @@ pub struct Config {
     pub autostart: bool,
     pub groups: String,
     pub device: Option<String>,
+    /// 가족 암호를 Windows 계정 열쇠(DPAPI)로 잠가 둔 것. 이게 있으면 `key` 는 비워 둠 (다른 계정·다른 PC에서는 못 풂)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_enc: Option<String>,
 }
 
 impl Default for Config {
@@ -33,6 +36,7 @@ impl Default for Config {
             autostart: true,
             groups: DEFAULT_GROUPS.into(),
             device: None,
+            key_enc: None,
         }
     }
 }
@@ -61,6 +65,14 @@ impl Config {
     pub fn parse(text: &str) -> Config {
         let d = Config::default();
         let mut c: Config = serde_json::from_str(text).unwrap_or_else(|_| d.clone());
+        // 잠가 둔 암호가 있으면 풀어서 씀 (못 풀면 기본값으로 — 설정 창에서 다시 입력)
+        if c.key.is_empty() {
+            if let Some(enc) = &c.key_enc {
+                if let Some(k) = crate::platform::unprotect(enc) {
+                    c.key = k;
+                }
+            }
+        }
         if c.host.is_empty() {
             c.host = d.host.clone();
         }
@@ -86,7 +98,13 @@ impl Config {
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         let tmp = dir.join("config.json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        // 저장할 때는 암호를 DPAPI 로 잠가 두고 평문은 비움 (잠글 수 없는 환경이면 그대로)
+        let mut on_disk = self.clone();
+        if let Some(enc) = crate::platform::protect(&self.key) {
+            on_disk.key_enc = Some(enc);
+            on_disk.key = String::new();
+        }
+        std::fs::write(&tmp, serde_json::to_string_pretty(&on_disk)?)?;
         std::fs::rename(tmp, Self::path())?; // 쓰다 꺼져도 설정 파일이 깨지지 않게 통째로 바꿔 끼움
         Ok(())
     }

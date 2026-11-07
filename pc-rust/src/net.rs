@@ -23,6 +23,8 @@ pub enum Event {
 
 pub struct Connection {
     stop: tokio::sync::watch::Sender<bool>,
+    /// 설정이 바뀌면 새 설정을 보냄 → 바로 끊고 새 주소·이름으로 다시 붙음
+    pub cfg_tx: tokio::sync::watch::Sender<Arc<Config>>,
     pub outgoing: mpsc::Sender<serde_json::Value>,
     pub outgoing_bin: mpsc::Sender<Vec<u8>>,
 }
@@ -30,11 +32,13 @@ pub struct Connection {
 impl Connection {
     pub fn spawn(cfg: Arc<Config>, events: mpsc::Sender<Event>) -> Connection {
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(cfg);
         let (out_tx, out_rx) = mpsc::channel::<serde_json::Value>(64);
         let (bin_tx, bin_rx) = mpsc::channel::<Vec<u8>>(64);
-        tokio::spawn(run(cfg, events, out_rx, bin_rx, stop_rx));
+        tokio::spawn(run(cfg_rx, events, out_rx, bin_rx, stop_rx));
         Connection {
             stop,
+            cfg_tx,
             outgoing: out_tx,
             outgoing_bin: bin_tx,
         }
@@ -46,7 +50,7 @@ impl Connection {
 }
 
 async fn run(
-    cfg: Arc<Config>,
+    mut cfg_rx: tokio::sync::watch::Receiver<Arc<Config>>,
     events: mpsc::Sender<Event>,
     mut out_rx: mpsc::Receiver<serde_json::Value>,
     mut bin_rx: mpsc::Receiver<Vec<u8>>,
@@ -57,6 +61,7 @@ async fn run(
         if *stop.borrow() {
             return;
         }
+        let cfg = cfg_rx.borrow_and_update().clone();
         if !cfg.configured() {
             let _ = events
                 .send(Event::State {
@@ -65,7 +70,7 @@ async fn run(
                     status: "설정에서 NAS 주소·이름·암호를 입력하세요".into(),
                 })
                 .await;
-            tokio::select! { _ = tokio::time::sleep(Duration::from_secs(5)) => {}, _ = stop.changed() => return }
+            tokio::select! { _ = tokio::time::sleep(Duration::from_secs(5)) => {}, _ = stop.changed() => return, _ = cfg_rx.changed() => {} }
             continue;
         }
         let mut attempts = vec![("home", cfg.host.clone())];
@@ -98,12 +103,17 @@ async fn run(
                 &mut out_rx,
                 &mut bin_rx,
                 &mut stop,
+                &mut cfg_rx,
             )
             .await
             {
                 Ok(()) => {
                     backoff = Duration::from_secs(2);
                     was_connected = true;
+                }
+                Err(SessionEnd::Reconfigured) => {
+                    backoff = Duration::from_millis(300);
+                    was_connected = true; // 바로 처음(집)부터 새 설정으로
                 }
                 Err(SessionEnd::Auth(msg)) => {
                     last_err = msg;
@@ -129,7 +139,7 @@ async fn run(
         if auth_failed {
             backoff = Duration::from_secs(20);
         } // 암호가 틀린 건 기다려도 안 바뀜 — 서버를 괴롭히지 않게 천천히
-        tokio::select! { _ = tokio::time::sleep(backoff) => {}, _ = stop.changed() => return }
+        tokio::select! { _ = tokio::time::sleep(backoff) => {}, _ = stop.changed() => return, _ = cfg_rx.changed() => { backoff = Duration::from_secs(2); continue; } }
         backoff = (backoff * 2).min(Duration::from_secs(20));
     }
 }
@@ -138,9 +148,11 @@ enum SessionEnd {
     Auth(String),
     Net(String),
     Stopped,
+    Reconfigured,
 }
 
 /// 한 번의 접속: 손잡이(hello) → 환영 → 메시지 주고받기. 정상적으로 붙었다가 끊기면 Ok, 붙지도 못하면 Err
+#[allow(clippy::too_many_arguments)]
 async fn session(
     cfg: &Config,
     where_: &str,
@@ -149,6 +161,7 @@ async fn session(
     out_rx: &mut mpsc::Receiver<serde_json::Value>,
     bin_rx: &mut mpsc::Receiver<Vec<u8>>,
     stop: &mut tokio::sync::watch::Receiver<bool>,
+    cfg_rx: &mut tokio::sync::watch::Receiver<Arc<Config>>,
 ) -> Result<(), SessionEnd> {
     let url = ws_url(addr);
     let connect = tokio_tungstenite::connect_async(&url);
@@ -177,6 +190,7 @@ async fn session(
     loop {
         tokio::select! {
             _ = stop.changed() => { let _ = sink.send(Message::Close(None)).await; return Err(SessionEnd::Stopped); }
+            _ = cfg_rx.changed() => { let _ = sink.send(Message::Close(None)).await; return Err(SessionEnd::Reconfigured); }
             _ = ping.tick() => {
                 if last_rx.elapsed() > Duration::from_secs(120) {
                     crate::log::info("연결 응답 없음 2분 → 다시 연결");

@@ -10,6 +10,7 @@
 mod app;
 mod audio;
 mod config;
+mod files;
 mod hotkey;
 mod log;
 mod net;
@@ -139,8 +140,57 @@ fn main() -> anyhow::Result<()> {
 
     if headless {
         log::info("창 없이 연결 점검 모드");
+        // --send-file <경로>: 연결되면 그 파일을 지금 상대에게 보냄 (첨부 기능 점검용)
+        let args: Vec<String> = std::env::args().collect();
+        let mut send_path = args
+            .iter()
+            .position(|a| a == "--send-file")
+            .and_then(|i| args.get(i + 1).cloned());
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let connected = state.lock().unwrap().connected;
+            if connected {
+                if let Some(p) = send_path.take() {
+                    log::info(&format!("점검: 첨부 보내기 {p}"));
+                    files::send_file(state.clone(), std::path::PathBuf::from(p), None, None);
+                }
+            }
+            let notices = {
+                let mut s = state.lock().unwrap();
+                let n = std::mem::take(&mut s.notices);
+                pump(&mut s, &out_tx);
+                n
+            };
+            for n in notices {
+                if let state::Notice::FileIn(c) = n {
+                    log::info(&format!(
+                        "점검: 첨부 받음 {} ({}바이트, 미리보기 {})",
+                        c.name, c.size, c.thumb
+                    ));
+                    let st = state.clone();
+                    let dest = files::file_path(&c);
+                    files::fetch(
+                        st.clone(),
+                        "file",
+                        c.clone(),
+                        dest,
+                        Some(Box::new(|p| {
+                            log::info(&format!("점검: 원본 내려받음 {}", p.display()))
+                        })),
+                    );
+                    if c.thumb {
+                        files::fetch(
+                            st,
+                            "thumb",
+                            c.clone(),
+                            files::thumb_path(&c),
+                            Some(Box::new(|p| {
+                                log::info(&format!("점검: 미리보기 내려받음 {}", p.display()))
+                            })),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -164,12 +214,22 @@ fn main() -> anyhow::Result<()> {
     };
     let st = state.clone();
     let pump_box: Box<dyn Fn(&mut state::State) + Send> = Box::new(move |s| pump(s, &out_tx));
+    let cfg_tx = conn.cfg_tx.clone();
+    let reconfigure: app::Reconfigure = Box::new(move |c| {
+        let _ = cfg_tx.send(Arc::new(c));
+    });
     eframe::run_native(
         "woorizip",
         opts,
         Box::new(move |cc| {
             *repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(cc, st, pump_box, inputs)))
+            Ok(Box::new(app::App::new(
+                cc,
+                st,
+                pump_box,
+                inputs,
+                reconfigure,
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("창 열기 실패: {e}"))?;

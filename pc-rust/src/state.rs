@@ -212,6 +212,12 @@ pub struct State {
     pub playing: Option<(i64, i64)>,
     /// 서버가 "곧 소리 파일 보낼게" 라고 알린 것 (id → 메타)
     pending: HashMap<i64, Value>,
+    /// 보내는 중인 첨부: 경로 → 진행 상황
+    pub uploads: HashMap<String, crate::files::Upload>,
+    /// 내려받는 중인 (종류, fid)
+    pub fetching: crate::files::Fetching,
+    /// 원본 내려받기 진행률 fid → 0~1
+    pub downloads: HashMap<String, f32>,
     data_dir: std::path::PathBuf,
     persist: bool, // 시험 때는 설정 파일을 건드리지 않음
 }
@@ -253,6 +259,9 @@ impl State {
             mic_wanted: false,
             playing: None,
             pending: HashMap::new(),
+            uploads: HashMap::new(),
+            fetching: HashSet::new(),
+            downloads: HashMap::new(),
             data_dir: dir,
             persist: true,
         };
@@ -1130,6 +1139,24 @@ impl State {
     }
 
     /// 받은 메시지를 봤다/들었다고 보낸 사람에게 알림 (한 번만)
+    /// 첨부 올리기가 끝남 (서버 응답 = file 메시지): 내 말풍선 추가
+    pub fn on_file_sent(&mut self, m: &Value) {
+        let clip = self.file_clip(m, true);
+        if clip.mid != 0 && self.clips.iter().any(|c| c.mid == clip.mid) {
+            return;
+        }
+        self.add_clip(clip);
+    }
+
+    pub fn mark_expired(&mut self, fid: &str) {
+        for c in &mut self.clips {
+            if c.kind == Kind::File && c.fid == fid {
+                c.expired = true;
+            }
+        }
+        self.save_texts();
+    }
+
     pub fn mark_seen(&mut self, mid: i64, mine: bool) {
         if mid == 0 || mine || self.seen_sent.contains(&mid) || !self.connected {
             return;

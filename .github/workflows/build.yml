@@ -116,6 +116,22 @@ jobs:
           path: android/app/build/outputs/apk/release/app-release.apk
           retention-days: 1
 
+  rust-pc:
+    # PC 프로그램 Rust판 (만드는 중 — 아직 설치 파일에는 들어가지 않음). 컴파일·검사·단위 시험만 통과 확인
+    name: PC Rust판 점검
+    runs-on: windows-latest
+    defaults: { run: { working-directory: pc-rust } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy, rustfmt }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: pc-rust }
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+
   release:
     name: 내려받기 페이지 만들기
     needs: [windows, android]

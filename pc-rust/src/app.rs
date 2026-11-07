@@ -1054,8 +1054,14 @@ fn draw_bubble(
     } else {
         Layout::left_to_right(Align::Min)
     };
+    // 내 글은 오른쪽 끝에 붙여서(카톡처럼), 받은 글은 왼쪽. 묶음 상자 안에서도 같음
+    let inner = if c.mine {
+        Layout::top_down(Align::Max)
+    } else {
+        Layout::top_down(Align::Min)
+    };
     ui.with_layout(layout, |ui| {
-        ui.vertical(|ui| {
+        ui.allocate_ui_with_layout(Vec2::new(max_w, 0.0), inner, |ui| {
             ui.set_max_width(max_w);
             if !c.mine && !same {
                 ui.label(

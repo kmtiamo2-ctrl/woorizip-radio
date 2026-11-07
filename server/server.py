@@ -16,6 +16,9 @@
   MAX_TALK_SEC 한 번에 말할 수 있는 최대 시간(초) (기본: 60)
   KEEP_HOURS   보관한 음성·문자를 몇 시간까지 전달 시도할지 (기본: 24)
   DATA_DIR     예약 메시지 저장 폴더 (기본: /app — 컨테이너를 다시 만들어도 남도록 NAS 폴더에 저장)
+  HISTORY_KEY  기록 암호화 열쇠(hex 64자). 없으면 history.key 파일을 자동 생성해 씀
+  names.json   화면에 보일 이름(공개 저장소에 두지 않음): {"첫째":"규민","둘째":"규준","셋째":"로아",
+               "by_viewer":{"아빠":{"엄마":"진희"},"엄마":{"아빠":"명호"}}} → welcome.names 로 각 기기에 전달
   VOICE_GATE   음성 감지 기준 음량(RMS, 기본 400, 0이면 끔). 버튼을 눌러도 이 크기의 말소리가
                VOICE_NEED_SEC(0.1초) 이상 들어와야 가족에게 "말하는 중" 신호와 소리가 나감.
                말소리 없이 손을 떼면 아무것도 보내지 않고 보낸 사람에게만 {"type":"talk_silent"}
@@ -43,6 +46,7 @@ import array
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -71,9 +75,10 @@ VOICE_PRE_SEC = 1.0                                             # 열릴 때 앞
 KEEP_HOURS = float(os.environ.get("KEEP_HOURS", "24"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 SCHEDULE_FILE = os.path.join(DATA_DIR, "schedules.json")
-HISTORY_FILE = os.path.join(DATA_DIR, "history.json")   # 문자 대화 기록 (폰·PC 어디서 열어도 같은 대화가 보이게)
-HISTORY_KEEP = 400
-HISTORY_SEND = 120
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")   # 문자 대화 기록 (폰·PC 어디서 열어도 같은 대화가 보이게) — 지우지 않고 계속 보관, 암호화 저장
+HISTORY_KEY_FILE = os.path.join(DATA_DIR, "history.key") # 기록 암호화 열쇠 (처음 켤 때 자동 생성, NAS 밖으로 나가지 않음)
+HISTORY_SEND = 120                                        # 접속할 때 먼저 보내는 개수 (그 이전은 맨 위로 올리면 history_before 로 이어서)
+NAMES_FILE = os.path.join(DATA_DIR, "names.json")        # 화면에 보일 이름 {"첫째":"규민", ...} + 보는 사람별 {"by_viewer": {"아빠": {"엄마": "진희"}}} — 공개 저장소에 두지 않음
 RECEIPT_KEEP = 300
 MAX_QUEUE = 20
 PING_INTERVAL = 20      # 감시 주기 (예약 메시지도 이 주기로 확인)
@@ -273,6 +278,84 @@ def is_private(ip):
         ip.startswith("172.") and ip.split(".")[1].isdigit() and 16 <= int(ip.split(".")[1]) <= 31)
 
 
+# ---- 기록 파일 암호화 (표준 라이브러리만): HMAC-SHA256 카운터 모드 스트림 + HMAC-SHA256 무결성 태그 ----
+HIST_MAGIC = b"WZH1"
+
+
+def history_key():
+    """열쇠 32바이트. 없으면 만들어 저장 (NAS 안에만 존재). 환경 변수 HISTORY_KEY(hex)로도 줄 수 있음"""
+    env = os.environ.get("HISTORY_KEY", "").strip()
+    if env:
+        return bytes.fromhex(env)
+    try:
+        with open(HISTORY_KEY_FILE) as f:
+            k = bytes.fromhex(f.read().strip())
+            if len(k) == 32:
+                return k
+    except Exception:
+        pass
+    k = secrets.token_bytes(32)
+    tmp = HISTORY_KEY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(k.hex())
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, HISTORY_KEY_FILE)
+    log("기록 암호화 열쇠를 새로 만들었어요: %s (이 파일을 잃으면 옛 기록을 못 읽으니 NAS 백업에 포함하세요)", HISTORY_KEY_FILE)
+    return k
+
+
+def _keystream_xor(key, nonce, data):
+    n = len(data)
+    if n == 0:
+        return b""
+    blocks = (n + 31) // 32
+    ks = b"".join(hmac.new(key, nonce + c.to_bytes(8, "big"), hashlib.sha256).digest() for c in range(blocks))[:n]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(ks, "big")).to_bytes(n, "big")
+
+
+def encrypt_blob(master, plain):
+    enc_key = hmac.new(master, b"woorizip-history-enc", hashlib.sha256).digest()
+    mac_key = hmac.new(master, b"woorizip-history-mac", hashlib.sha256).digest()
+    nonce = secrets.token_bytes(16)
+    ct = _keystream_xor(enc_key, nonce, plain)
+    tag = hmac.new(mac_key, HIST_MAGIC + nonce + ct, hashlib.sha256).digest()
+    return HIST_MAGIC + nonce + ct + tag
+
+
+def decrypt_blob(master, blob):
+    if not blob.startswith(HIST_MAGIC) or len(blob) < 4 + 16 + 32:
+        raise ValueError("형식 아님")
+    enc_key = hmac.new(master, b"woorizip-history-enc", hashlib.sha256).digest()
+    mac_key = hmac.new(master, b"woorizip-history-mac", hashlib.sha256).digest()
+    nonce, ct, tag = blob[4:20], blob[20:-32], blob[-32:]
+    if not hmac.compare_digest(tag, hmac.new(mac_key, HIST_MAGIC + nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("무결성 검사 실패 (열쇠가 다르거나 파일이 손상됨)")
+    return _keystream_xor(enc_key, nonce, ct)
+
+
+def load_names():
+    """names.json: {"첫째": "규민", ..., "by_viewer": {"아빠": {"엄마": "진희"}, "엄마": {"아빠": "명호"}}}"""
+    try:
+        with open(NAMES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def names_for(viewer):
+    """이 사람 기기에 보일 이름표: 공통 이름 + 보는 사람별 덮어쓰기 (자기 자신은 클라이언트가 '나'로 표시)"""
+    data = load_names()
+    out = {k: str(v) for k, v in data.items() if k in MEMBERS and isinstance(v, str) and v.strip()}
+    for k, v in ((data.get("by_viewer") or {}).get(viewer) or {}).items():
+        if k in MEMBERS and isinstance(v, str) and v.strip():
+            out[k] = v
+    return out
+
+
 class Hub:
     """
     - 가족 한 명(이름)이 폰·PC·노트북 여러 기기로 동시에 접속할 수 있음
@@ -337,7 +420,10 @@ class Hub:
         if to == "all":
             return [m for m in MEMBERS if m != name], "all"
         names = to if isinstance(to, list) else [to]
-        names = [n for n in names if isinstance(n, str) and n in MEMBERS and n != name]
+        names = [n for n in names if isinstance(n, str) and n in MEMBERS]
+        if names == [name]:
+            return [name], "direct"      # '나'에게: 메모 — 내 기기들에만 가고 다른 가족에게는 절대 안 감
+        names = [n for n in names if n != name]
         names = list(dict.fromkeys(names))
         if not names:
             return None, None
@@ -350,7 +436,7 @@ class Hub:
             await ws.send_json({"type": "talk_denied", "reason": "busy", "speaker": self.speaker})
             return
         targets, mode = self.resolve_targets(name, to)
-        if targets is None:
+        if targets is None or targets == [name]:   # 음성은 '나'에게 보내지 않음
             await ws.send_json({"type": "talk_denied", "reason": "offline", "to": to})
             return
         live = [w for t in targets for w in self.conns.get(t, ()) if self.hears_live(w)]
@@ -462,9 +548,8 @@ class Hub:
         log("문자: %s -> %s: %s", name, "전체" if mode == "all" else ",".join(targets), text)
         self.history.append({"mid": mid, "from": name, "mode": mode, "to": targets, "text": text, "ts": int(item["ts"]),
                              "status": self.receipts[mid]["status"]})
-        del self.history[:-HISTORY_KEEP]
         self.save_history()
-        for t in targets:
+        for t in ([] if targets == [name] else targets):   # '나'에게 쓴 메모는 text_sent/text_echo 로 내 기기들에만 감
             q = self.queue.setdefault(t, [])
             q.append(item)
             del q[:-MAX_QUEUE]
@@ -501,12 +586,27 @@ class Hub:
     # ---- 문자 대화 기록 ----
 
     def load_history(self):
+        self.hkey = history_key()
         try:
-            with open(HISTORY_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            self.history = data.get("items", [])[-HISTORY_KEEP:]
+            with open(HISTORY_FILE, "rb") as f:
+                raw = f.read()
+            if raw.startswith(HIST_MAGIC):
+                data = json.loads(decrypt_blob(self.hkey, raw).decode("utf-8"))
+            else:
+                data = json.loads(raw.decode("utf-8"))   # 예전 평문 파일 → 바로 암호화해서 다시 저장
+                log("기록 파일이 평문이라 암호화로 바꿉니다")
+            self.history = list(data.get("items", []))
             self.clip_seq = max(self.clip_seq, int(data.get("seq", 0)))
-        except Exception:
+            if not raw.startswith(HIST_MAGIC):
+                self.save_history()
+        except FileNotFoundError:
+            self.history = []
+        except Exception as e:
+            log("기록 파일을 읽지 못했어요 (%r) — 새 기록으로 시작하되 옛 파일은 history.json.bad 로 보관", e)
+            try:
+                os.replace(HISTORY_FILE, HISTORY_FILE + ".bad")
+            except Exception:
+                pass
             self.history = []
         for it in self.history:   # 재시작 뒤에도 읽음 확인이 이어지게 복원
             if it.get("mid") and isinstance(it.get("status"), dict):
@@ -515,8 +615,9 @@ class Hub:
     def save_history(self):
         try:
             tmp = HISTORY_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"items": self.history[-HISTORY_KEEP:], "seq": self.clip_seq}, f, ensure_ascii=False)
+            plain = json.dumps({"items": self.history, "seq": self.clip_seq}, ensure_ascii=False).encode("utf-8")
+            with open(tmp, "wb") as f:
+                f.write(encrypt_blob(self.hkey, plain))
             os.replace(tmp, HISTORY_FILE)
         except Exception as e:
             log("기록 저장 실패: %r", e)
@@ -525,7 +626,15 @@ class Hub:
         """접속 직후: 내가 보냈거나 받은 최근 문자 기록"""
         name = ws.name
         mine = [self.history_public(it) for it in self.history if it["from"] == name or name in it.get("to", [])]
-        await ws.send_json({"type": "history", "items": mine[-HISTORY_SEND:]})
+        await ws.send_json({"type": "history", "items": mine[-HISTORY_SEND:], "more": len(mine) > HISTORY_SEND})
+
+    async def send_history_before(self, ws, before_mid, limit=100):
+        """옛 대화 이어서 보내기: before_mid 보다 오래된 내 관련 기록을 limit 개"""
+        name = ws.name
+        limit = max(1, min(int(limit or 100), 300))
+        mine = [it for it in self.history if (it["from"] == name or name in it.get("to", [])) and 0 < it.get("mid", 0) < before_mid]
+        chunk = mine[-limit:]
+        await ws.send_json({"type": "history", "items": [self.history_public(it) for it in chunk], "more": len(mine) > limit, "before": before_mid})
 
     def history_public(self, it):
         """기록 항목을 클라이언트에 보낼 모양으로 (문자 / 첨부파일)"""
@@ -816,10 +925,9 @@ class Hub:
         item = {"kind": "file", "id": self.clip_seq, "mid": mid, "from": sender, "mode": mode, "to": targets, "ts": time.time(),
                 "fid": fid, "name": name, "size": size, "mime": mime, "thumb": bool(thumb), "status": self.receipts[mid]["status"]}
         self.history.append(item)
-        del self.history[:-HISTORY_KEEP]
         self.save_history()
         log("첨부: %s -> %s: %s (%.1fMB%s)", sender, "전체" if mode == "all" else ",".join(targets), name, size / 1048576, ", 미리보기" if thumb else "")
-        for t in targets:
+        for t in ([] if targets == [sender] else targets):   # '나'에게 보낸 첨부는 file_echo 로 내 기기들에만
             qd = self.queue.setdefault(t, [])
             qd.append({"kind": "file", "id": item["id"], "ts": item["ts"], "mid": mid, "item": item})
             del qd[:-MAX_QUEUE]
@@ -956,7 +1064,7 @@ class Hub:
             log("접속: %s [%s] %s(%s) — 기기 %d대", name, "집" if where == "home" else "밖", device, peer[0],
                 len(self.conns[name]))
             await ws.send_json({"type": "welcome", "members": MEMBERS, "you": name, "where": where,
-                                "parents": sorted(PARENTS)})
+                                "parents": sorted(PARENTS), "names": names_for(name)})
             await self.broadcast_presence()
             await self.send_history(ws)
             await self.flush_queue(name)
@@ -982,6 +1090,8 @@ class Hub:
                     await self.echo_others(name, ws, {"type": "seen_sync", "mid": int(msg.get("mid", 0))})   # 폰에서 읽으면 PC의 '새 글'도 같이 사라지게
                 elif t == "schedule_add":
                     await self.schedule_add(name, ws, msg)
+                elif t == "history_before":
+                    await self.send_history_before(ws, int(msg.get("mid", 0) or 0), msg.get("limit", 100))
                 elif t == "schedule_list":
                     await self.send_schedules(name)
                 elif t == "schedule_delete":

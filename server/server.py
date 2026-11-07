@@ -295,6 +295,7 @@ def history_key():
     except Exception:
         pass
     k = secrets.token_bytes(32)
+    os.makedirs(DATA_DIR, exist_ok=True)
     tmp = HISTORY_KEY_FILE + ".tmp"
     with open(tmp, "w") as f:
         f.write(k.hex())

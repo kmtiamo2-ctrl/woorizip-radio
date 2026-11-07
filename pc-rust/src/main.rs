@@ -98,6 +98,18 @@ fn main() -> anyhow::Result<()> {
     if just_updated {
         state.lock().unwrap().notice = format!("새 버전 {}으로 업데이트됐어요", update::version());
     }
+    // 자동 실행이 켜져 있어야 하는데(기본) 등록이 빠져 있으면 켤 때마다 채워 넣음 (설치본일 때만)
+    if cfg!(windows)
+        && !headless
+        && cfg.autostart
+        && platform::is_installed_copy()
+        && !platform::autostart_enabled()
+    {
+        match platform::set_autostart(true) {
+            Ok(()) => log::info("Windows 시작 시 자동 실행 등록"),
+            Err(e) => log::info(&format!("자동 실행 등록 실패: {e}")),
+        }
+    }
 
     // 통신: 별도 스레드의 tokio 런타임
     let rt = tokio::runtime::Builder::new_multi_thread()

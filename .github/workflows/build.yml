@@ -133,6 +133,23 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: 서버와 함께 자가 점검 (같은 컴퓨터에 서버를 켜고 아빠 2대·엄마로 붙어 글·읽음·메모·음성·예약·첨부·서명을 눌러 봄)
+        shell: bash
+        env: { PYTHONIOENCODING: utf-8, PYTHONUTF8: "1", FAMILY_KEY: "105403", PORT: "18765" }
+        run: |
+          set +e
+          mkdir -p out
+          export DATA_DIR="$RUNNER_TEMP/srv"
+          GITHUB_REPO= python -u ../server/server.py > out/server_rust.out 2> out/server_rust.log &
+          SRV=$!
+          sleep 3
+          target/release/woorizip-pc.exe --selftest 127.0.0.1:18765 2>&1 | tee out/selftest_rust.log
+          RC=${PIPESTATUS[0]}
+          kill $SRV 2>/dev/null || true
+          if [ "$RC" != "0" ]; then echo "::error title=Rust판 자가 점검 실패::$(grep FAIL out/selftest_rust.log | tr '\n' ' ' | cut -c1-800)"; fi
+          exit $RC
       - name: 실제 exe로 설치·교체 흐름 점검 (내려받은 파일 실행 → 자가 설치 → 새 파일로 교체 → 종료 요청)
         shell: pwsh
         timeout-minutes: 6
@@ -211,7 +228,7 @@ jobs:
                          "" "<details><summary>PC 프로그램 자동 점검 결과</summary>" "" '```' > notes.md
           cat out/pc/selftest.log >> notes.md 2>/dev/null || echo "(점검 기록 없음)" >> notes.md
           { echo; echo "--- 실제 exe 설치·교체 점검 ---"; cat out/pc/install.log 2>/dev/null | grep -v "^$" | head -12; } >> notes.md
-          { echo; echo "--- Rust판 설치·교체 점검 ---"; cat out/pc-rust/install_rust.log 2>/dev/null | grep -v "^$" | head -8; } >> notes.md
+          { echo; echo "--- Rust판 자가 점검 ---"; grep -E "^(OK|FAIL)" out/pc-rust/selftest_rust.log 2>/dev/null; echo; echo "--- Rust판 설치·교체 점검 ---"; cat out/pc-rust/install_rust.log 2>/dev/null | grep -v "^$" | head -8; } >> notes.md
           cp out/pc-rust/WoorizipRadio-PCRust-v$N.exe* out/ 2>/dev/null || true
           printf '%s\n' '```' "</details>" >> notes.md
           set +e

@@ -16,6 +16,7 @@ mod log;
 mod net;
 mod platform;
 mod proto;
+mod selftest;
 mod state;
 mod tray;
 mod update;
@@ -26,6 +27,13 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if update::cli(&args) {
         return Ok(()); // --sign / --verify / --pubkey (CI 용)
+    }
+    if args.get(1).map(|a| a.as_str()) == Some("--selftest") {
+        let addr = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1:8765".into());
+        std::process::exit(selftest::run(&addr));
     }
     log::init();
     log::info(&format!("우리집 PC(Rust) 시작 {}", update::version()));

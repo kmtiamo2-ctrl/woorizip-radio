@@ -1019,6 +1019,16 @@ impl State {
                 .unwrap_or("")
                 .to_string();
             let mine = from == self.cfg.name;
+            // 서버 기록에 '내가 이미 읽음'으로 남아 있으면 새 글로 세지 않고 다시 알리지도 않음 (새 기기·재설치 때)
+            if !mine
+                && it
+                    .get("status")
+                    .and_then(|st| st.get(&self.cfg.name))
+                    .and_then(|v| v.as_str())
+                    == Some("seen")
+            {
+                self.seen_sent.insert(mid);
+            }
             let clip = if it.get("kind").and_then(|v| v.as_str()) == Some("file") {
                 self.file_clip(it, mine)
             } else {

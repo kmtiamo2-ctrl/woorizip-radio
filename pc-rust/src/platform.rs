@@ -159,8 +159,8 @@ mod tests {
 
 #[cfg(windows)]
 pub fn protect(plain: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
-    use windows_sys::Win32::System::Memory::LocalFree;
     if plain.is_empty() {
         return None;
     }
@@ -194,8 +194,8 @@ pub fn protect(plain: &str) -> Option<String> {
 
 #[cfg(windows)]
 pub fn unprotect(enc: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
-    use windows_sys::Win32::System::Memory::LocalFree;
     let bytes = b64_decode(enc)?;
     let mut input = CRYPT_INTEGER_BLOB {
         cbData: bytes.len() as u32,

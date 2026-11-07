@@ -5,6 +5,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 
 pub const GUARD_PORT: u16 = 47651;
+/// 주 창 손잡이 (App 이 켜질 때 넣음). 창이 멈춰 있어도 '열어 줘' 요청을 바로 처리하려고 둠
+pub static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 pub const MUTEX_NAME: &str = "Local\\WoorizipRadio_single_instance";
 pub const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 pub const APP_NAME: &str = "WoorizipRadio";
@@ -51,9 +53,17 @@ pub fn single_instance() -> Option<Guard> {
                     let n = c.read(&mut buf).unwrap_or(0);
                     let s = String::from_utf8_lossy(&buf[..n]);
                     if s.starts_with("show") {
+                        let h = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+                        if h != 0 {
+                            window_show(h, None);
+                        }
                         let _ = tx.send(Request::Show);
                     } else if s.starts_with("quit") {
+                        // 같은 PC 안에서 온 요청(설치 파일·업데이트): 창이 멈춰 있어도 바로 끝냄
+                        crate::log::info("종료 요청(설치·업데이트) → 끝냄");
                         let _ = tx.send(Request::Quit);
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        std::process::exit(0);
                     }
                 }
             })
@@ -475,4 +485,93 @@ pub fn message_box(text: &str, warn: bool) {
 #[cfg(not(windows))]
 pub fn message_box(text: &str, _warn: bool) {
     eprintln!("{text}");
+}
+
+// ---- 창 숨기기/보이기 (Win32 직접) ----
+// 숨긴(Visible=false) 창은 Windows 가 그리기 메시지를 안 보내 egui 가 멈춤 → 트레이 클릭·팝업·종료 요청을 못 받음.
+// 그래서 '숨김' = 화면 밖(-32000)으로 옮기고 작업 표시줄·Alt+Tab 에서 빼기(WS_EX_TOOLWINDOW). 창은 계속 살아 있어 모든 게 동작함.
+
+#[cfg(windows)]
+pub fn window_handle(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+#[cfg(not(windows))]
+pub fn window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    None
+}
+
+#[cfg(windows)]
+pub fn window_hide(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let h = hwnd as HWND;
+    unsafe {
+        ShowWindow(h, SW_HIDE);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW as isize);
+        SetWindowPos(
+            h,
+            std::ptr::null_mut(),
+            -32000,
+            -32000,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        ShowWindow(h, SW_SHOWNOACTIVATE);
+    }
+}
+
+#[cfg(windows)]
+pub fn window_show(hwnd: isize, pos: Option<(i32, i32)>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let h = hwnd as HWND;
+    unsafe {
+        ShowWindow(h, SW_HIDE);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex & !(WS_EX_TOOLWINDOW as isize));
+        let (x, y) = pos.unwrap_or_else(|| {
+            let sw = GetSystemMetrics(SM_CXSCREEN);
+            let sh = GetSystemMetrics(SM_CYSCREEN);
+            ((sw - 460).max(0) / 2, (sh - 800).max(0) / 2)
+        });
+        SetWindowPos(
+            h,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER,
+        );
+        ShowWindow(h, SW_SHOW);
+        ShowWindow(h, SW_RESTORE);
+        SetForegroundWindow(h);
+    }
+}
+
+#[cfg(windows)]
+pub fn window_is_offscreen(hwnd: isize) -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe { GetWindowRect(hwnd as _, &mut r) };
+    r.left <= -30000
+}
+
+#[cfg(not(windows))]
+pub fn window_hide(_hwnd: isize) {}
+#[cfg(not(windows))]
+pub fn window_show(_hwnd: isize, _pos: Option<(i32, i32)>) {}
+#[cfg(not(windows))]
+pub fn window_is_offscreen(_hwnd: isize) -> bool {
+    false
 }

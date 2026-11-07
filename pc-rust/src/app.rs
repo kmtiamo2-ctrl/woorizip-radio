@@ -69,6 +69,8 @@ pub struct App {
     reconfigure: Reconfigure,
     extra: Extra,
     tray: Tray,
+    hwnd: Option<isize>,
+    last_pos: Option<(i32, i32)>,
     visible: bool,
     allow_close: bool,
     ask_quit: bool,
@@ -98,9 +100,17 @@ impl App {
         let configured = state.lock().unwrap().cfg.configured();
         let tray = Tray::new();
         let start_min = inputs.start_minimized;
+        let hwnd = crate::platform::window_handle(cc);
+        if let Some(h) = hwnd {
+            crate::platform::MAIN_HWND.store(h, std::sync::atomic::Ordering::Relaxed);
+        }
         if start_min {
-            cc.egui_ctx
-                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            match hwnd {
+                Some(h) => crate::platform::window_hide(h),
+                None => cc
+                    .egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false)),
+            }
         }
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
@@ -128,6 +138,8 @@ impl App {
             reconfigure,
             extra: Extra::new(configured),
             tray,
+            hwnd,
+            last_pos: None,
             visible: !start_min,
             allow_close: false,
             ask_quit: false,
@@ -1160,14 +1172,34 @@ fn disp_list_simple(s: &str, disp: &dyn Fn(&str) -> String) -> String {
 impl App {
     fn show(&mut self, ctx: &egui::Context) {
         self.visible = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        match self.hwnd {
+            Some(h) => {
+                crate::platform::window_show(h, self.last_pos);
+                ctx.request_repaint();
+            }
+            None => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        match self.hwnd {
+            Some(h) => {
+                // 지금 자리를 기억해 뒀다가 다시 열 때 그 자리로
+                if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+                    let ppp = ctx.pixels_per_point();
+                    if r.min.x > -20000.0 {
+                        self.last_pos = Some(((r.min.x * ppp) as i32, (r.min.y * ppp) as i32));
+                    }
+                }
+                crate::platform::window_hide(h);
+            }
+            None => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
+        }
     }
 
     /// 완전히 종료: 아이들이 함부로 끄지 못하게 가족 암호를 물음

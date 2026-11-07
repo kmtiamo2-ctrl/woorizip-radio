@@ -7,86 +7,6 @@ on:
 permissions: { contents: write, issues: write, actions: write }   # actions: 옛 빌드 중간 파일 삭제용
 
 jobs:
-  windows:
-    name: Windows 설치 파일 (.exe)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - run: pip install -r pc/requirements.txt pyinstaller
-      - run: echo '__version__ = "v${{ github.run_number }}"' > pc/version.py
-      - name: 실제로 띄워서 점검 (같은 컴퓨터에 서버를 켜고 PC 프로그램의 창·문자·확인 표시·예약을 눌러 봄)
-        shell: bash
-        env: { PYTHONIOENCODING: utf-8, PYTHONUTF8: "1", FAMILY_KEY: "105403" }
-        run: |
-          set +e
-          mkdir -p pcout
-          export DATA_DIR="$RUNNER_TEMP"
-          GITHUB_REPO= python -u server/server.py > pcout/server.out 2> pcout/server.log &
-          SRV=$!
-          sleep 3
-          python pc/radio_pc.py --selftest 2>&1 | tee pcout/selftest.log
-          RC=${PIPESTATUS[0]}
-          kill $SRV 2>/dev/null || true
-          echo "--- 서버 기록 ---"; cat pcout/server.log 2>/dev/null || true
-          if [ "$RC" != "0" ]; then echo "::error title=PC 자가 점검 실패::$(grep FAIL pcout/selftest.log | tr '\n' ' ' | cut -c1-800)"; fi
-          exit $RC
-      - name: 프로그램 폴더(빠른 실행) + 설치 파일 만들기
-        run: |
-          pyinstaller --noconfirm --clean --onedir --windowed --name "WoorizipRadio" --icon pc/icon.ico --collect-all winotify --collect-all pystray --collect-all customtkinter pc/radio_pc.py
-          pyinstaller --noconfirm --onefile --windowed --name "WoorizipRadio-Setup" --icon pc/icon.ico --add-data "dist/WoorizipRadio;app" pc/setup.py
-      - name: 실제 exe로 설치·교체 흐름 점검 (내려받은 파일 실행 → 자가 설치 → 새 파일로 교체 → 종료)
-        shell: pwsh
-        timeout-minutes: 6
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'la'
-          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'ra'
-          New-Item -ItemType Directory -Force (Join-Path $env:APPDATA 'WoorizipRadio') | Out-Null
-          Set-Content -Encoding UTF8 (Join-Path $env:APPDATA 'WoorizipRadio\config.json') '{"host":"127.0.0.1","out_host":"","name":"아빠","key":"105403","autostart":false}'
-          $inst = Join-Path $env:LOCALAPPDATA 'WoorizipRadio\app\WoorizipRadio.exe'
-          $log = @()
-          Copy-Item dist\WoorizipRadio-Setup.exe (Join-Path $env:RUNNER_TEMP 'dl1.exe')
-          Start-Process (Join-Path $env:RUNNER_TEMP 'dl1.exe') -ArgumentList '--minimized'
-          Start-Sleep 20
-          $p1 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
-          $log += "1) 내려받은 파일 실행 → 설치본 존재: $(Test-Path $inst) / 실행 중: $($p1.Count)개 / 경로: $(($p1 | ForEach-Object { $_.Path }) -join ' , ')"
-          Copy-Item dist\WoorizipRadio-Setup.exe (Join-Path $env:RUNNER_TEMP 'dl2.exe')
-          Start-Process (Join-Path $env:RUNNER_TEMP 'dl2.exe') -ArgumentList '--minimized','--updated'
-          Start-Sleep 25
-          $p2 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
-          $paths2 = @($p2 | ForEach-Object { [string]$_.Path })   # 프로세스가 끝난 뒤에는 경로를 못 읽으므로 지금 문자열로 떠 둠
-          $log += "2) 새 파일로 교체 실행 → 실행 중: $($p2.Count)개 / 경로: $($paths2 -join ' , ')"
-          python -c "import socket; s=socket.create_connection(('127.0.0.1',47651),timeout=3); s.sendall(b'quit'); s.close()"
-          Start-Sleep 8
-          $p3 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
-          $log += "3) 종료 요청 → 실행 중: $($p3.Count)개"
-          $bad = @($paths2 | Where-Object { -not [string]::Equals($_, [string]$inst, 'OrdinalIgnoreCase') })
-          $c1 = [bool](Test-Path $inst); $c2 = ($p1.Count -ge 1); $c3 = ($p2.Count -ge 1); $c4 = ($bad.Count -eq 0); $c5 = ($p3.Count -eq 0)
-          $pass = $c1 -and $c2 -and $c3 -and $c4 -and $c5
-          $log += "조건: 설치본=$c1 실행=$c2 교체후실행=$c3 경로일치=$c4(다른경로 $($bad.Count)개) 종료=$c5"
-          $log += "결과: " + $(if ($pass) { "통과" } else { "실패" })
-          $log += "--- 기록 파일 ---"
-          $log += (Get-Content (Join-Path $env:APPDATA 'WoorizipRadio\log.txt') -ErrorAction SilentlyContinue)
-          $log | Out-File -Encoding utf8 pcout/install.log
-          $log | Write-Host
-          if (-not $pass) { Get-Process WoorizipRadio -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host "::error title=설치·교체 점검 실패::$($log[0..3] -join ' | ')"; exit 1 }
-      - run: Copy-Item dist/WoorizipRadio-Setup.exe pcout/WoorizipRadio.exe
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pc
-          path: pcout/
-          retention-days: 1   # 릴리스에 올린 뒤에는 필요 없는 중간 파일 → 하루 뒤 삭제
-      - name: 점검에 실패하면 내용을 이슈로 남김
-        if: failure()
-        shell: bash
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          set +e
-          { echo '```'; cat pcout/selftest.log 2>/dev/null | tail -150; echo; echo "--- 서버 기록 ---"; tail -40 pcout/server.log 2>/dev/null; echo; echo "--- 설치·교체 점검 ---"; cat pcout/install.log 2>/dev/null | tail -80; echo '```'; } > body.md
-          gh issue create --title "PC 자가 점검 실패 (${{ github.run_number }})" --body-file body.md
-
   android:
     name: 안드로이드 앱 (.apk)
     runs-on: ubuntu-latest
@@ -117,9 +37,8 @@ jobs:
           retention-days: 1
 
   rust-pc:
-    # PC 프로그램 Rust판: 검사·시험 → 릴리스 exe(한 파일, 그 자체가 설치 파일) → 실제 설치·교체 흐름 점검 → 서명
-    # 지금은 릴리스에 `WoorizipRadio-PCRust-v번호.exe` 로 따로 올림 (한 대에서 써 본 뒤 7일차에 PC 기본 파일로 바꿈)
-    name: PC Rust판 점검
+    # PC 프로그램(Rust): 검사·시험 → 릴리스 exe(한 파일, 그 자체가 설치 파일) → 실제 설치·교체 흐름 점검 → 서명
+    name: PC 프로그램 (.exe)
     runs-on: windows-latest
     defaults: { run: { working-directory: pc-rust } }
     env: { WOORIZIP_VERSION: "v${{ github.run_number }}" }
@@ -192,29 +111,29 @@ jobs:
         env: { PC_SIGN_KEY: "${{ secrets.PC_SIGN_KEY }}" }
         run: |
           N=${{ github.run_number }}
-          cp target/release/woorizip-pc.exe "out/WoorizipRadio-PCRust-v$N.exe"
+          cp target/release/woorizip-pc.exe "out/WoorizipRadio-PC-v$N.exe"
           if [ -n "$PC_SIGN_KEY" ]; then
-            target/release/woorizip-pc.exe --sign "$PC_SIGN_KEY" "out/WoorizipRadio-PCRust-v$N.exe" > "out/WoorizipRadio-PCRust-v$N.exe.sig"
-            target/release/woorizip-pc.exe --verify "$(cat out/WoorizipRadio-PCRust-v$N.exe.sig)" "out/WoorizipRadio-PCRust-v$N.exe"
+            target/release/woorizip-pc.exe --sign "$PC_SIGN_KEY" "out/WoorizipRadio-PC-v$N.exe" > "out/WoorizipRadio-PC-v$N.exe.sig"
+            target/release/woorizip-pc.exe --verify "$(cat out/WoorizipRadio-PC-v$N.exe.sig)" "out/WoorizipRadio-PC-v$N.exe"
             echo "서명함"
           else
             echo "::warning title=서명 없음::GitHub 비밀 PC_SIGN_KEY 가 없어 Rust판 exe 에 서명하지 못했어요 (Rust판 자동 업데이트는 서명이 있어야 설치해요)"
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: pc-rust
+          name: pc
           path: pc-rust/out/
           retention-days: 1
 
   release:
     name: 내려받기 페이지 만들기
-    needs: [windows, android, rust-pc]
+    needs: [android, rust-pc]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with: { path: out }
       - run: |
-          mv out/pc/WoorizipRadio.exe out/WoorizipRadio-PC-v${{ github.run_number }}.exe
+          mv out/pc/WoorizipRadio-PC-v${{ github.run_number }}.exe* out/
           mv out/apk/app-release.apk out/WoorizipRadio-Phone-v${{ github.run_number }}.apk
       - uses: actions/checkout@v4
         with: { path: src }
@@ -222,14 +141,10 @@ jobs:
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           N=${{ github.run_number }}
-          printf '%s\n' "- **PC(Windows)**: \`WoorizipRadio-PC-v$N.exe\` 를 내려받아 더블클릭. 스스로 사용자 폴더에 설치되므로 내려받은 파일은 지워도 돼요" \
+          printf '%s\n' "- **PC(Windows)**: \`WoorizipRadio-PC-v$N.exe\` 를 내려받아 더블클릭. 켜져 있는 우리집을 스스로 끄고 사용자 폴더에 설치되므로 내려받은 파일은 지워도 돼요 (\`.sig\` 는 자동 업데이트가 쓰는 서명 파일)" \
                          "- **폰(안드로이드)**: \`WoorizipRadio-Phone-v$N.apk\` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)" \
-                         "- **PC Rust판(써 보는 중)**: \`WoorizipRadio-PCRust-v$N.exe\` — 더블클릭하면 지금 깔린 Python판을 끄고 그 자리에 설치돼요" \
                          "" "<details><summary>PC 프로그램 자동 점검 결과</summary>" "" '```' > notes.md
-          cat out/pc/selftest.log >> notes.md 2>/dev/null || echo "(점검 기록 없음)" >> notes.md
-          { echo; echo "--- 실제 exe 설치·교체 점검 ---"; cat out/pc/install.log 2>/dev/null | grep -v "^$" | head -12; } >> notes.md
-          { echo; echo "--- Rust판 자가 점검 ---"; grep -E "^(OK|FAIL)" out/pc-rust/selftest_rust.log 2>/dev/null; echo; echo "--- Rust판 설치·교체 점검 ---"; cat out/pc-rust/install_rust.log 2>/dev/null | grep -v "^$" | head -8; } >> notes.md
-          cp out/pc-rust/WoorizipRadio-PCRust-v$N.exe* out/ 2>/dev/null || true
+          { echo "--- 자가 점검 (서버와 함께) ---"; grep -E "^(OK|FAIL)" out/pc/selftest_rust.log 2>/dev/null || echo "(점검 기록 없음)"; echo; echo "--- 실제 exe 설치·교체 점검 ---"; cat out/pc/install_rust.log 2>/dev/null | grep -v "^$" | head -8; } >> notes.md
           printf '%s\n' '```' "</details>" >> notes.md
           set +e
           gh release create "v$N" out/*.exe out/*.apk out/*.sig --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest > release.log 2>&1

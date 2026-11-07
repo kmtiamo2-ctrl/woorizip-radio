@@ -506,6 +506,7 @@ pub fn window_handle(_cc: &eframe::CreationContext<'_>) -> Option<isize> {
 
 #[cfg(windows)]
 pub fn window_hide(hwnd: isize) {
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
     let h = hwnd as HWND;
     unsafe {
@@ -527,6 +528,7 @@ pub fn window_hide(hwnd: isize) {
 
 #[cfg(windows)]
 pub fn window_show(hwnd: isize, pos: Option<(i32, i32)>) {
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
     let h = hwnd as HWND;
     unsafe {

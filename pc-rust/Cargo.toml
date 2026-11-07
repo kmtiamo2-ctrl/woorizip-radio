@@ -21,6 +21,8 @@ open = "5"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 sha2 = "0.10"
 eframe = { version = "0.32", default-features = false, features = ["glow", "wgpu", "default_fonts", "x11", "wayland"] }
+# wgpu 는 그릴 방식(backend)을 따로 켜 줘야 함: Windows 는 DirectX 12(드라이버 없는 PC 는 소프트웨어 WARP), 그 외 Vulkan·OpenGL
+wgpu = { version = "25", default-features = false, features = ["dx12", "vulkan", "gles", "wgsl"] }
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.16"

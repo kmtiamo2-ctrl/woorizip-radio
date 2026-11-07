@@ -283,6 +283,10 @@ fn main() -> anyhow::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("우리집")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                    .unwrap_or_default(),
+            )
             .with_inner_size([440.0, 760.0])
             .with_min_inner_size([360.0, 560.0]),
         ..Default::default()

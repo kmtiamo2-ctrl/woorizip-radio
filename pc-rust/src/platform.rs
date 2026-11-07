@@ -362,7 +362,9 @@ pub fn install_self(args: &[String]) -> Result<bool, String> {
     if crate::config::Config::load().autostart {
         let _ = set_autostart(true);
     }
-    let _ = make_shortcut(ShortcutWhere::StartMenu);
+    std::thread::spawn(|| {
+        let _ = make_shortcut(ShortcutWhere::StartMenu);
+    });
     // 4) 설치본 실행 (같은 인자)
     std::process::Command::new(&inst)
         .args(args)

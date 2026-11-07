@@ -622,6 +622,7 @@ impl App {
         let mut open = true;
         let mut save = false;
         let mut check_update = false;
+        let mut make_shortcut_bg = false;
         {
             let d = &mut self.extra.settings;
             egui::Window::new("⚙ 설정")
@@ -746,12 +747,9 @@ impl App {
                             .add(small_btn("바탕화면에 바로가기 만들기", false))
                             .clicked()
                         {
-                            d.msg = match crate::platform::make_shortcut(
-                                crate::platform::ShortcutWhere::Desktop,
-                            ) {
-                                Ok(()) => "바탕화면에 '우리집' 바로가기를 만들었어요".into(),
-                                Err(e) => format!("바로가기를 만들지 못했어요 ({e})"),
-                            };
+                            // PowerShell 이 2~3초 걸리므로 뒤 스레드에서 — 창이 멈추지 않게
+                            d.msg = "바로가기를 만드는 중…".into();
+                            make_shortcut_bg = true;
                         }
                         if ui.add(small_btn("지금 업데이트 확인", false)).clicked() {
                             check_update = true;
@@ -766,6 +764,17 @@ impl App {
         }
         if save {
             self.apply_settings();
+        }
+        if make_shortcut_bg {
+            let st = self.state.clone();
+            std::thread::spawn(move || {
+                let msg =
+                    match crate::platform::make_shortcut(crate::platform::ShortcutWhere::Desktop) {
+                        Ok(()) => "바탕화면에 '우리집' 바로가기를 만들었어요".to_string(),
+                        Err(e) => format!("바로가기를 만들지 못했어요 ({e})"),
+                    };
+                st.lock().unwrap().notice = msg;
+            });
         }
         if check_update {
             let st = self.state.clone();

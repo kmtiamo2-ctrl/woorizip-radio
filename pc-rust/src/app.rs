@@ -168,7 +168,10 @@ impl eframe::App for App {
         let notices: Vec<Notice> = self.with_state(|s| std::mem::take(&mut s.notices));
         for n in notices {
             match n {
-                Notice::Text(_) | Notice::FileIn(_) | Notice::Incoming { .. } => {
+                Notice::Text(_)
+                | Notice::FileIn(_)
+                | Notice::Incoming { .. }
+                | Notice::Clip { .. } => {
                     self.flash_until = ctx.input(|i| i.time) + 1.5;
                 }
                 Notice::Schedules => {}
@@ -301,7 +304,21 @@ impl eframe::App for App {
 
                 // ---- 말하기 버튼 (Python판의 1/3 높이) ----
                 let me_room = self.with_state(|s| s.is_me_room(&room));
+                let playing_title = self.with_state(|s| {
+                    s.playing.and_then(|(id, _)| {
+                        s.clips
+                            .iter()
+                            .find(|c| c.id == id && c.kind == Kind::Clip)
+                            .map(|c| s.clip_title(c))
+                    })
+                });
                 let (title, sub, fill, fg) = match () {
+                    _ if playing_title.is_some() => (
+                        format!("🔊 {} 재생 중", playing_title.clone().unwrap()),
+                        "누르면 멈춤".into(),
+                        CARD2,
+                        GREEN,
+                    ),
                     _ if incoming.is_some() => {
                         let (f, m) = incoming.clone().unwrap();
                         (
@@ -390,7 +407,11 @@ impl eframe::App for App {
                     );
                 }
                 if resp.drag_started() {
-                    self.with_state(|s| s.start_talk());
+                    if playing_title.is_some() {
+                        self.with_state(|s| s.stop_clip());
+                    } else {
+                        self.with_state(|s| s.start_talk());
+                    }
                 }
                 if resp.drag_stopped() {
                     self.with_state(|s| s.stop_talk());
@@ -833,13 +854,32 @@ fn draw_bubble(
                             }
                         }
                         Kind::Clip => {
-                            ui.label(
-                                RichText::new(format!(
-                                    "🔊 음성 {}초 (3일차)",
-                                    (c.seconds as i64).max(1)
-                                ))
-                                .size(13.5),
-                            );
+                            ui.horizontal(|ui| {
+                                let playing = _app.with_state(|s| s.is_playing(c.id));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "🔊 음성 {}초",
+                                        (c.seconds as i64).max(1)
+                                    ))
+                                    .size(13.5),
+                                );
+                                let label = if playing { "■ 멈춤" } else { "▶ 듣기" };
+                                let b = egui::Button::new(
+                                    RichText::new(label).size(12.0).color(ON_DARK),
+                                )
+                                .fill(who_col)
+                                .corner_radius(CornerRadius::same(10));
+                                if ui.add(b).clicked() {
+                                    let id = c.id;
+                                    _app.with_state(|s| {
+                                        if playing {
+                                            s.stop_clip()
+                                        } else {
+                                            s.play_clip(id)
+                                        }
+                                    });
+                                }
+                            });
                         }
                     }
                 })

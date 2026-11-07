@@ -100,6 +100,9 @@ pub struct Clip {
     pub thumb: bool,
     #[serde(default)]
     pub expired: bool,
+    /// 받은 음성(kind=Clip)의 소리 파일 경로 (Python판과 같은 `clips/` 폴더·이름 규칙)
+    #[serde(default)]
+    pub file: String,
 }
 
 impl Clip {
@@ -149,10 +152,29 @@ struct OutboxItem {
 /// 화면에 알릴 일 (팝업·깜빡임 등)
 #[derive(Debug, Clone)]
 pub enum Notice {
-    Incoming { from: String, mode: String },
+    Incoming {
+        from: String,
+        mode: String,
+    },
     Text(Clip),
     FileIn(Clip),
+    /// 받은 음성. auto=집(또는 부모)이라 바로 틀었음
+    Clip {
+        clip: Clip,
+        auto: bool,
+    },
     Schedules,
+}
+
+/// 소리 장치에 시킬 일 (engine 이 비움)
+#[derive(Debug, Clone)]
+pub enum Sound {
+    Live(Vec<u8>),
+    BeepIn,
+    BeepOk,
+    BeepNo,
+    PlayFile(String),
+    Stop,
 }
 
 pub struct State {
@@ -182,6 +204,14 @@ pub struct State {
     pub outgoing: Vec<Value>,
     /// 화면에 알릴 것 (app 이 비움)
     pub notices: Vec<Notice>,
+    /// 소리 장치에 시킬 것 (engine 이 비움)
+    pub sounds: Vec<Sound>,
+    /// 마이크를 켜 둬야 하는지 (서버가 말하기를 허락한 동안)
+    pub mic_wanted: bool,
+    /// 지금 틀고 있는 보관 음성 (id, 끝나는 시각)
+    pub playing: Option<(i64, i64)>,
+    /// 서버가 "곧 소리 파일 보낼게" 라고 알린 것 (id → 메타)
+    pending: HashMap<i64, Value>,
     data_dir: std::path::PathBuf,
     persist: bool, // 시험 때는 설정 파일을 건드리지 않음
 }
@@ -219,10 +249,15 @@ impl State {
             outbox: vec![],
             outgoing: vec![],
             notices: vec![],
+            sounds: vec![],
+            mic_wanted: false,
+            playing: None,
+            pending: HashMap::new(),
             data_dir: dir,
             persist: true,
         };
         s.load_texts();
+        s.load_clip_files();
         s.load_outbox();
         s.load_names();
         s
@@ -631,6 +666,7 @@ impl State {
         if !connected {
             self.talking = false;
             self.requesting = false;
+            self.mic_wanted = false;
             self.incoming_from = None;
             self.incoming_mode = None;
             self.online.clear();
@@ -670,6 +706,8 @@ impl State {
                 }
                 self.requesting = false;
                 self.talking = true;
+                self.mic_wanted = true;
+                self.sounds.push(Sound::BeepOk);
                 self.notice = if s("to") == "all" {
                     "전체 방송 중".into()
                 } else {
@@ -678,6 +716,7 @@ impl State {
             }
             "talk_denied" => {
                 self.requesting = false;
+                self.sounds.push(Sound::BeepNo);
                 self.notice = match s("reason").as_str() {
                     "busy" => format!("{}가 말하는 중이에요", self.disp(&s("speaker"))),
                     "offline" => format!("{}가 지금 접속해 있지 않아요", self.disp_list(&s("to"))),
@@ -687,6 +726,8 @@ impl State {
             "talk_stopped" => {
                 self.talking = false;
                 self.requesting = false;
+                self.mic_wanted = false;
+                self.sounds.push(Sound::BeepNo);
                 self.notice = if s("reason") == "too_long" {
                     "1분이 지나 자동으로 끝났어요".into()
                 } else {
@@ -696,11 +737,14 @@ impl State {
             "talk_silent" => {
                 self.talking = false;
                 self.requesting = false;
+                self.mic_wanted = false;
                 self.notice = "소리가 안 들려 보내지 않았어요".into();
             }
             "incoming" => {
                 self.incoming_from = Some(s("from"));
                 self.incoming_mode = Some(s("mode"));
+                self.stop_clip();
+                self.sounds.push(Sound::BeepIn);
                 self.notices.push(Notice::Incoming {
                     from: s("from"),
                     mode: s("mode"),
@@ -709,6 +753,9 @@ impl State {
             "incoming_end" => {
                 self.incoming_from = None;
                 self.incoming_mode = None;
+            }
+            "clip" => {
+                self.pending.insert(i("id"), m.clone());
             }
             "text" => {
                 let cid = i("id");
@@ -1117,7 +1164,141 @@ impl State {
         }
         self.talking = false;
         self.requesting = false;
+        self.mic_wanted = false;
         self.outgoing.push(json!({"type": "talk_stop"}));
+    }
+
+    /// 마이크를 못 열었을 때 (engine 이 부름)
+    pub fn mic_failed(&mut self) {
+        self.notice = "마이크를 사용할 수 없어요".into();
+        self.stop_talk();
+    }
+
+    // ---- 소리 조각 ----
+
+    /// 서버가 보낸 소리: 1=실시간(누가 말하는 중), 2=보관 음성(id 4바이트 + 소리)
+    pub fn on_binary(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        match data[0] {
+            1 => {
+                if self.incoming_from.is_some() {
+                    self.sounds.push(Sound::Live(data[1..].to_vec()));
+                }
+            }
+            2 if data.len() > 5 => {
+                let cid = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as i64;
+                self.on_clip(cid, &data[5..]);
+            }
+            _ => {}
+        }
+    }
+
+    fn clip_dir(&self) -> std::path::PathBuf {
+        self.data_dir.join("clips")
+    }
+
+    fn on_clip(&mut self, cid: i64, pcm: &[u8]) {
+        let Some(meta) = self.pending.remove(&cid) else {
+            return;
+        };
+        self.outgoing.push(json!({"type": "clip_ack", "id": cid}));
+        let ts = meta
+            .get("ts")
+            .and_then(|v| v.as_i64())
+            .filter(|t| *t > 0)
+            .unwrap_or_else(|| chrono::Local::now().timestamp());
+        let sender = meta
+            .get("from")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mode = meta
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("direct")
+            .to_string();
+        if self
+            .clips
+            .iter()
+            .any(|c| c.kind == Kind::Clip && c.from == sender && c.ts == ts)
+        {
+            return;
+        }
+        let seconds = meta
+            .get("seconds")
+            .and_then(|v| v.as_f64())
+            .filter(|s| *s > 0.0)
+            .unwrap_or(pcm.len() as f64 / 32000.0);
+        let dir = self.clip_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!(
+            "{}_{}_{}_{}_{:.1}.pcm",
+            cid, sender, mode, ts, seconds
+        ));
+        if std::fs::write(&path, pcm).is_err() {
+            return;
+        }
+        let clip = Clip {
+            kind: Kind::Clip,
+            id: cid,
+            mid: meta.get("mid").and_then(|v| v.as_i64()).unwrap_or(0),
+            from: sender,
+            mode,
+            ts,
+            seconds,
+            file: path.to_string_lossy().to_string(),
+            ..Clip::empty()
+        };
+        self.add_clip(clip.clone());
+        let auto = self.where_.as_deref() == Some("home") || self.is_parent();
+        if auto {
+            self.play_clip(cid);
+        }
+        self.notices.push(Notice::Clip { clip, auto });
+    }
+
+    /// 보관 음성 듣기 (앞에 알림음). 듣기 시작하면 보낸 사람에게 '들음'
+    pub fn play_clip(&mut self, id: i64) {
+        if self.incoming_from.is_some() || self.talking {
+            return;
+        }
+        let Some(c) = self
+            .clips
+            .iter()
+            .find(|c| c.kind == Kind::Clip && c.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        if c.file.is_empty() || !std::path::Path::new(&c.file).exists() {
+            self.notice = "소리 파일이 없어요 (24시간이 지나 지워졌을 수 있어요)".into();
+            return;
+        }
+        let end = chrono::Local::now().timestamp() + c.seconds.ceil() as i64 + 1;
+        self.playing = Some((id, end));
+        self.sounds.push(Sound::PlayFile(c.file.clone()));
+        self.mark_seen(c.mid, c.mine);
+    }
+
+    pub fn stop_clip(&mut self) {
+        if self.playing.take().is_some() {
+            self.sounds.push(Sound::Stop);
+        }
+    }
+
+    /// engine 이 주기적으로 부름: 재생이 끝났으면 표시를 지움
+    pub fn tick(&mut self) {
+        if let Some((_, end)) = self.playing {
+            if chrono::Local::now().timestamp() >= end {
+                self.playing = None;
+            }
+        }
+    }
+
+    pub fn is_playing(&self, id: i64) -> bool {
+        self.playing.map(|(i, _)| i == id).unwrap_or(false)
     }
 
     pub fn schedule_add(&mut self, text: &str, at: i64, repeat: &str, to: Option<Value>) {
@@ -1132,8 +1313,66 @@ impl State {
     }
 
     pub fn delete_clip(&mut self, mid: i64, id: i64) {
+        if self.is_playing(id) {
+            self.stop_clip();
+        }
+        if let Some(c) = self.clips.iter().find(|c| c.mid == mid && c.id == id) {
+            if !c.file.is_empty() {
+                let _ = std::fs::remove_file(&c.file);
+            }
+        }
         self.clips.retain(|c| !(c.mid == mid && c.id == id));
         self.save_texts();
+    }
+
+    /// `clips/` 폴더의 소리 파일 목록 → 받은 음성 (파일 이름: id_보낸이_방식_시각_초.pcm). 24시간 지난 것은 지움
+    fn load_clip_files(&mut self) {
+        let dir = self.clip_dir();
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let now = chrono::Local::now().timestamp();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".pcm") else {
+                continue;
+            };
+            let p: Vec<&str> = stem.split('_').collect();
+            if p.len() < 5 {
+                continue;
+            }
+            let (Ok(id), Ok(ts), Ok(seconds)) = (
+                p[0].parse::<i64>(),
+                p[3].parse::<i64>(),
+                p[4].parse::<f64>(),
+            ) else {
+                continue;
+            };
+            if now - ts > 24 * 3600 {
+                let _ = std::fs::remove_file(e.path());
+                continue;
+            }
+            if self
+                .clips
+                .iter()
+                .any(|c| c.kind == Kind::Clip && c.id == id)
+            {
+                continue;
+            }
+            self.clips.push(Clip {
+                kind: Kind::Clip,
+                id,
+                mid: 0,
+                from: p[1].to_string(),
+                mode: p[2].to_string(),
+                ts,
+                seconds,
+                file: e.path().to_string_lossy().to_string(),
+                ..Clip::empty()
+            });
+        }
+        self.clips
+            .sort_by(|a, b| b.ts.cmp(&a.ts).then(b.mid.cmp(&a.mid)));
     }
 
     // ---- 파일 보관 (texts.json / outbox.json / names.json — Python판과 같은 자리) ----
@@ -1204,6 +1443,7 @@ impl Clip {
             mime: String::new(),
             thumb: false,
             expired: false,
+            file: String::new(),
         }
     }
 }
@@ -1386,6 +1626,56 @@ mod tests {
         assert_eq!(s.unread_count(&room), 0);
         s.mark_seen(8, false);
         assert!(!s.outgoing.iter().any(|o| o["type"] == "seen")); // 이미 읽음 처리됨 → 다시 안 보냄
+    }
+
+    #[test]
+    fn voice_clip_saved_and_autoplayed_at_home() {
+        let mut s = State::for_test("아빠");
+        s.connected = true;
+        s.where_ = Some("home".into());
+        s.on_message(&json!({"type":"clip","id":9,"mid":40,"from":"엄마","mode":"direct","ts":1700000000,"seconds":0.5}));
+        let mut data = vec![2u8, 0, 0, 0, 9];
+        data.extend(vec![0u8; 16000]);
+        s.on_binary(&data);
+        let c = s
+            .clips
+            .iter()
+            .find(|c| c.kind == Kind::Clip)
+            .expect("음성 보관")
+            .clone();
+        assert!(std::path::Path::new(&c.file).exists());
+        assert!(s.is_playing(9));
+        assert!(s
+            .outgoing
+            .iter()
+            .any(|o| o["type"] == "clip_ack" && o["id"] == 9));
+        assert!(s
+            .outgoing
+            .iter()
+            .any(|o| o["type"] == "seen" && o["mid"] == 40));
+        assert!(matches!(s.sounds.last(), Some(Sound::PlayFile(_))));
+        assert!(matches!(
+            s.notices.last(),
+            Some(Notice::Clip { auto: true, .. })
+        ));
+        // 실시간 소리는 누가 말하는 중일 때만 틀음
+        s.sounds.clear();
+        s.on_binary(&[1u8, 0, 0]);
+        assert!(s.sounds.is_empty());
+        s.on_message(&json!({"type":"incoming","from":"첫째","mode":"all"}));
+        assert!(!s.is_playing(9)); // 받는 중엔 재생 멈춤
+        s.on_binary(&[1u8, 0, 0]);
+        assert!(matches!(s.sounds.last(), Some(Sound::Live(_))));
+        // 말하기 허락 → 마이크 켜기, 끝 → 끄기
+        s.on_message(&json!({"type":"incoming_end","from":"첫째"}));
+        s.select_room("엄마");
+        s.start_talk();
+        assert!(s.requesting);
+        s.on_message(&json!({"type":"talk_granted","to":["엄마"]}));
+        assert!(s.talking && s.mic_wanted);
+        s.on_message(&json!({"type":"talk_stopped","reason":"too_long"}));
+        assert!(!s.talking && !s.mic_wanted);
+        let _ = std::fs::remove_file(&c.file);
     }
 
     #[test]

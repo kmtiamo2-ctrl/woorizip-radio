@@ -17,21 +17,26 @@ pub enum Event {
     },
     Welcome(Welcome),
     Message(serde_json::Value),
+    /// 소리 조각 (첫 바이트: 1=실시간, 2=보관 음성)
+    Binary(Vec<u8>),
 }
 
 pub struct Connection {
     stop: tokio::sync::watch::Sender<bool>,
     pub outgoing: mpsc::Sender<serde_json::Value>,
+    pub outgoing_bin: mpsc::Sender<Vec<u8>>,
 }
 
 impl Connection {
     pub fn spawn(cfg: Arc<Config>, events: mpsc::Sender<Event>) -> Connection {
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
         let (out_tx, out_rx) = mpsc::channel::<serde_json::Value>(64);
-        tokio::spawn(run(cfg, events, out_rx, stop_rx));
+        let (bin_tx, bin_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(run(cfg, events, out_rx, bin_rx, stop_rx));
         Connection {
             stop,
             outgoing: out_tx,
+            outgoing_bin: bin_tx,
         }
     }
 
@@ -44,6 +49,7 @@ async fn run(
     cfg: Arc<Config>,
     events: mpsc::Sender<Event>,
     mut out_rx: mpsc::Receiver<serde_json::Value>,
+    mut bin_rx: mpsc::Receiver<Vec<u8>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut backoff = Duration::from_secs(2);
@@ -84,7 +90,17 @@ async fn run(
                     },
                 })
                 .await;
-            match session(&cfg, where_, &addr, &events, &mut out_rx, &mut stop).await {
+            match session(
+                &cfg,
+                where_,
+                &addr,
+                &events,
+                &mut out_rx,
+                &mut bin_rx,
+                &mut stop,
+            )
+            .await
+            {
                 Ok(()) => {
                     backoff = Duration::from_secs(2);
                     was_connected = true;
@@ -131,6 +147,7 @@ async fn session(
     addr: &str,
     events: &mpsc::Sender<Event>,
     out_rx: &mut mpsc::Receiver<serde_json::Value>,
+    bin_rx: &mut mpsc::Receiver<Vec<u8>>,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), SessionEnd> {
     let url = ws_url(addr);
@@ -170,11 +187,15 @@ async fn session(
             Some(v) = out_rx.recv() => {
                 if sink.send(Message::Text(v.to_string())).await.is_err() { return if connected { Ok(()) } else { Err(SessionEnd::Net("보내기 실패".into())) }; }
             }
+            Some(b) = bin_rx.recv() => {
+                if sink.send(Message::Binary(b)).await.is_err() { return if connected { Ok(()) } else { Err(SessionEnd::Net("보내기 실패".into())) }; }
+            }
             m = stream.next() => {
                 let m = match m { Some(Ok(m)) => m, _ => return if connected { Ok(()) } else { Err(SessionEnd::Net("연결이 끊겼어요".into())) } };
                 last_rx = tokio::time::Instant::now();
                 let text = match m {
                     Message::Text(t) => t,
+                    Message::Binary(b) => { let _ = events.send(Event::Binary(b)).await; continue; }
                     Message::Ping(p) => { let _ = sink.send(Message::Pong(p)).await; continue; }
                     Message::Close(_) => return if connected { Ok(()) } else { Err(SessionEnd::Net("서버가 연결을 닫았어요".into())) },
                     _ => continue,

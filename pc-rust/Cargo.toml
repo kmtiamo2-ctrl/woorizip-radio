@@ -17,6 +17,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hostname = "0.4"
 eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
+[target.'cfg(windows)'.dependencies]
+cpal = "0.16"
+
 [profile.release]
 opt-level = "s"
 lto = true

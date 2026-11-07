@@ -8,6 +8,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod config;
 mod log;
 mod net;
@@ -56,6 +57,7 @@ fn main() -> anyhow::Result<()> {
                         } => s.on_state(connected, where_, status),
                         net::Event::Welcome(w) => s.on_welcome(&w),
                         net::Event::Message(v) => s.on_message(&v),
+                        net::Event::Binary(b) => s.on_binary(&b),
                     }
                     pump(&mut s, &out_tx);
                 }
@@ -64,6 +66,59 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // 소리: 전용 스레드가 상태를 20ms 마다 보며 스피커·마이크를 다룸
+    {
+        let state = state.clone();
+        let bin_tx = conn.outgoing_bin.clone();
+        let out_tx = out_tx.clone();
+        std::thread::Builder::new()
+            .name("audio".into())
+            .spawn(move || {
+                let mut audio = audio::Audio::new();
+                if let Some(e) = &audio.error {
+                    log::info(e);
+                    state.lock().unwrap().notice = e.clone();
+                }
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let (sounds, mic_wanted, mic_failed) = {
+                        let mut s = state.lock().unwrap();
+                        s.tick();
+                        let sounds = std::mem::take(&mut s.sounds);
+                        (sounds, s.mic_wanted, false)
+                    };
+                    let _ = mic_failed;
+                    for snd in sounds {
+                        match snd {
+                            state::Sound::Live(b) => audio.play_live(&b),
+                            state::Sound::BeepIn => audio.effect(&audio::beep_in()),
+                            state::Sound::BeepOk => audio.effect(&audio::beep_ok()),
+                            state::Sound::BeepNo => audio.effect(&audio::beep_no()),
+                            state::Sound::Stop => audio.stop_playback(),
+                            state::Sound::PlayFile(p) => match std::fs::read(&p) {
+                                Ok(b) => audio.play_all(&audio::bytes_to_i16(&b)),
+                                Err(e) => log::info(&format!("소리 파일 읽기 실패 {p}: {e}")),
+                            },
+                        }
+                    }
+                    if mic_wanted && !audio.mic_on() {
+                        let tx = bin_tx.clone();
+                        let ok = audio.start_mic(Box::new(move |frame| {
+                            let _ = tx.try_send(frame); // 밀리면 조각을 버림 (실시간이라 기다리지 않음)
+                        }));
+                        if !ok {
+                            let mut s = state.lock().unwrap();
+                            s.mic_failed();
+                            pump(&mut s, &out_tx);
+                        }
+                    } else if !mic_wanted && audio.mic_on() {
+                        audio.stop_mic();
+                    }
+                }
+            })
+            .expect("audio thread");
     }
 
     if headless {

@@ -98,12 +98,8 @@ fn main() -> anyhow::Result<()> {
     if just_updated {
         state.lock().unwrap().notice = format!("새 버전 {}으로 업데이트됐어요", update::version());
     }
-    // 자동 실행이 켜져 있어야 하는데(기본) 등록이 빠져 있으면 켤 때마다 채워 넣음 (설치본일 때만)
-    if cfg!(windows)
-        && !headless
-        && cfg.autostart
-        && platform::is_installed_copy()
-        && !platform::autostart_enabled()
+    // Windows 시작 시 자동 실행은 항상 켜 둠(설정에 끄는 항목 없음 — 아이들이 실수로 끄지 못하게). 켤 때마다 등록을 확인·보정
+    if cfg!(windows) && !headless && platform::is_installed_copy() && !platform::autostart_enabled()
     {
         match platform::set_autostart(true) {
             Ok(()) => log::info("Windows 시작 시 자동 실행 등록"),

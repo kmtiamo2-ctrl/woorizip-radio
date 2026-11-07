@@ -610,7 +610,6 @@ impl App {
         d.hotkey = s.cfg.hotkey.clone();
         d.quick = s.cfg.quick.clone();
         d.groups = s.cfg.groups.clone();
-        d.autostart = crate::platform::autostart_enabled();
     }
 
     pub(super) fn draw_settings(&mut self, ctx: &egui::Context) {
@@ -657,9 +656,6 @@ impl App {
                                     .hint_text("아이들=첫째,둘째,셋째")
                                     .desired_width(240.0),
                             );
-                            ui.end_row();
-                            ui.label("자동 실행");
-                            ui.checkbox(&mut d.autostart, "Windows 시작할 때 켜기");
                             ui.end_row();
                         });
                     ui.separator();
@@ -819,7 +815,6 @@ impl App {
             s.cfg.hotkey = d.hotkey.trim().to_string();
             s.cfg.quick = d.quick.trim().to_string();
             s.cfg.groups = d.groups.trim().to_string();
-            s.cfg.autostart = d.autostart;
             if d.unlocked {
                 if !d.name.trim().is_empty() {
                     s.cfg.name = d.name.trim().to_string();
@@ -849,9 +844,6 @@ impl App {
             (before != after, s.cfg.hotkey.clone())
         };
         let _ = self.inputs.hotkey_tx.send(hotkey);
-        if let Err(e) = crate::platform::set_autostart(d.autostart) {
-            crate::log::info(&format!("자동 실행 설정 실패: {e}"));
-        }
         if changed_conn {
             let cfg = self.state.lock().unwrap().cfg.clone();
             (self.reconfigure)(cfg);
@@ -903,10 +895,8 @@ impl App {
                 }
                 s.cfg.clone()
             };
-            if cfg.autostart {
-                if let Err(e) = crate::platform::set_autostart(true) {
-                    crate::log::info(&format!("자동 실행 설정 실패: {e}"));
-                }
+            if let Err(e) = crate::platform::set_autostart(true) {
+                crate::log::info(&format!("자동 실행 설정 실패: {e}"));
             }
             (self.reconfigure)(cfg);
             self.extra.setup_open = false;

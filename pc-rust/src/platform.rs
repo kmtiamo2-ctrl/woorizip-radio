@@ -358,10 +358,8 @@ pub fn install_self(args: &[String]) -> Result<bool, String> {
     let legacy = root.join("WoorizipRadio.exe"); // 아주 예전 한 파일 설치본
     let _ = std::fs::remove_file(legacy);
     // 3) 자동 실행 등록이 있었으면 설치본을 가리키게 갱신, 시작 메뉴 항목
-    // 자동 실행: 설정에서 끄지 않았으면(기본 켜짐) 설치하면서 바로 등록 — 설치본 경로로
-    if crate::config::Config::load().autostart {
-        let _ = set_autostart(true);
-    }
+    // 자동 실행: 설치하면서 바로 등록 (항상 켜 둠) — 설치본 경로로
+    let _ = set_autostart(true);
     std::thread::spawn(|| {
         let _ = make_shortcut(ShortcutWhere::StartMenu);
     });

@@ -1,9 +1,13 @@
 //! 창 화면 (egui). Python판 창과 같은 구성 — 상태 줄 / 방 버튼 3줄 격자 / 말하기 버튼(1/3 높이) / 대화 말풍선 / 입력줄.
+use crate::hotkey::HotkeyEvent;
+use crate::platform::Request;
 use crate::state::{josa, member_style, Clip, Kind, Notice, Room, State};
+use crate::tray::{Tray, TrayEvent};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke,
     Vec2,
 };
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 // 색 (Python판과 같음)
@@ -30,9 +34,40 @@ pub fn blend(fg: Color32, bg: Color32, a: f32) -> Color32 {
 
 pub type Shared = Arc<Mutex<State>>;
 
+/// 오른쪽 아래 작은 팝업 (가족이 말하거나 글을 보냈을 때)
+struct Popup {
+    title: String,
+    text: String,
+    color: Color32,
+    reply_to: Option<String>,
+    clip_id: Option<i64>,
+    deadline: f64,
+    created: f64,
+    replying: bool,
+    reply_text: String,
+    last_active: f64,
+}
+
+/// 창 밖에서 들어오는 것들 (트레이·두 번째 실행·전역 단축키)
+pub struct Inputs {
+    pub requests: Option<mpsc::Receiver<Request>>,
+    pub hotkey_rx: mpsc::Receiver<HotkeyEvent>,
+    pub hotkey_tx: mpsc::Sender<String>,
+    pub start_minimized: bool,
+}
+
 pub struct App {
     pub state: Shared,
     pub pump: Box<dyn Fn(&mut State) + Send>, // state.outgoing → 서버
+    inputs: Inputs,
+    tray: Tray,
+    visible: bool,
+    allow_close: bool,
+    ask_quit: bool,
+    quit_pw: String,
+    quit_err: String,
+    popup: Option<Popup>,
+    hotkey_down: bool,
     input: String,
     shown_count: usize,
     shown_room: String,
@@ -48,8 +83,15 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         state: Shared,
         pump: Box<dyn Fn(&mut State) + Send>,
+        inputs: Inputs,
     ) -> App {
         install_fonts(&cc.egui_ctx);
+        let tray = Tray::new();
+        let start_min = inputs.start_minimized;
+        if start_min {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BG;
@@ -72,6 +114,15 @@ impl App {
         App {
             state,
             pump,
+            inputs,
+            tray,
+            visible: !start_min,
+            allow_close: false,
+            ask_quit: false,
+            quit_pw: String::new(),
+            quit_err: String::new(),
+            popup: None,
+            hotkey_down: false,
             input: String::new(),
             shown_count: 40,
             shown_room: String::new(),
@@ -164,22 +215,123 @@ pub fn human_size(n: i64) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 알림 처리 (팝업·깜빡임은 4일차 트레이와 함께; 지금은 창 제목 깜빡임만)
-        let notices: Vec<Notice> = self.with_state(|s| std::mem::take(&mut s.notices));
-        for n in notices {
-            match n {
-                Notice::Text(_)
-                | Notice::FileIn(_)
-                | Notice::Incoming { .. }
-                | Notice::Clip { .. } => {
-                    self.flash_until = ctx.input(|i| i.time) + 1.5;
-                }
-                Notice::Schedules => {}
+        // 창이 숨겨져 있어도 트레이·단축키·팝업을 돌보려면 가끔 깨어나야 함
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        let now = ctx.input(|i| i.time);
+
+        // ---- 창 닫기(X) = 숨기기. 완전히 끄려면 트레이 메뉴에서 가족 암호 ----
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide(ctx);
+        }
+        // ---- 트레이·두 번째 실행·전역 단축키 ----
+        for ev in self.tray.poll() {
+            match ev {
+                TrayEvent::Open => self.show(ctx),
+                TrayEvent::Quit => self.begin_quit(ctx),
             }
         }
-        if ctx.input(|i| i.time) < self.flash_until {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        let mut reqs = vec![];
+        if let Some(rx) = &self.inputs.requests {
+            while let Ok(r) = rx.try_recv() {
+                reqs.push(r);
+            }
         }
+        for r in reqs {
+            match r {
+                Request::Show => self.show(ctx),
+                Request::Quit => self.begin_quit(ctx),
+            }
+        }
+        while let Ok(h) = self.inputs.hotkey_rx.try_recv() {
+            match h {
+                HotkeyEvent::Down if !self.hotkey_down => {
+                    self.hotkey_down = true;
+                    self.with_state(|s| s.start_talk());
+                }
+                HotkeyEvent::Up => {
+                    self.hotkey_down = false;
+                    self.with_state(|s| s.stop_talk());
+                }
+                _ => {}
+            }
+        }
+        let connected_now = self.with_state(|s| s.connected);
+        self.tray.set_connected(connected_now);
+
+        // ---- 알림 → 팝업 + 창 깜빡임 ----
+        let notices: Vec<Notice> = self.with_state(|s| std::mem::take(&mut s.notices));
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        for n in notices {
+            let (title, text, who, clip_id, secs) = match &n {
+                Notice::Incoming { from, mode } => {
+                    let d = self.with_state(|s| s.disp(from).to_string());
+                    (
+                        format!("{} {}가 말해요", member_style(from).0, d),
+                        if mode == "all" {
+                            "전체 방송".to_string()
+                        } else {
+                            "나에게".to_string()
+                        },
+                        Some(from.clone()),
+                        None,
+                        8.0,
+                    )
+                }
+                Notice::Text(c) => {
+                    let t = self.with_state(|s| s.clip_title(c));
+                    (
+                        format!("💬 {t}"),
+                        c.text.clone(),
+                        Some(c.from.clone()),
+                        None,
+                        5.0,
+                    )
+                }
+                Notice::FileIn(c) => {
+                    let t = self.with_state(|s| s.clip_title(c));
+                    (
+                        format!("📎 {t}"),
+                        format!("{} ({})", c.name, human_size(c.size)),
+                        Some(c.from.clone()),
+                        None,
+                        5.0,
+                    )
+                }
+                Notice::Clip { clip, auto } => {
+                    let t = self.with_state(|s| s.clip_title(clip));
+                    (
+                        format!("🔊 {t}"),
+                        format!(
+                            "{}초 · {}",
+                            (clip.seconds as i64).max(1),
+                            if *auto {
+                                "방금 재생했어요"
+                            } else {
+                                "[듣기]를 누르세요"
+                            }
+                        ),
+                        Some(clip.from.clone()),
+                        Some(clip.id),
+                        5.0,
+                    )
+                }
+                Notice::Schedules => continue,
+            };
+            if !focused || !self.visible {
+                let color = who
+                    .as_deref()
+                    .map(|w| rgb(member_style(w).1))
+                    .unwrap_or(AMBER);
+                self.show_popup(now, title, text, color, who, clip_id, secs);
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+            }
+            self.flash_until = now + 1.5;
+        }
+        self.draw_popup(ctx, now);
+        self.draw_quit_dialog(ctx);
 
         let (room, connected, status, me, online_n, where_, notice, talking, requesting, incoming) =
             self.with_state(|s| {
@@ -418,6 +570,14 @@ impl eframe::App for App {
                 }
                 if !notice.is_empty() {
                     ui.label(RichText::new(&notice).color(SUB).size(11.5));
+                } else {
+                    let hk = self.with_state(|s| s.cfg.hotkey.trim().to_uppercase());
+                    let t = if hk.is_empty() {
+                        "단축키 없음 · 설정에서 정하면 다른 창에서도 말할 수 있어요".to_string()
+                    } else {
+                        format!("[{hk}] 누르고 있는 동안 말하기 · 다른 창에서도")
+                    };
+                    ui.label(RichText::new(t).color(SUB).size(11.0));
                 }
                 ui.add_space(4.0);
 
@@ -916,4 +1076,264 @@ fn disp_list_simple(s: &str, disp: &dyn Fn(&str) -> String) -> String {
         .map(disp)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+impl App {
+    fn show(&mut self, ctx: &egui::Context) {
+        self.visible = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn hide(&mut self, ctx: &egui::Context) {
+        self.visible = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    /// 완전히 종료: 아이들이 함부로 끄지 못하게 가족 암호를 물음
+    fn begin_quit(&mut self, ctx: &egui::Context) {
+        self.show(ctx);
+        self.ask_quit = true;
+        self.quit_pw.clear();
+        self.quit_err.clear();
+    }
+
+    fn draw_quit_dialog(&mut self, ctx: &egui::Context) {
+        if !self.ask_quit {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("quit")).show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.label(RichText::new("완전히 종료").strong().size(16.0));
+            ui.label(
+                RichText::new("끄면 가족의 말과 글을 받지 못해요. 가족 암호를 입력하세요.")
+                    .color(SUB)
+                    .size(12.0),
+            );
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.quit_pw)
+                    .password(true)
+                    .desired_width(f32::INFINITY),
+            );
+            r.request_focus();
+            if !self.quit_err.is_empty() {
+                ui.label(RichText::new(&self.quit_err).color(RED).size(12.0));
+            }
+            ui.horizontal(|ui| {
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("종료").clicked() || enter {
+                    let ok = self.with_state(|s| s.cfg.key == self.quit_pw.trim());
+                    if ok {
+                        crate::log::info("사용자가 완전히 종료");
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        self.quit_err = "암호가 달라요".into();
+                        self.quit_pw.clear();
+                    }
+                }
+                if ui.button("취소").clicked() {
+                    self.ask_quit = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.ask_quit = false;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn show_popup(
+        &mut self,
+        now: f64,
+        title: String,
+        text: String,
+        color: Color32,
+        reply_to: Option<String>,
+        clip_id: Option<i64>,
+        secs: f64,
+    ) {
+        if let Some(p) = &self.popup {
+            if p.replying {
+                return; // 답장을 쓰는 중이면 팝업을 바꾸지 않음 (새 메시지는 목록에 있음)
+            }
+        }
+        self.popup = Some(Popup {
+            title,
+            text,
+            color,
+            reply_to,
+            clip_id,
+            deadline: now + secs,
+            created: now,
+            replying: false,
+            reply_text: String::new(),
+            last_active: now,
+        });
+    }
+
+    /// 오른쪽 아래 작은 창. 닫히는 규칙: 기본 몇 초 뒤 / 마우스가 위에 있으면 조금 더(최대 20초) / 답장 중엔 1분 동안 입력이 없으면
+    fn draw_popup(&mut self, ctx: &egui::Context, now: f64) {
+        let Some(p) = &mut self.popup else { return };
+        let hovered = ctx.input(|i| i.pointer.hover_pos().is_some());
+        let keep = if p.replying {
+            now - p.last_active <= 60.0
+        } else {
+            (now <= p.deadline) || (hovered && now - p.created < 20.0)
+        };
+        if !keep {
+            self.popup = None;
+            return;
+        }
+        let (mw, mh) = ctx.input(|i| {
+            i.viewport()
+                .monitor_size
+                .map(|v| (v.x, v.y))
+                .unwrap_or((1280.0, 720.0))
+        });
+        let (w, h) = (330.0, if p.replying { 150.0 } else { 104.0 });
+        let id = egui::ViewportId::from_hash_of("popup");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("우리집 알림")
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_resizable(false)
+            .with_inner_size([w, h])
+            .with_position([mw - w - 16.0, mh - h - 60.0]);
+        let state = self.state.clone();
+        let mut close = false;
+        let mut open_main = false;
+        let mut action: Option<(String, String)> = None; // (답장 받을 사람, 글)
+        let mut play: Option<i64> = None;
+        let color = p.color;
+        let title = p.title.clone();
+        let text = p.text.clone();
+        let reply_to = p.reply_to.clone();
+        let clip_id = p.clip_id;
+        let mut replying = p.replying;
+        let mut reply_text = std::mem::take(&mut p.reply_text);
+        let mut touched = false;
+        let quick: Vec<String> = state.lock().unwrap().quick_replies.clone();
+        ctx.show_viewport_immediate(id, builder, |ctx, _| {
+            egui::CentralPanel::default()
+                .frame(Frame::NONE.fill(color).inner_margin(Margin::same(2)))
+                .show(ctx, |ui| {
+                    Frame::NONE
+                        .fill(CARD)
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_min_height(ui.available_height());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&title).color(color).strong().size(13.0));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.add(small_btn("×", false)).clicked() {
+                                        close = true;
+                                    }
+                                });
+                            });
+                            ui.label(RichText::new(&text).size(13.0));
+                            if replying {
+                                ui.horizontal_wrapped(|ui| {
+                                    for q in &quick {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(RichText::new(q).size(11.0))
+                                                    .fill(CARD2)
+                                                    .corner_radius(CornerRadius::same(10)),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some((
+                                                reply_to.clone().unwrap_or_default(),
+                                                q.clone(),
+                                            ));
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(&mut reply_text)
+                                            .hint_text("답장…")
+                                            .desired_width(ui.available_width() - 60.0),
+                                    );
+                                    if r.changed() {
+                                        touched = true;
+                                    }
+                                    r.request_focus();
+                                    let enter = r.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    if (ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("보내기").color(ON_DARK),
+                                            )
+                                            .fill(color),
+                                        )
+                                        .clicked()
+                                        || enter)
+                                        && !reply_text.trim().is_empty()
+                                    {
+                                        action = Some((
+                                            reply_to.clone().unwrap_or_default(),
+                                            reply_text.clone(),
+                                        ));
+                                    }
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    if let Some(cid) = clip_id {
+                                        if ui.add(small_btn("▶ 듣기", true)).clicked() {
+                                            play = Some(cid);
+                                        }
+                                    }
+                                    if reply_to.is_some()
+                                        && ui.add(small_btn("답장", false)).clicked()
+                                    {
+                                        replying = true;
+                                        touched = true;
+                                    }
+                                    if ui.add(small_btn("열기", false)).clicked() {
+                                        open_main = true;
+                                    }
+                                });
+                            }
+                        });
+                });
+            if ctx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+        });
+        if let Some(p) = &mut self.popup {
+            p.replying = replying;
+            p.reply_text = reply_text;
+            if touched {
+                p.last_active = now;
+            }
+        }
+        if let Some(cid) = play {
+            self.with_state(|s| s.play_clip(cid));
+        }
+        if let Some((to, text)) = action {
+            let to_json = if to.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!([to]))
+            };
+            self.with_state(|s| {
+                s.send_text(&text, to_json);
+            });
+            close = true;
+        }
+        if open_main {
+            self.show(ctx);
+            close = true;
+        }
+        if close {
+            self.popup = None;
+        }
+    }
 }

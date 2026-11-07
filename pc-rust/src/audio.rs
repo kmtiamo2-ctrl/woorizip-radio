@@ -173,8 +173,10 @@ pub fn to_mono(input: &[i16], channels: usize) -> Vec<i16> {
 }
 
 pub fn bytes_to_i16(b: &[u8]) -> Vec<i16> {
-    b.chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+    b.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
         .collect()
 }
 pub fn i16_to_bytes(v: &[i16]) -> Vec<u8> {

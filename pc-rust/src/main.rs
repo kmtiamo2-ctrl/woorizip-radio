@@ -10,10 +10,13 @@
 mod app;
 mod audio;
 mod config;
+mod hotkey;
 mod log;
 mod net;
+mod platform;
 mod proto;
 mod state;
+mod tray;
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +31,19 @@ fn main() -> anyhow::Result<()> {
         log::info("설정에 NAS 주소·이름·암호가 없어요 — Python판 설정 창에서 먼저 저장해 주세요 (Rust판 설정 창은 5일차)");
     }
     let headless = std::env::args().any(|a| a == "--headless"); // 창 없이 연결만 (점검용)
+    let start_minimized = std::env::args().any(|a| a == "--minimized");
+    // 하나만 실행: 이미 떠 있으면 그 창을 앞으로 보내고 끝
+    let guard = if headless {
+        None
+    } else {
+        match platform::single_instance() {
+            Some(g) => Some(g),
+            None => {
+                log::info("이미 실행 중 → 그 창을 열어 달라고 보냄");
+                return Ok(());
+            }
+        }
+    };
     let state: app::Shared = Arc::new(Mutex::new(state::State::new(cfg.clone())));
 
     // 통신: 별도 스레드의 tokio 런타임
@@ -135,6 +151,17 @@ fn main() -> anyhow::Result<()> {
             .with_min_inner_size([360.0, 560.0]),
         ..Default::default()
     };
+    // 전역 단축키 (설정이 바뀌면 hk_spec_tx 로 새 값을 보냄)
+    let (hk_tx, hk_rx) = std::sync::mpsc::channel::<hotkey::HotkeyEvent>();
+    let (hk_spec_tx, hk_spec_rx) = std::sync::mpsc::channel::<String>();
+    let initial_hotkey = state.lock().unwrap().cfg.hotkey.clone();
+    hotkey::start(hk_spec_rx, initial_hotkey, hk_tx);
+    let inputs = app::Inputs {
+        requests: guard.map(|g| g.requests),
+        hotkey_rx: hk_rx,
+        hotkey_tx: hk_spec_tx,
+        start_minimized,
+    };
     let st = state.clone();
     let pump_box: Box<dyn Fn(&mut state::State) + Send> = Box::new(move |s| pump(s, &out_tx));
     eframe::run_native(
@@ -142,7 +169,7 @@ fn main() -> anyhow::Result<()> {
         opts,
         Box::new(move |cc| {
             *repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(cc, st, pump_box)))
+            Ok(Box::new(app::App::new(cc, st, pump_box, inputs)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("창 열기 실패: {e}"))?;

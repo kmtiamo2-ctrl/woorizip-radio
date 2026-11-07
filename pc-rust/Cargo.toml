@@ -19,6 +19,10 @@ eframe = { version = "0.32", default-features = false, features = ["glow", "defa
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.16"
+tray-icon = "0.21"
+rdev = "0.5"
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [profile.release]
 opt-level = "s"

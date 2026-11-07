@@ -1,57 +1,105 @@
-//! 우리집 PC 프로그램 (Rust판) — 1일차: 뼈대·설정 읽기·NAS 연결/재연결(집→밖)·기록.
+//! 우리집 PC 프로그램 (Rust판).
 //!
 //! 설정 파일과 기록 파일은 Python판과 같은 자리(`%APPDATA%\WoorizipRadio\`)를 그대로 써서,
 //! 바꿔 끼워도 가족 설정이 유지됩니다.
+//!
+//! 구성: `net`(NAS 연결, tokio) → `state`(상태·대화 자료) ← `app`(egui 창). 통신은 뒤 스레드, 화면은 앞 스레드.
+#![allow(dead_code)] // 다음 날들에 쓸 함수·필드를 미리 둠
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-#![allow(dead_code)] // 1일차: 다음 날들에 쓸 함수·필드를 미리 둠
-
+mod app;
 mod config;
 mod log;
 mod net;
 mod proto;
+mod state;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     log::init();
     log::info(&format!(
         "우리집 PC(Rust) 시작 v{}",
         env!("CARGO_PKG_VERSION")
     ));
-    let cfg = Arc::new(config::Config::load());
+    let cfg = config::Config::load();
     if !cfg.configured() {
-        log::info("설정에 NAS 주소·이름·암호가 없어요 — Python판 설정 창에서 먼저 저장해 주세요 (Rust판 설정 창은 다음 단계)");
+        log::info("설정에 NAS 주소·이름·암호가 없어요 — Python판 설정 창에서 먼저 저장해 주세요 (Rust판 설정 창은 5일차)");
     }
-    // 서버에서 오는 메시지를 받는 쪽. 1일차는 기록만 남기고, 화면·소리는 다음 날들에 붙임
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<net::Event>(256);
-    let conn = net::Connection::spawn(cfg.clone(), tx);
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            net::Event::State {
-                connected,
-                where_,
-                status,
-            } => {
-                log::info(&format!(
-                    "상태: {} {}",
-                    if connected { "연결됨" } else { "끊김" },
-                    status
-                ));
-                if let Some(w) = where_ {
-                    log::info(&format!("위치: {}", if w == "home" { "집" } else { "밖" }));
+    let headless = std::env::args().any(|a| a == "--headless"); // 창 없이 연결만 (점검용)
+    let state: app::Shared = Arc::new(Mutex::new(state::State::new(cfg.clone())));
+
+    // 통신: 별도 스레드의 tokio 런타임
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<net::Event>(256);
+    let conn = rt.block_on(async { net::Connection::spawn(Arc::new(cfg), ev_tx) });
+    let out_tx = conn.outgoing.clone();
+    let repaint: Arc<Mutex<Option<eframe::egui::Context>>> = Arc::new(Mutex::new(None));
+
+    // 서버 → 상태 적용 → 화면 다시 그리기
+    {
+        let state = state.clone();
+        let out_tx = out_tx.clone();
+        let repaint = repaint.clone();
+        rt.spawn(async move {
+            while let Some(ev) = ev_rx.recv().await {
+                {
+                    let mut s = state.lock().unwrap();
+                    match ev {
+                        net::Event::State {
+                            connected,
+                            where_,
+                            status,
+                        } => s.on_state(connected, where_, status),
+                        net::Event::Welcome(w) => s.on_welcome(&w),
+                        net::Event::Message(v) => s.on_message(&v),
+                    }
+                    pump(&mut s, &out_tx);
+                }
+                if let Some(ctx) = repaint.lock().unwrap().as_ref() {
+                    ctx.request_repaint();
                 }
             }
-            net::Event::Welcome(w) => log::info(&format!(
-                "환영: 나={} 가족={:?} 이름표={:?}",
-                w.you, w.members, w.names
-            )),
-            net::Event::Message(v) => {
-                let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("?");
-                log::info(&format!("받음: {}", t));
-            }
+        });
+    }
+
+    if headless {
+        log::info("창 없이 연결 점검 모드");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
+
+    let opts = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("우리집")
+            .with_inner_size([440.0, 760.0])
+            .with_min_inner_size([360.0, 560.0]),
+        ..Default::default()
+    };
+    let st = state.clone();
+    let pump_box: Box<dyn Fn(&mut state::State) + Send> = Box::new(move |s| pump(s, &out_tx));
+    eframe::run_native(
+        "woorizip",
+        opts,
+        Box::new(move |cc| {
+            *repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
+            Ok(Box::new(app::App::new(cc, st, pump_box)))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("창 열기 실패: {e}"))?;
     conn.stop();
     Ok(())
+}
+
+/// 상태에 쌓인 보낼 것(outgoing)을 통신 쪽으로 넘김
+fn pump(s: &mut state::State, out_tx: &tokio::sync::mpsc::Sender<serde_json::Value>) {
+    for v in s.outgoing.drain(..) {
+        if out_tx.try_send(v).is_err() {
+            log::info("보내기 대기열이 가득 찼어요");
+        }
+    }
 }

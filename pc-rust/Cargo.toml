@@ -15,6 +15,7 @@ serde_json = "1"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hostname = "0.4"
+eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
 [profile.release]
 opt-level = "s"

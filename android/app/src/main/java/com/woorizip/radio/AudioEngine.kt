@@ -167,9 +167,50 @@ object Feedback {
         vibrate(ctx, longArrayOf(0, 80, 100, 80))
     }
 
-    /** 방송 들어옴 알림음 */
+    /** 방송 들어옴 알림음: 둥근 '삐' (880Hz, 0.14초) */
     fun incoming() {
-        tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+        play(SOFT_BEEP)
+    }
+
+    /** 글·사진이 왔을 때: '톡톡' 두 번 (카톡처럼 짧은 신호음, 읽어 주기 전에 먼저 남) */
+    fun chime() {
+        play(TOKTOK)
+    }
+
+    private const val SR = 16000
+    private fun note(freq: Double, ms: Int, decay: Double, vol: Double = 0.6, harm2: Double = 0.3): ShortArray {
+        val n = SR * ms / 1000
+        return ShortArray(n) { i ->
+            val t = i.toDouble() / SR
+            val a = minOf(1.0, t / 0.008) * Math.exp(-t / decay)
+            val s = Math.sin(2 * Math.PI * freq * t) + harm2 * Math.sin(2 * Math.PI * freq * 2 * t)
+            (32767 * vol * a * s / (1 + harm2)).toInt().coerceIn(-32768, 32767).toShort()
+        }
+    }
+    private fun seq(vararg parts: Pair<Int, ShortArray>): ShortArray {   // (시작 ms, 소리)
+        val len = parts.maxOf { (off, p) -> SR * off / 1000 + p.size }
+        val out = IntArray(len)
+        for ((off, p) in parts) { val o = SR * off / 1000; for (i in p.indices) out[o + i] += p[i].toInt() }
+        return ShortArray(len) { out[it].coerceIn(-32768, 32767).toShort() }
+    }
+    private val TOKTOK: ShortArray by lazy { seq(0 to note(784.0, 120, 0.05), 150 to note(784.0, 160, 0.07)) }
+    private val SOFT_BEEP: ShortArray by lazy { note(880.0, 140, 0.06, harm2 = 0.15) }
+
+    private fun play(pcm: ShortArray) {
+        try {
+            val attrs = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
+            val fmt = AudioFormat.Builder().setSampleRate(SR).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
+            val track = AudioTrack(attrs, fmt, pcm.size * 2, AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE)
+            track.write(pcm, 0, pcm.size)
+            track.setNotificationMarkerPosition(pcm.size)
+            track.setPlaybackPositionUpdateListener(object : AudioTrack.OnPlaybackPositionUpdateListener {
+                override fun onMarkerReached(t: AudioTrack) { try { t.release() } catch (_: Exception) {} }
+                override fun onPeriodicNotification(t: AudioTrack) {}
+            })
+            track.play()
+        } catch (_: Exception) {
+            tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+        }
     }
 
     fun vibrate(ctx: Context, pattern: LongArray) {

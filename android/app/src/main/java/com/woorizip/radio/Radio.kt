@@ -483,8 +483,9 @@ object Radio : RadioClient.Listener {
     private fun speakText(from: String, text: String): Boolean {
         val am = app.getSystemService(AudioManager::class.java)
         if (am.ringerMode != AudioManager.RINGER_MODE_NORMAL || !ttsReady || incomingFrom != null || talking) return false
-        Feedback.incoming()
-        tts?.speak("$from: $text", TextToSpeech.QUEUE_ADD, null, "msg${System.currentTimeMillis()}")
+        Feedback.chime()   // '톡톡' 먼저 → 잠깐 뒤에 읽어 줌 (대뜸 목소리가 나오지 않게)
+        tts?.playSilentUtterance(450, TextToSpeech.QUEUE_ADD, "gap${System.currentTimeMillis()}")
+        tts?.speak("${disp(from)}: $text", TextToSpeech.QUEUE_ADD, null, "msg${System.currentTimeMillis()}")
         return true
     }
 
@@ -510,7 +511,7 @@ object Radio : RadioClient.Listener {
         addClip(clip)
         if (Prefs(app).dnd) return
         Feedback.vibrate(app, if (atHome || isParent) longArrayOf(0, 120) else longArrayOf(0, 250, 150, 250))
-        if (atHome || isParent) Feedback.incoming()
+        if (atHome || isParent) Feedback.chime()
         Notifs.showClip(app, clip, autoPlayed = false)
     }
 

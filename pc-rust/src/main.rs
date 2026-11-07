@@ -175,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                         match snd {
                             state::Sound::Live(b) => audio.play_live(&b),
                             state::Sound::BeepIn => audio.effect(&audio::beep_in()),
+                            state::Sound::Chime => audio.effect(&audio::chime()),
                             state::Sound::BeepOk => audio.effect(&audio::beep_ok()),
                             state::Sound::BeepNo => audio.effect(&audio::beep_no()),
                             state::Sound::Stop => audio.stop_playback(),

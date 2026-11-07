@@ -17,8 +17,46 @@ pub fn tone(freq: f32, ms: u32, vol: f32) -> Vec<i16> {
         })
         .collect()
 }
+/// 한 음(둥근 종소리 느낌): 바로 켜지고 decay 초에 걸쳐 잦아듦, 2배음 조금
+pub fn note(freq: f32, ms: u32, decay: f32, vol: f32, harm2: f32) -> Vec<i16> {
+    let n = (RATE * ms / 1000) as usize;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            let a = (t / 0.008).min(1.0) * (-t / decay).exp();
+            let w = 2.0 * std::f32::consts::PI * freq * t;
+            let s = w.sin() + harm2 * (2.0 * w).sin();
+            (32767.0 * vol * a * s / (1.0 + harm2)) as i16
+        })
+        .collect()
+}
+fn seq(parts: &[(u32, Vec<i16>)]) -> Vec<i16> {
+    let len = parts
+        .iter()
+        .map(|(off, p)| (RATE * off / 1000) as usize + p.len())
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![0i32; len];
+    for (off, p) in parts {
+        let o = (RATE * off / 1000) as usize;
+        for (i, v) in p.iter().enumerate() {
+            out[o + i] += *v as i32;
+        }
+    }
+    out.into_iter()
+        .map(|v| v.clamp(-32768, 32767) as i16)
+        .collect()
+}
+/// 방송 들어옴: 둥근 '삐'
 pub fn beep_in() -> Vec<i16> {
-    tone(880.0, 150, 0.25)
+    note(880.0, 140, 0.06, 0.6, 0.15)
+}
+/// 글·사진 왔을 때: '톡톡' 두 번 (카톡처럼)
+pub fn chime() -> Vec<i16> {
+    seq(&[
+        (0, note(784.0, 120, 0.05, 0.6, 0.3)),
+        (150, note(784.0, 160, 0.07, 0.6, 0.3)),
+    ])
 }
 pub fn beep_ok() -> Vec<i16> {
     tone(1200.0, 120, 0.25)

@@ -171,6 +171,8 @@ pub enum Notice {
 pub enum Sound {
     Live(Vec<u8>),
     BeepIn,
+    /// 글·사진 알림음 (톡톡)
+    Chime,
     BeepOk,
     BeepNo,
     PlayFile(String),
@@ -797,6 +799,7 @@ impl State {
                     ..Clip::empty()
                 };
                 self.add_clip(clip.clone());
+                self.sounds.push(Sound::Chime);
                 self.notices.push(Notice::Text(clip));
             }
             "text_sent" | "text_echo" => {
@@ -860,6 +863,7 @@ impl State {
                 self.outgoing
                     .push(json!({"type": "clip_ack", "id": clip.id}));
                 self.add_clip(clip.clone());
+                self.sounds.push(Sound::Chime);
                 self.notices.push(Notice::FileIn(clip));
             }
             "file_echo" => {

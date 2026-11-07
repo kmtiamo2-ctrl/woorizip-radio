@@ -20,7 +20,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 open = "5"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 sha2 = "0.10"
-eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.32", default-features = false, features = ["glow", "wgpu", "default_fonts", "x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.16"

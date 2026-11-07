@@ -277,21 +277,61 @@ fn main() -> anyhow::Result<()> {
     let reconfigure: app::Reconfigure = Box::new(move |c| {
         let _ = cfg_tx.send(Arc::new(c));
     });
-    eframe::run_native(
-        "woorizip",
-        opts,
-        Box::new(move |cc| {
-            *repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
-            Ok(Box::new(app::App::new(
-                cc,
-                st,
-                pump_box,
-                inputs,
-                reconfigure,
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("창 열기 실패: {e}"))?;
+    // 그리기: Windows 는 wgpu(DirectX 12 — 그래픽 드라이버가 없어도 소프트웨어로 됨), 그 외는 OpenGL.
+    // 하나가 실패하면 다른 쪽으로 한 번 더 시도
+    let first = if cfg!(windows) {
+        eframe::Renderer::Wgpu
+    } else {
+        eframe::Renderer::Glow
+    };
+    let second = if cfg!(windows) {
+        eframe::Renderer::Glow
+    } else {
+        eframe::Renderer::Wgpu
+    };
+    let app_cell = Arc::new(Mutex::new(Some((st, pump_box, inputs, reconfigure))));
+    let mut last_err = String::new();
+    for renderer in [first, second] {
+        if app_cell.lock().unwrap().is_none() {
+            break; // 창이 떴다가 정상 종료됨
+        }
+        let o = eframe::NativeOptions {
+            renderer,
+            ..opts.clone()
+        };
+        let cell = app_cell.clone();
+        let rp = repaint.clone();
+        let r = eframe::run_native(
+            "woorizip",
+            o,
+            Box::new(move |cc| {
+                *rp.lock().unwrap() = Some(cc.egui_ctx.clone());
+                let (st, pump_box, inputs, reconfigure) =
+                    cell.lock().unwrap().take().expect("app once");
+                Ok(Box::new(app::App::new(
+                    cc,
+                    st,
+                    pump_box,
+                    inputs,
+                    reconfigure,
+                )))
+            }),
+        );
+        match r {
+            Ok(()) => {
+                last_err.clear();
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+                log::info(&format!("창 열기 실패({renderer:?}): {e}"));
+            }
+        }
+    }
+    if !last_err.is_empty() {
+        platform::message_box(&format!("창을 열 수 없어요:\n{last_err}"), true);
+        anyhow::bail!("창 열기 실패: {last_err}");
+    }
     conn.stop();
     Ok(())
 }

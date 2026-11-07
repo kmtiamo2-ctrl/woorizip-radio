@@ -117,10 +117,12 @@ jobs:
           retention-days: 1
 
   rust-pc:
-    # PC 프로그램 Rust판 (만드는 중 — 아직 설치 파일에는 들어가지 않음). 컴파일·검사·단위 시험만 통과 확인
+    # PC 프로그램 Rust판: 검사·시험 → 릴리스 exe(한 파일, 그 자체가 설치 파일) → 실제 설치·교체 흐름 점검 → 서명
+    # 지금은 릴리스에 `WoorizipRadio-PCRust-v번호.exe` 로 따로 올림 (한 대에서 써 본 뒤 7일차에 PC 기본 파일로 바꿈)
     name: PC Rust판 점검
     runs-on: windows-latest
     defaults: { run: { working-directory: pc-rust } }
+    env: { WOORIZIP_VERSION: "v${{ github.run_number }}" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -131,10 +133,65 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      - name: 실제 exe로 설치·교체 흐름 점검 (내려받은 파일 실행 → 자가 설치 → 새 파일로 교체 → 종료 요청)
+        shell: pwsh
+        timeout-minutes: 6
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'la'
+          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'ra'
+          New-Item -ItemType Directory -Force (Join-Path $env:APPDATA 'WoorizipRadio') | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $env:APPDATA 'WoorizipRadio\config.json') '{"host":"127.0.0.1","out_host":"","name":"아빠","key":"105403","autostart":false}'
+          $inst = Join-Path $env:LOCALAPPDATA 'WoorizipRadio\app\WoorizipRadio.exe'
+          $log = @()
+          Copy-Item target\release\woorizip-pc.exe (Join-Path $env:RUNNER_TEMP 'dl1.exe')
+          Start-Process (Join-Path $env:RUNNER_TEMP 'dl1.exe') -ArgumentList '--minimized'
+          Start-Sleep 15
+          $p1 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
+          $log += "1) 내려받은 파일 실행 → 설치본 존재: $(Test-Path $inst) / 실행 중: $($p1.Count)개 / 경로: $(($p1 | ForEach-Object { $_.Path }) -join ' , ')"
+          Copy-Item target\release\woorizip-pc.exe (Join-Path $env:RUNNER_TEMP 'dl2.exe')
+          Start-Process (Join-Path $env:RUNNER_TEMP 'dl2.exe') -ArgumentList '--minimized','--updated'
+          Start-Sleep 20
+          $p2 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
+          $paths2 = @($p2 | ForEach-Object { [string]$_.Path })
+          $log += "2) 새 파일로 교체 실행 → 실행 중: $($p2.Count)개 / 경로: $($paths2 -join ' , ')"
+          python -c "import socket; s=socket.create_connection(('127.0.0.1',47651),timeout=3); s.sendall(b'quit'); s.close()"
+          Start-Sleep 8
+          $p3 = @(Get-Process WoorizipRadio -ErrorAction SilentlyContinue)
+          $log += "3) 종료 요청 → 실행 중: $($p3.Count)개"
+          $bad = @($paths2 | Where-Object { -not [string]::Equals($_, [string]$inst, 'OrdinalIgnoreCase') })
+          $c1 = [bool](Test-Path $inst); $c2 = ($p1.Count -ge 1); $c3 = ($p2.Count -ge 1); $c4 = ($bad.Count -eq 0); $c5 = ($p3.Count -eq 0)
+          $pass = $c1 -and $c2 -and $c3 -and $c4 -and $c5
+          $log += "조건: 설치본=$c1 실행=$c2 교체후실행=$c3 경로일치=$c4(다른경로 $($bad.Count)개) 종료=$c5"
+          $log += "결과: " + $(if ($pass) { "통과" } else { "실패" })
+          $log += "--- 기록 파일 ---"
+          $log += (Get-Content (Join-Path $env:APPDATA 'WoorizipRadio\log_rust.txt') -ErrorAction SilentlyContinue)
+          New-Item -ItemType Directory -Force out | Out-Null
+          $log | Out-File -Encoding utf8 out/install_rust.log
+          $log | Write-Host
+          if (-not $pass) { Get-Process WoorizipRadio -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host "::error title=Rust판 설치·교체 점검 실패::$($log[0..3] -join ' | ')"; exit 1 }
+      - name: 릴리스 파일 이름 붙이기 + 서명 (GitHub 비밀 PC_SIGN_KEY 가 있을 때만)
+        shell: bash
+        env: { PC_SIGN_KEY: "${{ secrets.PC_SIGN_KEY }}" }
+        run: |
+          N=${{ github.run_number }}
+          cp target/release/woorizip-pc.exe "out/WoorizipRadio-PCRust-v$N.exe"
+          if [ -n "$PC_SIGN_KEY" ]; then
+            target/release/woorizip-pc.exe --sign "$PC_SIGN_KEY" "out/WoorizipRadio-PCRust-v$N.exe" > "out/WoorizipRadio-PCRust-v$N.exe.sig"
+            target/release/woorizip-pc.exe --verify "$(cat out/WoorizipRadio-PCRust-v$N.exe.sig)" "out/WoorizipRadio-PCRust-v$N.exe"
+            echo "서명함"
+          else
+            echo "::warning title=서명 없음::GitHub 비밀 PC_SIGN_KEY 가 없어 Rust판 exe 에 서명하지 못했어요 (Rust판 자동 업데이트는 서명이 있어야 설치해요)"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pc-rust
+          path: pc-rust/out/
+          retention-days: 1
 
   release:
     name: 내려받기 페이지 만들기
-    needs: [windows, android]
+    needs: [windows, android, rust-pc]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -150,12 +207,15 @@ jobs:
           N=${{ github.run_number }}
           printf '%s\n' "- **PC(Windows)**: \`WoorizipRadio-PC-v$N.exe\` 를 내려받아 더블클릭. 스스로 사용자 폴더에 설치되므로 내려받은 파일은 지워도 돼요" \
                          "- **폰(안드로이드)**: \`WoorizipRadio-Phone-v$N.apk\` 를 폰으로 보내서 설치 (기존 앱 위에 덮어 설치됨)" \
+                         "- **PC Rust판(써 보는 중)**: \`WoorizipRadio-PCRust-v$N.exe\` — 더블클릭하면 지금 깔린 Python판을 끄고 그 자리에 설치돼요" \
                          "" "<details><summary>PC 프로그램 자동 점검 결과</summary>" "" '```' > notes.md
           cat out/pc/selftest.log >> notes.md 2>/dev/null || echo "(점검 기록 없음)" >> notes.md
           { echo; echo "--- 실제 exe 설치·교체 점검 ---"; cat out/pc/install.log 2>/dev/null | grep -v "^$" | head -12; } >> notes.md
+          { echo; echo "--- Rust판 설치·교체 점검 ---"; cat out/pc-rust/install_rust.log 2>/dev/null | grep -v "^$" | head -8; } >> notes.md
+          cp out/pc-rust/WoorizipRadio-PCRust-v$N.exe* out/ 2>/dev/null || true
           printf '%s\n' '```' "</details>" >> notes.md
           set +e
-          gh release create "v$N" out/*.exe out/*.apk --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest > release.log 2>&1
+          gh release create "v$N" out/*.exe out/*.apk out/*.sig --repo "$GITHUB_REPOSITORY" --title "우리집 무전기 v$N" --notes-file notes.md --latest > release.log 2>&1
           RC=$?
           if [ $RC -ne 0 ]; then
             echo "::error title=release::$(tr '\n' ' ' < release.log | cut -c1-900)"

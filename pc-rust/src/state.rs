@@ -218,6 +218,9 @@ pub struct State {
     pub fetching: crate::files::Fetching,
     /// 원본 내려받기 진행률 fid → 0~1
     pub downloads: HashMap<String, f32>,
+    /// 받아 둔 새 버전 (경로, 번호) — 창이 한가할 때 적용
+    pub update_ready: Option<(std::path::PathBuf, u64)>,
+    pub update_applied: bool,
     data_dir: std::path::PathBuf,
     persist: bool, // 시험 때는 설정 파일을 건드리지 않음
 }
@@ -262,6 +265,8 @@ impl State {
             uploads: HashMap::new(),
             fetching: HashSet::new(),
             downloads: HashMap::new(),
+            update_ready: None,
+            update_applied: false,
             data_dir: dir,
             persist: true,
         };

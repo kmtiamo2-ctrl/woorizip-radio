@@ -292,3 +292,187 @@ mod b64_tests {
         assert!(b64_decode("abc").is_none());
     }
 }
+
+// ---- 설치 (이 exe 자체가 설치 파일): 설치 자리가 아닌 곳에서 실행되면 자기를 설치 자리에 복사하고 그쪽을 켬 ----
+
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
+/// 지금 실행 파일이 설치본인지
+pub fn is_installed_copy() -> bool {
+    match (std::env::current_exe(), installed_exe_path()) {
+        (Ok(me), Some(inst)) => same_path(&me, &inst),
+        _ => true, // 설치 자리를 모르는 환경(리눅스 점검 등)은 그냥 실행
+    }
+}
+
+/// 설치: 켜져 있는 우리집(이 판이든 Python판이든)에 '종료해 줘' → 설치 폴더(app)를 통째로 바꿈 → 설치본을 같은 인자로 실행.
+/// Ok(true)=설치하고 그쪽을 켰으니 나는 끝내면 됨
+pub fn install_self(args: &[String]) -> Result<bool, String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let Some(inst) = installed_exe_path() else {
+        return Ok(false);
+    };
+    let app_dir = inst.parent().unwrap().to_path_buf();
+    let root = app_dir.parent().unwrap().to_path_buf();
+    // 1) 실행 중이면 끄기 (뮤텍스가 풀릴 때까지 최대 15초)
+    #[cfg(windows)]
+    {
+        if instance_running() {
+            send_request("quit");
+            for _ in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if !instance_running() {
+                    break;
+                }
+            }
+            if instance_running() {
+                return Err("실행 중인 '우리집'을 먼저 종료해 주세요.\n(오른쪽 아래 시계 옆 별 아이콘 → 완전히 종료)\n\n그 다음 이 파일을 다시 실행하면 새 버전으로 바뀌어요.".into());
+            }
+        }
+    }
+    // 2) 폴더 바꿔 끼우기: app.new 에 넣고 → app → app.old → app.new → app
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let new_dir = root.join("app.new");
+    let old_dir = root.join("app.old");
+    let _ = std::fs::remove_dir_all(&new_dir);
+    std::fs::create_dir_all(&new_dir).map_err(|e| e.to_string())?;
+    std::fs::copy(&me, new_dir.join("WoorizipRadio.exe")).map_err(|e| format!("복사 실패: {e}"))?;
+    let _ = std::fs::remove_dir_all(&old_dir);
+    if app_dir.exists() {
+        retry(|| std::fs::rename(&app_dir, &old_dir))?;
+    }
+    retry(|| std::fs::rename(&new_dir, &app_dir))?;
+    let _ = std::fs::remove_dir_all(&old_dir);
+    let legacy = root.join("WoorizipRadio.exe"); // 아주 예전 한 파일 설치본
+    let _ = std::fs::remove_file(legacy);
+    // 3) 자동 실행 등록이 있었으면 설치본을 가리키게 갱신, 시작 메뉴 항목
+    if autostart_enabled() {
+        let _ = set_autostart(true);
+    }
+    let _ = make_shortcut(ShortcutWhere::StartMenu);
+    // 4) 설치본 실행 (같은 인자)
+    std::process::Command::new(&inst)
+        .args(args)
+        .current_dir(&app_dir)
+        .spawn()
+        .map_err(|e| format!("설치는 됐지만 실행하지 못했어요: {e}"))?;
+    Ok(true)
+}
+
+fn retry<T, E: std::fmt::Display>(mut f: impl FnMut() -> Result<T, E>) -> Result<T, String> {
+    let mut last = String::new();
+    for _ in 0..40 {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+    Err(last)
+}
+
+#[cfg(windows)]
+fn instance_running() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = MUTEX_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    let exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if !h.is_null() {
+        unsafe { CloseHandle(h) };
+    }
+    exists
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ShortcutWhere {
+    StartMenu,
+    Desktop,
+}
+
+/// '우리집' 바로가기 만들기 (PowerShell). 한글 이름이 어느 언어 Windows 에서도 깨지지 않게 영문 이름으로 만든 뒤 바꿈
+#[cfg(windows)]
+pub fn make_shortcut(where_: ShortcutWhere) -> Result<(), String> {
+    let target = installed_exe_path()
+        .filter(|p| p.exists())
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or("실행 파일을 못 찾았어요")?;
+    let t = target.to_string_lossy().replace('\'', "''");
+    let dir = target
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\'', "''"))
+        .unwrap_or_default();
+    let folder = match where_ {
+        ShortcutWhere::StartMenu => {
+            "(Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs')".to_string()
+        }
+        ShortcutWhere::Desktop => "[Environment]::GetFolderPath('DesktopDirectory')".to_string(),
+    };
+    let ps = format!(
+        "$ErrorActionPreference='Stop'\n$desk={folder}\nif(-not (Test-Path $desk)){{ New-Item -ItemType Directory -Force $desk | Out-Null }}\n$tmp=Join-Path $desk 'WoorizipRadio.lnk'\n$s=(New-Object -ComObject WScript.Shell).CreateShortcut($tmp)\n$s.TargetPath='{t}'\n$s.WorkingDirectory='{dir}'\n$s.IconLocation='{t},0'\n$s.Description='우리집'\n$s.Save()\nMove-Item -Force -LiteralPath $tmp -Destination (Join-Path $desk '우리집.lnk')\n"
+    );
+    let script = crate::config::data_dir().join("shortcut.ps1");
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend(ps.as_bytes());
+    std::fs::write(&script, bytes).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
+        .arg(&script)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .take(300)
+            .collect());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn make_shortcut(_where: ShortcutWhere) -> Result<(), String> {
+    Err("Windows에서만 돼요".into())
+}
+
+/// 사용자에게 보이는 안내 상자 (설치 중 문제 등)
+#[cfg(windows)]
+pub fn message_box(text: &str, warn: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_ICONWARNING,
+    };
+    let t: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "우리집 설치"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            t.as_ptr(),
+            title.as_ptr(),
+            if warn {
+                MB_ICONWARNING
+            } else {
+                MB_ICONINFORMATION
+            },
+        )
+    };
+}
+#[cfg(not(windows))]
+pub fn message_box(text: &str, _warn: bool) {
+    eprintln!("{text}");
+}

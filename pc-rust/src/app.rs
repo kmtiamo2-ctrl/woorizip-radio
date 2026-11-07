@@ -252,7 +252,12 @@ impl eframe::App for App {
         for r in reqs {
             match r {
                 Request::Show => self.show(ctx),
-                Request::Quit => self.begin_quit(ctx),
+                Request::Quit => {
+                    // 같은 PC 안에서 온 요청(설치 파일·업데이트): 암호 없이 바로 끝냄
+                    crate::log::info("종료 요청(설치·업데이트) → 끝냄");
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
         while let Ok(h) = self.inputs.hotkey_rx.try_recv() {
@@ -270,6 +275,30 @@ impl eframe::App for App {
         }
         let connected_now = self.with_state(|s| s.connected);
         self.tray.set_connected(connected_now);
+        // 받아 둔 새 버전: 아무도 말하지 않고 창이 숨겨져 있을 때 조용히 적용
+        let ready = self.with_state(|s| {
+            if s.update_applied
+                || s.talking
+                || s.requesting
+                || s.incoming_from.is_some()
+                || s.playing.is_some()
+            {
+                return None;
+            }
+            s.update_ready.clone()
+        });
+        if let Some((path, number)) = ready {
+            if !self.visible {
+                let r = crate::update::Ready { path, number };
+                match crate::update::apply(&r) {
+                    Ok(()) => self.with_state(|s| s.update_applied = true),
+                    Err(e) => {
+                        crate::log::info(&format!("업데이트 실행 실패: {e}"));
+                        self.with_state(|s| s.update_ready = None);
+                    }
+                }
+            }
+        }
 
         // ---- 알림 → 팝업 + 창 깜빡임 ----
         let notices: Vec<Notice> = self.with_state(|s| std::mem::take(&mut s.notices));

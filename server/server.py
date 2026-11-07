@@ -1244,6 +1244,22 @@ def fetch_latest_release():
             raise RuntimeError("%s 크기 불일치 (%d != %d)" % (name, size, want))
         os.replace(tmp, dest)
         info[key] = {"file": name, "size": size, "sha256": sha}
+    # PC 설치 파일 서명(.sig, Rust판이 확인): 있으면 latest.json 에 같이 넣음. 없으면 Rust판은 그 버전을 설치하지 않음
+    if "pc" in info:
+        sig_name = info["pc"]["file"] + ".sig"
+        try:
+            if data is not None:
+                asset = next((a for a in data.get("assets", []) if a.get("name") == sig_name), None)
+                sig = _http_get(asset["url"], "application/octet-stream").strip() if asset else ""
+            else:
+                sig = _http_get("https://github.com/%s/releases/download/%s/%s" % (GITHUB_REPO, urllib.parse.quote(tag), sig_name),
+                                "application/octet-stream").strip()
+            if isinstance(sig, bytes):
+                sig = sig.decode("ascii", "replace")
+            if re.fullmatch(r"[0-9a-f]{128}", sig or ""):
+                info["pc"]["sig"] = sig
+        except Exception as e:
+            log("PC 설치 파일 서명 없음 (%s): %s", sig_name, e)
     if "pc" not in info and "phone" not in info:
         return None
     tmp = os.path.join(UPDATE_DIR, "latest.json.tmp")

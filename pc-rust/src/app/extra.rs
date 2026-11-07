@@ -621,6 +621,7 @@ impl App {
         let real_key = self.with_state(|s| s.cfg.key.clone());
         let mut open = true;
         let mut save = false;
+        let mut check_update = false;
         {
             let d = &mut self.extra.settings;
             egui::Window::new("⚙ 설정")
@@ -739,10 +740,50 @@ impl App {
                                 .size(11.0),
                         );
                     });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(small_btn("바탕화면에 바로가기 만들기", false))
+                            .clicked()
+                        {
+                            d.msg = match crate::platform::make_shortcut(
+                                crate::platform::ShortcutWhere::Desktop,
+                            ) {
+                                Ok(()) => "바탕화면에 '우리집' 바로가기를 만들었어요".into(),
+                                Err(e) => format!("바로가기를 만들지 못했어요 ({e})"),
+                            };
+                        }
+                        if ui.add(small_btn("지금 업데이트 확인", false)).clicked() {
+                            check_update = true;
+                        }
+                        ui.label(
+                            RichText::new(format!("버전 {}", crate::update::version()))
+                                .color(SUB)
+                                .size(11.0),
+                        );
+                    });
                 });
         }
         if save {
             self.apply_settings();
+        }
+        if check_update {
+            let st = self.state.clone();
+            std::thread::spawn(move || {
+                let msg = match crate::update::check(&st) {
+                    Ok(Some(r)) => {
+                        st.lock().unwrap().update_ready = Some((r.path, r.number));
+                        format!(
+                            "새 버전 v{}을 받아 뒀어요 — 창을 닫아 두면 조용히 바뀌어요",
+                            r.number
+                        )
+                    }
+                    Ok(None) => "지금이 최신이에요".into(),
+                    Err(e) => format!("확인 실패: {e}"),
+                };
+                st.lock().unwrap().notice = msg;
+            });
+            self.extra.settings.msg = "확인하는 중…".into();
         }
         if !open {
             self.extra.settings.open = false;

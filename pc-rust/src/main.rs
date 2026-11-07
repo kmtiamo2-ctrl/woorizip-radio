@@ -18,15 +18,42 @@ mod platform;
 mod proto;
 mod state;
 mod tray;
+mod update;
 
 use std::sync::{Arc, Mutex};
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if update::cli(&args) {
+        return Ok(()); // --sign / --verify / --pubkey (CI 용)
+    }
     log::init();
-    log::info(&format!(
-        "우리집 PC(Rust) 시작 v{}",
-        env!("CARGO_PKG_VERSION")
-    ));
+    log::info(&format!("우리집 PC(Rust) 시작 {}", update::version()));
+    // 설치 자리가 아닌 곳(내려받은 파일 등)에서 실행됐으면: 설치하고 설치본을 켠 뒤 끝
+    if cfg!(windows)
+        && !args
+            .iter()
+            .any(|a| a == "--no-install" || a == "--headless")
+        && !platform::is_installed_copy()
+    {
+        let pass: Vec<String> = args[1..].to_vec();
+        match platform::install_self(&pass) {
+            Ok(true) => {
+                log::info("설치본으로 복사하고 그쪽을 켬");
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::info(&format!("설치 실패: {e}"));
+                platform::message_box(&format!("설치 중 문제가 생겼어요:\n{e}"), true);
+                return Ok(());
+            }
+        }
+    }
+    let just_updated = args.iter().any(|a| a == "--updated");
+    if just_updated {
+        update::cleanup();
+    }
     let cfg = config::Config::load();
     if !cfg.configured() {
         log::info("설정에 NAS 주소·이름·암호가 없어요 — Python판 설정 창에서 먼저 저장해 주세요 (Rust판 설정 창은 5일차)");
@@ -46,6 +73,9 @@ fn main() -> anyhow::Result<()> {
         }
     };
     let state: app::Shared = Arc::new(Mutex::new(state::State::new(cfg.clone())));
+    if just_updated {
+        state.lock().unwrap().notice = format!("새 버전 {}으로 업데이트됐어요", update::version());
+    }
 
     // 통신: 별도 스레드의 tokio 런타임
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -136,6 +166,27 @@ fn main() -> anyhow::Result<()> {
                 }
             })
             .expect("audio thread");
+    }
+
+    // 자동 업데이트: 켜지고 2분 뒤, 그 뒤 12시간마다 확인. 받아 두면 state.update_ready 에 두고 창이 한가할 때 적용
+    {
+        let state = state.clone();
+        std::thread::Builder::new()
+            .name("update".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(update::FIRST_CHECK_SECS));
+                loop {
+                    match update::check(&state) {
+                        Ok(Some(r)) => {
+                            state.lock().unwrap().update_ready = Some((r.path, r.number))
+                        }
+                        Ok(None) => {}
+                        Err(e) => log::info(&format!("업데이트 확인 실패: {e}")),
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(update::CHECK_EVERY_SECS));
+                }
+            })
+            .ok();
     }
 
     if headless {

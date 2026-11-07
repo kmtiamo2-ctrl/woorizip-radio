@@ -619,7 +619,9 @@ object Radio : RadioClient.Listener {
     /** 내가 보낸 메시지의 가족별 확인 표시: · 보냄, ✓ 받음, ✓✓ 봄(들음) */
     fun receiptText(clip: Clip): String {
         val st = receipts[clip.mid] ?: return ""
-        return st.entries.joinToString("  ") { (n, v) -> disp(n) + when (v) { "seen" -> "✓✓"; "received" -> "✓"; else -> "·" } }
+        // 기호 대신 말로: "규민 읽음 · 로아 받음 · 엄마 보냄" (가족 순서대로)
+        val order = members.withIndex().associate { (i, m) -> m to i }
+        return st.entries.sortedBy { order[it.key] ?: 99 }.joinToString(" · ") { (n, v) -> disp(n) + " " + when (v) { "seen" -> "읽음"; "received" -> "받음"; else -> "보냄" } }
     }
 
     // ---- 예약 메시지 ----

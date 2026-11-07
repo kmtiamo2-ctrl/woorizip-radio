@@ -617,6 +617,9 @@ impl App {
         if !self.extra.settings.open {
             return;
         }
+        if let Some(m) = self.with_state(|s| s.settings_msg.take()) {
+            self.extra.settings.msg = m;
+        }
         let members = self.with_state(|s| s.members.clone());
         let real_key = self.with_state(|s| s.cfg.key.clone());
         let mut open = true;
@@ -773,7 +776,9 @@ impl App {
                         Ok(()) => "바탕화면에 '우리집' 바로가기를 만들었어요".to_string(),
                         Err(e) => format!("바로가기를 만들지 못했어요 ({e})"),
                     };
-                st.lock().unwrap().notice = msg;
+                let mut s = st.lock().unwrap();
+                s.notice = msg.clone();
+                s.settings_msg = Some(msg);
             });
         }
         if check_update {
@@ -790,7 +795,9 @@ impl App {
                     Ok(None) => "지금이 최신이에요".into(),
                     Err(e) => format!("확인 실패: {e}"),
                 };
-                st.lock().unwrap().notice = msg;
+                let mut s = st.lock().unwrap();
+                s.notice = msg.clone();
+                s.settings_msg = Some(msg);
             });
             self.extra.settings.msg = "확인하는 중…".into();
         }

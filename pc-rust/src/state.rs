@@ -223,6 +223,8 @@ pub struct State {
     /// 받아 둔 새 버전 (경로, 번호) — 창이 한가할 때 적용
     pub update_ready: Option<(std::path::PathBuf, u64)>,
     pub update_applied: bool,
+    /// 설정 창에 보일 결과 글 (뒤 스레드가 넣고 설정 창이 꺼내 씀)
+    pub settings_msg: Option<String>,
     data_dir: std::path::PathBuf,
     persist: bool, // 시험 때는 설정 파일을 건드리지 않음
 }
@@ -269,6 +271,7 @@ impl State {
             downloads: HashMap::new(),
             update_ready: None,
             update_applied: false,
+            settings_msg: None,
             data_dir: dir,
             persist: true,
         };

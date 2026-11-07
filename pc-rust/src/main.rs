@@ -37,6 +37,20 @@ fn main() -> anyhow::Result<()> {
     }
     log::init();
     log::info(&format!("우리집 PC(Rust) 시작 {}", update::version()));
+    // 예기치 않게 죽을 때 원인을 기록 파일에 남김 (릴리스는 panic=abort 라 그냥 사라지므로)
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        log::info(&format!("프로그램 오류(panic) {loc}: {msg}"));
+    }));
     // 설치 자리가 아닌 곳(내려받은 파일 등)에서 실행됐으면: 설치하고 설치본을 켠 뒤 끝
     if cfg!(windows)
         && !args

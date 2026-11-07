@@ -164,7 +164,7 @@ pub fn protect(plain: &str) -> Option<String> {
     if plain.is_empty() {
         return None;
     }
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: plain.len() as u32,
         pbData: plain.as_ptr() as *mut u8,
     };
@@ -175,7 +175,7 @@ pub fn protect(plain: &str) -> Option<String> {
     // 안전: Windows API 에 올바른 구조체·포인터를 넘기고, 결과 메모리는 복사 후 LocalFree 로 돌려줌
     let ok = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             std::ptr::null(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -197,7 +197,7 @@ pub fn unprotect(enc: &str) -> Option<String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
     let bytes = b64_decode(enc)?;
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: bytes.len() as u32,
         pbData: bytes.as_ptr() as *mut u8,
     };
@@ -207,7 +207,7 @@ pub fn unprotect(enc: &str) -> Option<String> {
     };
     let ok = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),

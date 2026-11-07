@@ -87,9 +87,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var incomingCard: MaterialCardView
     private lateinit var incomingText: TextView
-    private lateinit var memberGroup: ChipGroup
-    private lateinit var memberHolder: FrameLayout          // 평소: 여러 줄로 펼침
-    private lateinit var memberScroll: HorizontalScrollView // 키패드 열림: 한 줄로 접어 옆으로 넘김
+    private lateinit var memberGrid: LinearLayout           // 평소: 3줄 격자 (모두·아이들 / 아빠·엄마 / 첫째·둘째·셋째), 칸 폭·여백 모두 같게
+    private lateinit var memberLine: LinearLayout           // 키패드 열림: 한 줄로 접어 옆으로 넘김
+    private lateinit var memberHolder: FrameLayout
+    private lateinit var memberScroll: HorizontalScrollView
+    private var shownCount = 40                              // 대화 칸에 그려 둔 글 수 (맨 위로 올리면 40개씩 더)
+    private var loadOlderBusy = false
     private lateinit var roomsGuide: TextView
     private lateinit var talkCard: MaterialCardView
     private lateinit var talkWrap: FrameLayout
@@ -339,11 +342,13 @@ class MainActivity : AppCompatActivity() {
         // 대화방 (평소엔 여러 줄로 펼침, 키패드가 열리면 한 줄로 접어 대화 칸에 자리를 내줌)
         roomsGuide = sectionTitle("대화방  ·  누르면 그 방  ·  길게 누르면 몇 명만 묶기")
         root.addView(roomsGuide, lp(top = 14))
-        memberGroup = ChipGroup(this).apply { chipSpacingHorizontal = dp(8); chipSpacingVertical = dp(4) }
+        memberGrid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         memberHolder = FrameLayout(this)
-        memberHolder.addView(memberGroup, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        memberHolder.addView(memberGrid, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(memberHolder, lp(top = 6))
+        memberLine = LinearLayout(this)
         memberScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; clipToPadding = false; visibility = View.GONE }
+        memberScroll.addView(memberLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(memberScroll, lp(top = 6))
 
         // 말하기 버튼
@@ -352,15 +357,15 @@ class MainActivity : AppCompatActivity() {
             isClickable = true
             setOnTouchListener { v, e ->
                 when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { v.isPressed = true; Radio.startTalk() }
+                    MotionEvent.ACTION_DOWN -> { if (Radio.isMeRoom(Radio.currentRoom())) toast("나에게는 글·사진만 보낼 수 있어요") else { v.isPressed = true; Radio.startTalk() } }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { v.isPressed = false; Radio.stopTalk() }
                 }
                 true
             }
         }
-        val talkInner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dp(16), dp(22), dp(16), dp(22)) }
-        talkTitle = label("", 22f, cOnAmber, true)
-        talkSub = label("", 13f, cOnAmber).apply { alpha = 0.8f }
+        val talkInner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(dp(14), dp(15), dp(14), dp(15)) }   // 예전보다 약 1/4 낮게
+        talkTitle = label("", 19f, cOnAmber, true)
+        talkSub = label("", 12f, cOnAmber).apply { alpha = 0.8f }
         talkInner.addView(talkTitle); talkInner.addView(talkSub, lp(w = ViewGroup.LayoutParams.WRAP_CONTENT, top = 2))
         talkCard.addView(talkInner)
         // '모두' 방일 때는 카드 둘레에 가족 5명 색을 이어 붙인 테두리 (모두 = 가족 전부의 색)
@@ -383,9 +388,10 @@ class MainActivity : AppCompatActivity() {
         scrollRoot.setPadding(dp(14), 0, dp(14), 0)
         outer.addView(scrollRoot, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         // 대화 칸 크기가 바뀔 때(키패드 열림/닫힘, 말하기 버튼 접힘/펼침) 바닥 근처를 보고 있었으면 바닥으로 다시 붙임 — 옛 글을 보던 중이면 그대로 둠
-        scrollRoot.setOnScrollChangeListener(NestedScrollView.OnScrollChangeListener { v, _, _, _, _ ->
+        scrollRoot.setOnScrollChangeListener(NestedScrollView.OnScrollChangeListener { v, _, sy, _, oldSy ->
             val c = v.getChildAt(0) ?: return@OnScrollChangeListener
             chatNearBottom = c.bottom - (v.height + v.scrollY) < dp(160)
+            if (sy < dp(40) && sy < oldSy) loadOlder()   // 맨 위로 올리면 더 옛 글을 이어 붙임
         })
         scrollRoot.addOnLayoutChangeListener { v, _, top, _, bottom, _, oldTop, _, oldBottom ->
             if ((bottom - top) != (oldBottom - oldTop) && chatNearBottom) v.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }
@@ -397,18 +403,30 @@ class MainActivity : AppCompatActivity() {
         quickRow = LinearLayout(this)
         scroll.addView(quickRow)
         bottom.addView(scroll)
-        inputRow = LinearLayout(this).apply { gravity = Gravity.BOTTOM }   // 입력칸 테두리(아래쪽)에 + 와 보내기를 맞춤
+        inputRow = LinearLayout(this).apply { gravity = Gravity.BOTTOM }   // 입력칸 테두리(아래쪽)에 보내기를 맞춤
         val (til, et) = inputField("메시지 입력")
         input = et; inputTil = til
-        // [+] 사진·파일·카메라·예약 — 작은 정사각형, 입력칸 왼쪽 (입력칸이 남는 폭을 다 쓰게)
-        inputRow.addView(MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
-            text = "+"; textSize = 24f; isAllCaps = false; setTextColor(cText); cornerRadius = dp(14)
+        // [+] 사진·파일·카메라·예약 — 작은 정사각형(40dp). 입력칸 테두리의 세로 가운데에 오게, 실제 그려진 위치를 재서 맞춤
+        val plusBtn = MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+            text = "+"; textSize = 22f; isAllCaps = false; setTextColor(cText); cornerRadius = dp(12)
             strokeColor = ColorStateList.valueOf(cOutline); minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
-            insetTop = 0; insetBottom = 0; setPadding(0, 0, 0, 0)
+            insetTop = 0; insetBottom = 0; setPadding(0, 0, 0, 0); includeFontPadding = false; gravity = Gravity.CENTER
             contentDescription = "사진·파일·예약 보내기"
             setOnClickListener { openAttachMenu() }
-        }, LinearLayout.LayoutParams(dp(52), dp(56)).apply { marginEnd = dp(8) })
+        }
+        inputRow.addView(plusBtn, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginEnd = dp(8) })
         inputRow.addView(til, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val alignPlus = {
+            // 입력칸(EditText)의 세로 중심에 맞춤. TextInputLayout 은 안에 틀을 하나 더 두므로 et 에서 til 까지 올라가며 top 을 더해 실제 위치를 구함
+            var top = 0; var v: View = et
+            while (v !== til) { top += v.top; v = v.parent as? View ?: break }
+            val center = til.top + top + et.height / 2f
+            val myCenter = plusBtn.top + plusBtn.height / 2f
+            val dy = center - myCenter
+            if (plusBtn.translationY != dy) plusBtn.translationY = dy
+        }
+        til.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> alignPlus() }
+        plusBtn.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> alignPlus() }
         input.setOnFocusChangeListener { _, has -> if (has) scrollRoot.postDelayed({ scrollRoot.fullScroll(View.FOCUS_DOWN) }, 300) }
         input.imeOptions = EditorInfo.IME_ACTION_SEND   // 키패드의 '완료' 대신 '전송' — 치고 바로 보내고, 키패드는 그대로 열려 있음
         input.setOnEditorActionListener { _, action, _ -> if (action == EditorInfo.IME_ACTION_SEND) { sendTyped(); true } else false }
@@ -463,24 +481,55 @@ class MainActivity : AppCompatActivity() {
         roomsGuide.visibility = shown
         talkWrap.visibility = shown
         noticeText.visibility = shown
-        (memberGroup.parent as? ViewGroup)?.removeView(memberGroup)
-        memberGroup.isSingleLine = compact
+        memberSig = ""   // 접힘/펼침이 바뀌면 방 버튼을 그 모양으로 다시 그림
         if (compact) {
-            memberScroll.addView(memberGroup, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             memberHolder.visibility = View.GONE; memberScroll.visibility = View.VISIBLE
+            renderMembers()
             memberScroll.post { scrollToSelectedChip() }
             scrollRoot.post { scrollRoot.fullScroll(View.FOCUS_DOWN) }   // 선택한 방의 최신 글이 입력칸 바로 위에 오게
         } else {
-            memberHolder.addView(memberGroup, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             memberScroll.visibility = View.GONE; memberHolder.visibility = View.VISIBLE
+            renderMembers()
         }
     }
 
     private fun scrollToSelectedChip() {
         if (!compactMode) return
-        for (i in 0 until memberGroup.childCount) {
-            val c = memberGroup.getChildAt(i) as? Chip ?: continue
-            if (c.isChecked) { memberScroll.smoothScrollTo((c.left - dp(8)).coerceAtLeast(0), 0); break }
+        for (i in 0 until memberLine.childCount) {
+            val c = memberLine.getChildAt(i)
+            if (c.tag == "sel") { memberScroll.smoothScrollTo((c.left - dp(8)).coerceAtLeast(0), 0); break }
+        }
+    }
+
+    /** 대화 칸을 맨 위까지 올렸을 때: 그려 둔 것보다 더 있으면 40개 더 그리고, 그것도 다 보였으면 서버에 더 옛 기록을 달라고 함. 보던 자리가 튀지 않게 스크롤 위치를 보정 */
+    private fun loadOlder() {
+        if (loadOlderBusy) return
+        val room = Radio.currentRoom()
+        val total = Radio.roomClips(room).size
+        if (shownCount < total) {
+            loadOlderBusy = true
+            val child = scrollRoot.getChildAt(0)
+            val before = child?.height ?: 0
+            shownCount += 40
+            renderMessages()
+            scrollRoot.post {
+                val after = scrollRoot.getChildAt(0)?.height ?: 0
+                scrollRoot.scrollBy(0, (after - before).coerceAtLeast(0))
+                loadOlderBusy = false
+            }
+        } else if (Radio.loadOlder()) {
+            loadOlderBusy = true
+            val child = scrollRoot.getChildAt(0)
+            val before = child?.height ?: 0
+            shownCount += 100
+            h.postDelayed({
+                renderMessages()
+                scrollRoot.post {
+                    val after = scrollRoot.getChildAt(0)?.height ?: 0
+                    scrollRoot.scrollBy(0, (after - before).coerceAtLeast(0))
+                    loadOlderBusy = false
+                }
+            }, 700)
         }
     }
 
@@ -517,36 +566,41 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- 가족 칩 / 빠른 답장 칩 ----------
 
-    private fun roomChip(room: Room, selected: Boolean, unread: Int): Chip {
+    /** 방 버튼 하나. 글자는 가운데, 칸 폭은 격자가 정함. 내 자리('나')는 메모장 — 접속 표시 없음 */
+    private fun roomButton(room: Room, selected: Boolean, unread: Int): View {
         val m = room.members
-        val single = m != null && m.size == 1
+        val meRoom = Radio.isMeRoom(room)
+        val single = m != null && m.size == 1 && !meRoom
         val on = single && m!![0] in Radio.online
         // 사람 방: 연결된 사람은 초록 점만, 안 된 사람만 "꺼짐" (집/밖 글자는 안 씀)
-        val base = if (m == null) "${Radio.online.size}명 접속" else if (single) (if (on) "" else "꺼짐") else "${m.size}명"
+        val base = if (m == null) "${Radio.online.size}명 접속" else if (meRoom) "" else if (single) (if (on) "" else "꺼짐") else "${m.size}명"
         val sub = listOf(base, if (unread > 0) "새 글 $unread" else "").filter { it.isNotEmpty() }.joinToString(" · ")
         val dim = single && !on
-        return Chip(this).apply {
-            text = "${room.icon} ${room.label}" + (if (sub.isNotEmpty()) " · $sub" else "")
-            if (on) { chipIcon = circle(if (selected) Color.parseColor("#101418") else cGreen); chipIconSize = dpf(9); isChipIconVisible = true; iconStartPadding = dpf(6) }
-            isCheckable = true; isChecked = selected; isCheckedIconVisible = false
-            textSize = 14f
-            chipCornerRadius = dpf(18)
-            chipStrokeWidth = dpf(1)
-            chipStrokeColor = ColorStateList.valueOf(if (selected) room.color else cOutline)
-            chipBackgroundColor = ColorStateList.valueOf(if (selected) room.color else cCard)
-            setTextColor(if (selected) Color.parseColor("#101418") else if (dim) cSub else room.color)
-            setEnsureMinTouchTargetSize(false)
+        val onColor = Color.parseColor("#101418")
+        val btn = MaterialButton(this, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+            text = "${room.icon} ${room.label}" + (if (sub.isNotEmpty()) "  ·  $sub" else "")
+            isAllCaps = false; textSize = 14f; maxLines = 2
+            textAlignment = View.TEXT_ALIGNMENT_CENTER; gravity = Gravity.CENTER
+            cornerRadius = dp(18)
+            strokeWidth = if (room.key == "all") 0 else dp(1)
+            strokeColor = ColorStateList.valueOf(if (selected) room.color else cOutline)
+            backgroundTintList = ColorStateList.valueOf(if (selected) room.color else cCard)
+            setTextColor(if (selected) onColor else if (dim) cSub else room.color)
+            insetTop = 0; insetBottom = 0; minHeight = 0; minimumHeight = 0; minWidth = 0; minimumWidth = 0
+            setPadding(dp(10), dp(9), dp(10), dp(9))
+            if (on) { icon = circle(if (selected) onColor else cGreen); iconSize = dp(9); iconPadding = dp(6); iconGravity = MaterialButton.ICON_GRAVITY_TEXT_START; iconTint = null }
+            tag = if (selected) "sel" else null
             setOnClickListener { Radio.selectRoom(room.key); render() }
-            if (m != null && m.size == 1) setOnLongClickListener { Radio.toggleTarget(m[0]); render(); true }   // 몇 명만 묶기
+            if (single) setOnLongClickListener { Radio.toggleTarget(m!![0]); render(); true }   // 몇 명만 묶기
         }
-    }
-
-    /** '모두' 방 버튼은 가족 5명 색 테두리로 감쌈 */
-    private fun wrapAllChip(chip: Chip): View = FrameLayout(this).apply {
-        setPadding(dp(2), dp(2), dp(2), dp(2))
-        background = android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.LEFT_RIGHT, Family.colors()).apply { cornerRadius = dpf(20) }
-        chip.chipStrokeWidth = 0f
-        addView(chip, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        if (room.key != "all") return btn
+        // '모두' 방 버튼은 가족 5명 색 테두리로 감쌈
+        return FrameLayout(this).apply {
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+            background = android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.LEFT_RIGHT, Family.colors()).apply { cornerRadius = dpf(20) }
+            tag = btn.tag
+            addView(btn, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
     }
 
     private fun renderMembers() {
@@ -559,12 +613,31 @@ class MainActivity : AppCompatActivity() {
         val rooms = Radio.rooms()
         val cur = Radio.currentRoom()
         val unread = rooms.associate { it.key to Radio.unreadCount(it) }
-        val sig = listOf(rooms.joinToString { it.key }, Radio.online.joinToString(), Radio.target, Radio.memberWhere.toString(), unread.toString()).joinToString("|")
+        val sig = listOf(compactMode, rooms.joinToString { it.key + it.label }, Radio.online.joinToString(), Radio.target, Radio.memberWhere.toString(), unread.toString()).joinToString("|")
         if (sig == memberSig) return
         memberSig = sig
-        memberGroup.removeAllViews()
-        rooms.forEach { r -> val chip = roomChip(r, r.key == cur.key, unread[r.key] ?: 0); memberGroup.addView(if (r.key == "all") wrapAllChip(chip) else chip) }
-        if (compactMode) memberScroll.post { scrollToSelectedChip() }   // 한 줄로 접힌 상태면 선택한 방이 보이게 옆으로 맞춤
+        val btn = { r: Room -> roomButton(r, r.key == cur.key, unread[r.key] ?: 0) }
+        if (compactMode) {
+            // 한 줄: 모두 · 아이들 · 아빠 · 엄마 · 첫째 · 둘째 · 셋째 순서로 옆으로 넘김
+            memberLine.removeAllViews()
+            rooms.forEach { r -> memberLine.addView(btn(r), LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(8) }) }
+            memberScroll.post { scrollToSelectedChip() }
+        } else {
+            // 3줄 격자: [모두][아이들] / [아빠][엄마] / [첫째][둘째][셋째] — 한 줄 안의 칸은 폭이 같고, 칸 사이 여백은 모두 같게
+            memberGrid.removeAllViews()
+            val byKey = rooms.associateBy { it.key }
+            val lines = listOf(listOf("all", "g:아이들"), listOf("아빠", "엄마"), listOf("첫째", "둘째", "셋째"))
+            val used = HashSet<String>()
+            val rowsOf = ArrayList<List<Room>>()
+            lines.forEach { keys -> val l = keys.mapNotNull { byKey[it] }; if (l.isNotEmpty()) { rowsOf.add(l); used.addAll(l.map { it.key }) } }
+            val rest = rooms.filter { it.key !in used }   // 직접 묶은 방이 더 있으면 아래 줄에 2개씩
+            rest.chunked(2).forEach { rowsOf.add(it) }
+            rowsOf.forEachIndexed { i, l ->
+                val row = LinearLayout(this)
+                l.forEach { r -> row.addView(btn(r), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply { marginStart = dp(4); marginEnd = dp(4) }) }
+                memberGrid.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = if (i == 0) 0 else dp(8); marginStart = -dp(4); marginEnd = -dp(4) })
+            }
+        }
     }
 
     private fun renderQuick() {
@@ -806,7 +879,7 @@ class MainActivity : AppCompatActivity() {
         val from = Radio.incomingFrom
         if (from != null) {
             incomingCard.visibility = View.VISIBLE
-            incomingText.text = if (Radio.incomingMode == "all") "🔊  ${from}님 전체 방송 중" else "🔊  ${from}님이 나에게 말하는 중"
+            incomingText.text = if (Radio.incomingMode == "all") "🔊  ${Radio.disp(from)} 전체 방송 중" else "🔊  ${Radio.disp(from)}가 나에게 말하는 중"
         } else incomingCard.visibility = View.GONE
 
         val room = Radio.currentRoom()
@@ -815,9 +888,10 @@ class MainActivity : AppCompatActivity() {
             Radio.talking -> { talkTitle.text = "${room.label}에게 말하는 중…"; talkSub.text = "손을 떼면 끝"; talkCard.setCardBackgroundColor(cRed); talkTitle.setTextColor(Color.WHITE); talkSub.setTextColor(Color.WHITE) }
             Radio.requesting -> { talkTitle.text = "잠깐만요…"; talkSub.text = ""; talkCard.setCardBackgroundColor(cAmberDark); talkTitle.setTextColor(cOnAmber); talkSub.setTextColor(cOnAmber) }
             !Radio.connected -> { talkTitle.text = "연결 대기 중"; talkSub.text = Radio.status; talkCard.setCardBackgroundColor(cCard2); talkTitle.setTextColor(cSub); talkSub.setTextColor(cSub) }
+            Radio.isMeRoom(room) -> { talkTitle.text = "📝 나에게 메모"; talkSub.text = "말하기는 안 되고 글·사진만 — 내 기기에서만 보여요"; talkCard.setCardBackgroundColor(cCard2); talkTitle.setTextColor(cSub); talkSub.setTextColor(cSub) }
             else -> { talkTitle.text = "${room.icon} ${room.label}에게 말하기"; talkSub.text = "누르고 있는 동안 말해요"; talkCard.setCardBackgroundColor(room.color); talkTitle.setTextColor(onRoom); talkSub.setTextColor(onRoom) }
         }
-        msgHead.text = "${room.icon} ${if (room.key == "all") "모두의 대화" else room.label + "와의 대화"}"
+        msgHead.text = "${room.icon} ${if (room.key == "all") "모두의 대화" else if (Radio.isMeRoom(room)) "나의 메모" else room.label + Family.josa(room.label, "과", "와") + "의 대화"}"
         msgHead.setTextColor(room.color)
         if (inputRoomKey != room.key) {   // 입력칸 테두리·보내기 버튼·안내 글을 고른 방 색으로 — 키패드 위 입력줄만 봐도 누구에게 보내는지 보이게
             inputRoomKey = room.key
@@ -825,7 +899,7 @@ class MainActivity : AppCompatActivity() {
             inputTil.boxStrokeColor = room.color
             inputTil.hintTextColor = ColorStateList.valueOf(room.color)
             inputTil.defaultHintTextColor = ColorStateList.valueOf(room.color)
-            inputTil.hint = "${if (room.key == "all") "모두" else room.label}에게 메시지"
+            inputTil.hint = if (Radio.isMeRoom(room)) "나에게 메모" else "${if (room.key == "all") "모두" else room.label}에게 메시지"
             sendBtn.backgroundTintList = ColorStateList.valueOf(room.color)
             sendBtn.setTextColor(onRoom)
         }
@@ -932,11 +1006,15 @@ class MainActivity : AppCompatActivity() {
     private fun convOf(c: Clip): Conv? {
         if (c.mode == "all") return null
         val names = if (c.mine) c.from.split(", ").filter { it.isNotBlank() } else listOf(c.from)
-        if (names.size == 1) return Conv(names[0], "${Family.icon(names[0])} ${names[0]}와의 대화", Family.color(names[0]))
+        if (names.size == 1) {
+            val d = Radio.disp(names[0])
+            val lab = if (names[0] == prefs.name) "📝 나의 메모" else "${Family.icon(names[0])} $d${Family.josa(d, "과", "와")}의 대화"
+            return Conv(names[0], lab, Family.color(names[0]))
+        }
         val set = names.toSet()
         val room = Radio.rooms().firstOrNull { it.members != null && it.members.toSet() == set }
         return if (room != null) Conv(room.key, "${room.icon} ${room.label}에게", room.color)
-        else Conv("c:" + names.sorted().joinToString(","), names.joinToString(", ") + "에게", cSub)
+        else Conv("c:" + names.sorted().joinToString(","), names.joinToString(", ") { Radio.disp(it) } + "에게", cSub)
     }
 
     private fun blendColor(fg: Int, bg: Int, a: Float): Int = Color.rgb(
@@ -944,9 +1022,11 @@ class MainActivity : AppCompatActivity() {
         (Color.green(bg) + (Color.green(fg) - Color.green(bg)) * a).toInt(),
         (Color.blue(bg) + (Color.blue(fg) - Color.blue(bg)) * a).toInt())
 
+    private var shownRoomKey: String? = null
     private fun renderMessages() {
         val room = Radio.currentRoom()
-        val shown = Radio.roomClips(room).take(40).reversed()   // 오래된 것 → 최신 (최신이 아래)
+        if (room.key != shownRoomKey) { shownRoomKey = room.key; shownCount = 40 }   // 방을 바꾸면 최근 40개부터 다시
+        val shown = Radio.roomClips(room).take(shownCount).reversed()   // 오래된 것 → 최신 (최신이 아래). 맨 위로 올리면 더 그림
         val sig = room.key + "|" + Radio.schedules.joinToString(",") { "${it.sid}:${it.at}" } + "|" + shown.joinToString("|") { "${it.id}:${it.ts}:${Radio.playingClip === it}:${Radio.receiptText(it)}:${it.expired}:${if (it.thumb) Radio.thumbFile(it).exists() else ""}:${Radio.downloading[it.fid ?: ""] ?: ""}" }
         if (sig == msgSig) return
         val newestKey = shown.lastOrNull()?.let { "${it.id}:${it.ts}" }
@@ -994,7 +1074,7 @@ class MainActivity : AppCompatActivity() {
                 gravity = if (c.mine) Gravity.END else Gravity.START
                 if (c.mine) marginStart = dp(48) else marginEnd = dp(48)
             }
-            if (!c.mine && !same) col.addView(label("${Family.icon(c.from)} ${c.from}", 13f, whoColor, true).apply { setPadding(dp(6), 0, 0, dp(2)) })
+            if (!c.mine && !same) col.addView(label("${Family.icon(c.from)} ${Radio.disp(c.from)}", 13f, whoColor, true).apply { setPadding(dp(6), 0, 0, dp(2)) })
             val bubble = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 background = roundRect(if (c.mine) Color.parseColor("#2A3F66") else cCard2, 16)
@@ -1038,7 +1118,7 @@ class MainActivity : AppCompatActivity() {
                     cornerRadius = dpf(16); setColor(cCard2); setStroke(dp(1), cSub, dpf(6), dpf(4))
                 }
                 setPadding(dp(14), dp(9), dp(14), dp(9))
-                addView(label("⏰ $whenTxt 보낼 예정" + (if (room.key == "all" && sc.to != "all") " · ${sc.to}에게" else ""), 11f, cAmber))
+                addView(label("⏰ $whenTxt 보낼 예정" + (if (room.key == "all" && sc.to != "all") " · ${Radio.dispList(sc.to.replace(",", ", "))}에게" else ""), 11f, cAmber))
                 addView(label(sc.text, 17f, cText))
                 setOnLongClickListener {
                     MaterialAlertDialogBuilder(this@MainActivity).setTitle("예약 취소할까요?").setMessage("$whenTxt · ${sc.text}")

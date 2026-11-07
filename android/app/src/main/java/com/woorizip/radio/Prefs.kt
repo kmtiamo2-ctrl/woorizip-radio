@@ -27,6 +27,11 @@ class Prefs(ctx: Context) {
         set(v) = sp.edit().putString("key", v).apply()
 
     /** 대화방 묶음: "아이들=첫째,둘째,셋째;부모님=엄마,아빠" */
+    /** 서버가 보내 준 보이는 이름표(JSON) — 꺼져 있을 때도 마지막 값으로 표시 */
+    var names: String
+        get() = sp.getString("names", "") ?: ""
+        set(v) = sp.edit().putString("names", v).apply()
+
     var groups: String
         get() = (sp.getString("groups", null) ?: "").ifBlank { DEFAULT_GROUPS }
         set(v) = sp.edit().putString("groups", v.trim()).apply()

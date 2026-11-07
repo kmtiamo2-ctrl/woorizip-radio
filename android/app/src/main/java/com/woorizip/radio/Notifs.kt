@@ -71,7 +71,7 @@ object Notifs {
         val title = when {
             Radio.talking -> "🎙 $who 에게 말하는 중"
             Radio.playingClip != null -> "🔊 ${Radio.playingClip?.title} 재생 중"
-            Radio.incomingFrom != null -> "🔊 ${Radio.incomingFrom}님이 말하는 중"
+            Radio.incomingFrom != null -> "🔊 ${Radio.disp(Radio.incomingFrom)}가 말하는 중"
             Radio.connected -> "우리집 · 수신 대기 중$place"
             else -> "우리집 · ${Radio.status}"
         }
@@ -100,7 +100,7 @@ object Notifs {
         val text = if (mode == "all") "전체 방송 중 (무음 모드라 소리 없이 알려드려요)" else "나에게 말하는 중 (무음 모드)"
         val n = NotificationCompat.Builder(ctx, CH_INCOMING)
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode)
-            .setContentTitle("${from}님")
+            .setContentTitle(Radio.disp(from))
             .setContentText(text)
             .setAutoCancel(true)
             .setTimeoutAfter(60_000)

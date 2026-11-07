@@ -29,13 +29,16 @@ data class Clip(
     val isText get() = text != null && fid == null
     val isFile get() = fid != null
     val isImage get() = isFile && FileXfer.isImage(mime, name)
-    val title get() = when {
-        mine && voiceSent -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"} (음성 ${seconds.toInt().coerceAtLeast(1)}초)"
-        mine && isFile -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"} (📎 ${name})"
-        mine -> "내가 ${if (mode == "all") "모두에게" else "${from}님에게"}"
-        mode == "all" -> "${from}님 전체 방송"
-        mode == "group" -> "${from}님이 몇 명에게"
-        else -> "${from}님이 나에게"
+    val title get(): String {
+        val who = Radio.dispList(from)
+        return when {
+            mine && voiceSent -> "내가 ${if (mode == "all") "모두에게" else "${who}에게"} (음성 ${seconds.toInt().coerceAtLeast(1)}초)"
+            mine && isFile -> "내가 ${if (mode == "all") "모두에게" else "${who}에게"} (📎 ${name})"
+            mine -> "내가 ${if (mode == "all") "모두에게" else "${who}에게"}"
+            mode == "all" -> "$who 전체 방송"
+            mode == "group" -> "${who}가 몇 명에게"
+            else -> "${who}가 나에게"
+        }
     }
 }
 
@@ -56,6 +59,12 @@ object Family {
     /** 가족 5명 색을 순서대로 — '모두' 버튼의 띠(모두 = 가족 전부의 색)에 사용 */
     fun colors(): IntArray = style.values.map { it.second }.toIntArray()
     fun color(name: String?) = style[name]?.second ?: GREY
+    /** 받침에 따라 조사 고르기: josa("규민", "과", "와") → "과", josa("로아", ...) → "와" */
+    fun josa(word: String, withBatchim: String, without: String): String {
+        val c = word.lastOrNull() ?: return without
+        if (c !in '가'..'힣') return without
+        return if ((c - '가') % 28 != 0) withBatchim else without
+    }
     fun groupIcon(name: String) = groupStyle[name]?.first ?: "👪"
     fun groupColor(name: String) = groupStyle[name]?.second ?: GREY
 
@@ -80,7 +89,7 @@ data class Schedule(val sid: Int, val to: String, val text: String, val at: Long
  */
 object Radio : RadioClient.Listener {
 
-    private const val MAX_CLIPS = 150
+    private const val MAX_CLIPS = 3000
 
     private const val LIVE: Byte = 1
     private const val CLIP: Byte = 2
@@ -133,21 +142,41 @@ object Radio : RadioClient.Listener {
         if (t == "all") "all" else JSONArray().also { arr -> t.split(",").filter { it.isNotBlank() }.forEach { arr.put(it) } }
 
     /** 화면 표시용: "모두" 또는 "엄마, 아빠" */
-    fun targetLabel(t: String = target): String = if (t == "all") "모두" else t.split(",").filter { it.isNotBlank() }.joinToString(", ")
+    fun targetLabel(t: String = target): String = if (t == "all") "모두" else t.split(",").filter { it.isNotBlank() }.joinToString(", ") { disp(it) }
 
     // ---- 대화방 ----
 
+    /** 서버(names.json)가 보내 준 화면 이름표: 속 이름 → 보이는 이름 (예: 첫째 → 규민, 아빠 기기에서 엄마 → 진희) */
+    @Volatile var names: Map<String, String> = emptyMap(); private set
+
+    /** 화면에 보일 이름: 나 자신은 '나', 나머지는 이름표가 있으면 그 이름 */
+    fun disp(name: String?): String {
+        if (name == null) return ""
+        if (name == me && me.isNotBlank()) return "나"
+        return names[name] ?: name
+    }
+
+    /** "엄마, 첫째" 처럼 쉼표로 이어진 이름들도 변환 */
+    fun dispList(s: String?): String = (s ?: "").split(", ").filter { it.isNotEmpty() }.joinToString(", ") { disp(it) }
+
+    /** 대화방: 1줄 모두·아이들 / 2줄 아빠·엄마 / 3줄 첫째·둘째·셋째 (내 자리는 '나' — 메모용) */
     fun rooms(): List<Room> {
-        val others = members.filter { it != me }
         val out = ArrayList<Room>()
         out.add(Room("all", "모두", null, Family.ALL_ICON, Family.ALL_COLOR))
-        others.forEach { out.add(Room(it, it, listOf(it), Family.icon(it), Family.color(it))) }
+        val others = members.filter { it != me }
         Family.parseGroups(Prefs(app).groups).forEach { (name, mem) ->
             val m = mem.filter { it in others }
-            if (m.size >= 2) out.add(Room("g:$name", name, m, Family.groupIcon(name), Family.groupColor(name)))
+            if (m.size >= 2 && name != "부모님") out.add(Room("g:$name", name, m, Family.groupIcon(name), Family.groupColor(name)))
+        }
+        for (n in listOf("아빠", "엄마", "첫째", "둘째", "셋째")) {
+            if (n !in members) continue
+            if (n == me) out.add(Room(n, "나", listOf(n), "📝", Family.color(n)))
+            else out.add(Room(n, disp(n), listOf(n), Family.icon(n), Family.color(n)))
         }
         return out
     }
+
+    fun isMeRoom(room: Room) = room.members == listOf(me)
 
     /** 지금 고른 상대에 해당하는 방 (방에 없는 조합이면 custom) */
     fun currentRoom(): Room {
@@ -168,8 +197,9 @@ object Radio : RadioClient.Listener {
     /** 그 방에 보이는 메시지: 모두 방은 전부, 나머지는 그 사람(들)과 주고받은 것 */
     fun roomClips(room: Room): List<Clip> {
         val ms = room.members?.toSet() ?: return clips.toList()
+        if (ms == setOf(me)) return clips.filter { it.mine && it.mode == "direct" && it.from == me }   // '나' 방: 내 메모만
         return clips.filter { c ->
-            if (c.mine) c.mode != "all" && c.from.split(", ").any { it in ms }
+            if (c.mine) c.mode != "all" && c.from != me && c.from.split(", ").any { it in ms }
             else c.from in ms
         }
     }
@@ -190,6 +220,10 @@ object Radio : RadioClient.Listener {
         app = ctx.applicationContext
         client = RadioClient(app, this)
         me = Prefs(app).name
+        try {
+            val o = JSONObject(Prefs(app).names.ifBlank { "{}" })
+            names = o.keys().asSequence().associateWith { o.optString(it) }.filterValues { it.isNotBlank() }
+        } catch (_: Exception) {}
         loadClips()
         loadOutbox()
         tts = TextToSpeech(app) { status ->
@@ -215,7 +249,8 @@ object Radio : RadioClient.Listener {
         if (talking || requesting) return
         when {
             !connected -> { notice = "NAS에 연결되어 있지 않아요"; Feedback.denied(app); changed(); return }
-            incomingFrom != null -> { notice = "${incomingFrom}님이 말하는 중이에요"; Feedback.denied(app); changed(); return }
+            incomingFrom != null -> { notice = "${disp(incomingFrom)}가 말하는 중이에요"; Feedback.denied(app); changed(); return }
+            Prefs(app).targetList == listOf(me) -> { notice = "나에게는 글·사진만 보낼 수 있어요 (메모)"; Feedback.denied(app); changed(); return }
             !micReady && !uiVisible -> { notice = "말하기를 쓰려면 앱을 한 번 열어 주세요"; Feedback.denied(app); changed(); return }
         }
         stopClip()
@@ -252,6 +287,10 @@ object Radio : RadioClient.Listener {
             "welcome" -> {
                 members = msg.optJSONArray("members").toList().ifEmpty { members }
                 msg.optJSONArray("parents")?.let { parents = it.toList().toSet() }
+                msg.optJSONObject("names")?.let { o ->
+                    val m = o.keys().asSequence().associateWith { o.optString(it) }.filterValues { it.isNotBlank() }
+                    if (m != names) { names = m; Prefs(app).names = JSONObject(m).toString() }
+                }
                 notice = ""
                 flushOutbox()
                 Updater.maybeCheck(app, client.httpBase, client.currentNetwork)   // 6시간에 한 번 새 버전 확인
@@ -277,8 +316,8 @@ object Radio : RadioClient.Listener {
                 requesting = false
                 Feedback.denied(app)
                 notice = when (msg.optString("reason")) {
-                    "busy" -> "${msg.optString("speaker")}님이 말하는 중이에요"
-                    "offline" -> "${msg.optString("to")}님이 지금 접속해 있지 않아요"
+                    "busy" -> "${disp(msg.optString("speaker"))}가 말하는 중이에요"
+                    "offline" -> "${dispList(msg.optString("to"))}가 지금 접속해 있지 않아요"
                     else -> "지금은 말할 수 없어요"
                 }
             }
@@ -337,7 +376,11 @@ object Radio : RadioClient.Listener {
                     msg.optLong("ts", System.currentTimeMillis() / 1000), 0.0, null, msg.optString("text"), mine = true, mid = mid))
             }
             "seen_sync" -> seenSent.add(msg.optInt("mid"))   // 내 다른 기기에서 읽음 → 여기서도 '새 글'에서 빼고 다시 알리지 않음
-            "history" -> mergeHistory(msg.optJSONArray("items"))
+            "history" -> {
+                historyMore = msg.optBoolean("more", false)
+                loadingOlder = false
+                mergeHistory(msg.optJSONArray("items"))
+            }
             "receipt" -> {
                 val st = msg.optJSONObject("status") ?: JSONObject()
                 receipts = receipts + (msg.optInt("mid") to st.keys().asSequence().associateWith { st.optString(it) })
@@ -576,7 +619,7 @@ object Radio : RadioClient.Listener {
     /** 내가 보낸 메시지의 가족별 확인 표시: · 보냄, ✓ 받음, ✓✓ 봄(들음) */
     fun receiptText(clip: Clip): String {
         val st = receipts[clip.mid] ?: return ""
-        return st.entries.joinToString("  ") { (n, v) -> n + when (v) { "seen" -> "✓✓"; "received" -> "✓"; else -> "·" } }
+        return st.entries.joinToString("  ") { (n, v) -> disp(n) + when (v) { "seen" -> "✓✓"; "received" -> "✓"; else -> "·" } }
     }
 
     // ---- 예약 메시지 ----
@@ -606,6 +649,18 @@ object Radio : RadioClient.Listener {
     }
 
     /** 서버가 보관한 문자 기록을 합침 (이미 있는 것은 mid로 건너뜀) → 폰·PC 어디서나 같은 대화 */
+    @Volatile var historyMore = false; private set   // 서버에 더 옛 기록이 남아 있는지
+    @Volatile var loadingOlder = false; private set
+
+    /** 대화창을 맨 위까지 올렸을 때: 서버에 더 옛 기록이 있으면 이어서 받아 옴 */
+    fun loadOlder(): Boolean {
+        if (!historyMore || loadingOlder || !connected) return false
+        val oldest = clips.filter { it.mid != 0 }.minOfOrNull { it.mid } ?: return false
+        loadingOlder = true
+        client.sendJson(JSONObject().put("type", "history_before").put("mid", oldest).put("limit", 100))
+        return true
+    }
+
     private fun mergeHistory(items: JSONArray?) {
         if (items == null) return
         val have = clips.mapNotNull { if (it.mid != 0) it.mid else null }.toHashSet()
@@ -664,7 +719,7 @@ object Radio : RadioClient.Listener {
         stopClip()
         val prefs = Prefs(app)
         if (prefs.dnd) {
-            notice = "방해금지 중 — ${from}님의 말을 받지 않았어요"
+            notice = "방해금지 중 — ${disp(from)}의 말을 받지 않았어요"
             return
         }
         val am = app.getSystemService(AudioManager::class.java)
@@ -744,7 +799,7 @@ object Radio : RadioClient.Listener {
         if (incomingFrom != null || talking) return
         val f = clip.file
         if (f == null) {   // 문자 메시지는 읽어 줌
-            if (ttsReady && clip.text != null) tts?.speak("${clip.from}: ${clip.text}", TextToSpeech.QUEUE_FLUSH, null, "msg${clip.id}")
+            if (ttsReady && clip.text != null) tts?.speak("${disp(clip.from)}: ${clip.text}", TextToSpeech.QUEUE_FLUSH, null, "msg${clip.id}")
             markSeen(clip)
             return
         }
